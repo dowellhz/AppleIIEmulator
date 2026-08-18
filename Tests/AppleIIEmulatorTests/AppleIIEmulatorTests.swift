@@ -4,10 +4,26 @@ import XCTest
 
 final class AppleIIEmulatorTests: XCTestCase {
     func testVintagePanelArtworkIsReadableFromResourceBundle() throws {
-        let url = try XCTUnwrap(Bundle.module.url(forResource: "VintagePlasticTexture", withExtension: "png"))
+        let url = try XCTUnwrap(
+            AppResources.bundle.url(forResource: "VintagePlasticTexture", withExtension: "png"),
+            "main=\(Bundle.main.bundleURL.path), resources=\(Bundle.main.resourceURL?.path ?? "nil"), resolved=\(AppResources.bundle.bundleURL.path)"
+        )
         let image = try XCTUnwrap(NSImage(contentsOf: url))
         XCTAssertGreaterThan(image.size.width, 1)
         XCTAssertGreaterThan(image.size.height, 1)
+    }
+
+    func testSpeakerWaveformLetsAnIsolatedToggleDecaySmoothly() {
+        var waveform = AppleIISpeakerWaveform()
+        waveform.toggle(atEmulatedCycle: 0)
+
+        let samples = waveform.render(toEmulatedCycle: 300_000)
+
+        XCTAssertFalse(samples.isEmpty)
+        XCTAssertGreaterThan(abs(samples[0]), 0.1)
+        XCTAssertLessThan(abs(samples[samples.count / 2]), abs(samples[0]))
+        XCTAssertLessThan(abs(samples[samples.count - 1]), 0.001)
+        XCTAssertTrue(samples.allSatisfy(\.isFinite))
     }
 
     func testKeyboardStrobeClearsAtC010() {
@@ -500,6 +516,10 @@ final class AppleIIEmulatorTests: XCTestCase {
 
     @MainActor
     func testBundledGamesMountWithoutFilePicker() {
+        XCTAssertEqual(
+            AppleIIMachine.BundledGame.allCases.map(\.title),
+            ["Galaxy", "J-Bird", "Ocean Night"]
+        )
         let machine = AppleIIMachine()
         for game in AppleIIMachine.BundledGame.allCases {
             machine.loadBundledGame(game)
@@ -544,13 +564,6 @@ final class AppleIIEmulatorTests: XCTestCase {
             }.joined(separator: "|")
             XCTAssertFalse(text.contains("ERR"), "\(game.title) boot failed: \(text)")
             XCTAssertTrue(!machine.memory.textMode || text.trimmingCharacters(in: .whitespacesAndNewlines.union(.init(charactersIn: "|"))).isEmpty == false, "\(game.title) should reach a visible title or graphics screen")
-            if game == .wayOut {
-                let hgrBytes = (0..<192).flatMap { row in
-                    (0..<40).map { machine.memory.hgrByte(column: $0, row: row) }
-                }
-                XCTAssertTrue(machine.memory.hires, "Way Out should reach its hi-res game screen")
-                XCTAssertGreaterThan(hgrBytes.filter { $0 != 0 }.count, 0, "Way Out should render a non-empty hi-res frame")
-            }
         }
     }
 

@@ -84,7 +84,7 @@ struct EmulatorControlsPanel: View {
 private struct VintagePlasticBackground: NSViewRepresentable {
     func makeNSView(context: Context) -> TextureImageView {
         let imageView = TextureImageView()
-        imageView.image = Bundle.module.url(forResource: "VintagePlasticTexture", withExtension: "png")
+        imageView.image = AppResources.bundle.url(forResource: "VintagePlasticTexture", withExtension: "png")
             .flatMap(NSImage.init(contentsOf:))
         return imageView
     }

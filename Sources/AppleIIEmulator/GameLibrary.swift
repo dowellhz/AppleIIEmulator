@@ -19,7 +19,7 @@ struct GameLibrary {
 
     let games: [Game]
 
-    init(bundle: Bundle = .module) {
+    init(bundle: Bundle = AppResources.bundle) {
         games = ((try? FileManager.default.contentsOfDirectory(
             at: bundle.bundleURL,
             includingPropertiesForKeys: nil,

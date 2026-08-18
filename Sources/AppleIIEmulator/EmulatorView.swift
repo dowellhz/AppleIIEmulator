@@ -100,7 +100,7 @@ struct MetalButtonStyle: ButtonStyle {
 
 private struct MonitorArtwork: View {
     var body: some View {
-        if let url = Bundle.module.url(forResource: "AppleIIMonitorReference", withExtension: "png"),
+        if let url = AppResources.bundle.url(forResource: "AppleIIMonitorReference", withExtension: "png"),
            let image = NSImage(contentsOf: url) {
             Image(nsImage: image)
                 .resizable()

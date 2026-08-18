@@ -62,43 +62,41 @@ final class AppleIIMachine: ObservableObject {
         }
     }
 
-    /// Disk images selected from the requested Planet Emulation W collection.
+    /// A small, deterministic set of games shown in the default GAME menu.
     /// They are packaged with the app so launching one never opens a file picker.
     enum BundledGame: String, CaseIterable, Identifiable {
-        case wayOut
-        case warpDestroyer
+        case galaxy
+        case jBird
+        case oceanNight
 
         var id: Self { self }
 
         var title: String {
             switch self {
-            case .wayOut: return "Way Out (1982)"
-            case .warpDestroyer: return "Warp Destroyer (1982)"
+            case .galaxy: return "Galaxy"
+            case .jBird: return "J-Bird"
+            case .oceanNight: return "Ocean Night"
             }
         }
 
         var resourceName: String {
             switch self {
-            // The original DOS dump returns to a blank Applesoft screen on
-            // the compatibility motherboard. This bundled zero-page variant
-            // has the same game data with a loader that remains in the
-            // game's RAM image.
-            case .wayOut: return "WayOutZeroPage"
-            case .warpDestroyer: return "WarpDestroyer"
+            case .galaxy: return "galaxy"
+            case .jBird: return "j-bird"
+            case .oceanNight: return "Ocean Night (compatiboot)"
             }
         }
 
         var resourceExtension: String {
             switch self {
-            case .wayOut: return "do"
-            case .warpDestroyer: return "dsk"
+            case .galaxy: return "do"
+            case .jBird, .oceanNight: return "dsk"
             }
         }
 
         var diskFirmware: AppleIIMemory.DiskIIFirmware {
             switch self {
-            case .wayOut: return .sixteenSector
-            case .warpDestroyer: return .sixteenSector
+            case .galaxy, .jBird, .oceanNight: return .sixteenSector
             }
         }
 
@@ -331,7 +329,7 @@ final class AppleIIMachine: ObservableObject {
     }
 
     func loadBundledGame(_ game: BundledGame) {
-        guard let url = Bundle.module.url(
+        guard let url = AppResources.bundle.url(
             forResource: game.resourceName,
             withExtension: game.resourceExtension
         ) else {
@@ -408,7 +406,7 @@ final class AppleIIMachine: ObservableObject {
     private static func downloadedGamesDirectory() -> URL? {
         let relativePath = "Downloads/AppleIIGames/ftp.apple.asimov.net/images/games/action"
         var roots = [URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)]
-        for bundleURL in [Bundle.main.bundleURL, Bundle.module.bundleURL] {
+        for bundleURL in [Bundle.main.bundleURL, AppResources.bundle.bundleURL] {
             var ancestor = bundleURL
             for _ in 0..<8 {
                 ancestor.deleteLastPathComponent()
@@ -690,7 +688,7 @@ final class AppleIIMemory: AppleIIBus {
     }
 
     func loadBundledAppleIIcROM(named name: String) throws {
-        guard let url = Bundle.module.url(forResource: name, withExtension: "bin") else {
+        guard let url = AppResources.bundle.url(forResource: name, withExtension: "bin") else {
             throw CocoaError(.fileNoSuchFile)
         }
         let data = try Data(contentsOf: url)
@@ -702,8 +700,8 @@ final class AppleIIMemory: AppleIIBus {
     }
 
     func loadBundledAppleIIPlusROM(diskFirmware: DiskIIFirmware) throws {
-        guard let systemURL = Bundle.module.url(forResource: "AppleIIPlus-Applesoft-Autostart", withExtension: "rom"),
-              let diskURL = Bundle.module.url(forResource: diskFirmware.resourceName, withExtension: "rom") else {
+        guard let systemURL = AppResources.bundle.url(forResource: "AppleIIPlus-Applesoft-Autostart", withExtension: "rom"),
+              let diskURL = AppResources.bundle.url(forResource: diskFirmware.resourceName, withExtension: "rom") else {
             throw CocoaError(.fileNoSuchFile)
         }
         let systemROM = try Data(contentsOf: systemURL)

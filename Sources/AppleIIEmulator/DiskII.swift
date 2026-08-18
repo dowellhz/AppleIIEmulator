@@ -54,7 +54,7 @@ final class IWMController {
     // so normalize its crossed address/data pins before converting it to the
     // logical order used by `clockSequencer`.
     private static let thirteenSectorP6: [UInt8] = {
-        guard let url = Bundle.module.url(forResource: "DiskII-13sector-341-0010", withExtension: "bin"),
+        guard let url = AppResources.bundle.url(forResource: "DiskII-13sector-341-0010", withExtension: "bin"),
               let raw = try? Data(contentsOf: url), raw.count == 256 else {
             return p6
         }
