@@ -3,8 +3,27 @@ import SwiftUI
 
 struct EmulatorView: View {
     @ObservedObject var machine: AppleIIMachine
+    @State private var isFullscreen = false
 
     var body: some View {
+        Group {
+            if isFullscreen {
+                fullscreenDisplay
+            } else {
+                chassis
+            }
+        }
+        .background(WindowTransparencyConfigurator(isFullscreen: $isFullscreen))
+        .frame(
+            minWidth: ChassisLayout.minimumWidth,
+            idealWidth: ChassisLayout.preferredWidth,
+            minHeight: ChassisLayout.minimumHeight,
+            idealHeight: ChassisLayout.idealHeight
+        )
+        .preferredColorScheme(.dark)
+    }
+
+    private var chassis: some View {
         GeometryReader { proxy in
             let chassisWidth = min(proxy.size.width, ChassisLayout.preferredWidth)
 
@@ -18,14 +37,21 @@ struct EmulatorView: View {
             .frame(width: chassisWidth)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
-        .frame(
-            minWidth: ChassisLayout.minimumWidth,
-            idealWidth: ChassisLayout.preferredWidth,
-            minHeight: ChassisLayout.minimumHeight,
-            idealHeight: ChassisLayout.idealHeight
-        )
-        .background(WindowTransparencyConfigurator())
-        .preferredColorScheme(.dark)
+    }
+
+    private var fullscreenDisplay: some View {
+        GeometryReader { proxy in
+            let available = proxy.size
+            let displayWidth = min(available.width, available.height * 4 / 3)
+            let displayHeight = displayWidth * 3 / 4
+
+            ZStack {
+                Color.black
+                emulatedScreen(width: displayWidth, height: displayHeight)
+            }
+            .frame(width: available.width, height: available.height)
+        }
+        .ignoresSafeArea()
     }
 
     private func monitor(width chassisWidth: CGFloat) -> some View {
@@ -48,15 +74,7 @@ struct EmulatorView: View {
                 .fill(Color(red: 0.008, green: 0.020, blue: 0.013))
                 .frame(width: screenWidth, height: screenHeight)
                 .position(screenCenter)
-            AppleIIScreen(memory: machine.memory, refreshToken: machine.refreshToken)
-                .background(KeyboardCapture { machine.keyDown($0) })
-                .frame(width: screenWidth, height: screenHeight)
-                .clipShape(RoundedRectangle(cornerRadius: screenWidth * 0.035, style: .continuous))
-                .overlay {
-                    LinearGradient(colors: [.white.opacity(0.07), .clear, .white.opacity(0.02)], startPoint: .topLeading, endPoint: .bottomTrailing)
-                        .clipShape(RoundedRectangle(cornerRadius: screenWidth * 0.035, style: .continuous))
-                        .allowsHitTesting(false)
-                }
+            emulatedScreen(width: screenWidth, height: screenHeight)
                 // The photo includes the monitor's right-hand control column,
                 // so its CRT center sits left of the full image centerline.
                 .position(screenCenter)
@@ -65,6 +83,19 @@ struct EmulatorView: View {
         // Keep the enclosure only subtly rounded.  The reference monitor has
         // nearly square corners, rather than the large modern-card radius.
         .clipShape(RoundedRectangle(cornerRadius: 7.5, style: .continuous))
+    }
+
+    private func emulatedScreen(width: CGFloat, height: CGFloat) -> some View {
+        let cornerRadius = min(width, height) * 0.035
+        return AppleIIScreen(memory: machine.memory, refreshToken: machine.refreshToken)
+            .background(KeyboardCapture { machine.keyDown($0) })
+            .frame(width: width, height: height)
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .overlay {
+                LinearGradient(colors: [.white.opacity(0.07), .clear, .white.opacity(0.02)], startPoint: .topLeading, endPoint: .bottomTrailing)
+                    .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+                    .allowsHitTesting(false)
+            }
     }
 
 }
@@ -117,18 +148,28 @@ private struct MonitorArtwork: View {
 /// Configure that host window once so the area around the monitor is truly
 /// transparent rather than a black rectangle.
 private struct WindowTransparencyConfigurator: NSViewRepresentable {
+    @Binding var isFullscreen: Bool
+
     func makeNSView(context: Context) -> TransparentWindowHostView {
-        TransparentWindowHostView(frame: .zero)
+        let view = TransparentWindowHostView(frame: .zero)
+        view.fullscreenChanged = { isFullscreen = $0 }
+        return view
     }
 
     func updateNSView(_ nsView: TransparentWindowHostView, context: Context) {
+        nsView.fullscreenChanged = { isFullscreen = $0 }
         nsView.configureWindow()
     }
 
     final class TransparentWindowHostView: NSView {
+        var fullscreenChanged: ((Bool) -> Void)?
+        private weak var observedWindow: NSWindow?
+        private var fullscreenObservers = [NSObjectProtocol]()
+
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             configureWindow()
+            observeFullscreenState()
         }
 
         func configureWindow() {
@@ -138,6 +179,30 @@ private struct WindowTransparencyConfigurator: NSViewRepresentable {
             window.titlebarAppearsTransparent = true
             window.hasShadow = false
         }
+
+        private func observeFullscreenState() {
+            guard let window, observedWindow !== window else { return }
+            removeFullscreenObservers()
+            observedWindow = window
+            let center = NotificationCenter.default
+            fullscreenObservers = [
+                center.addObserver(forName: NSWindow.didEnterFullScreenNotification, object: window, queue: .main) { [weak self] _ in
+                    self?.fullscreenChanged?(true)
+                },
+                center.addObserver(forName: NSWindow.didExitFullScreenNotification, object: window, queue: .main) { [weak self] _ in
+                    self?.fullscreenChanged?(false)
+                }
+            ]
+            fullscreenChanged?(window.styleMask.contains(.fullScreen))
+        }
+
+        private func removeFullscreenObservers() {
+            let center = NotificationCenter.default
+            fullscreenObservers.forEach(center.removeObserver)
+            fullscreenObservers.removeAll()
+        }
+
+        deinit { removeFullscreenObservers() }
     }
 }
 
