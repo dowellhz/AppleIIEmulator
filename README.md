@@ -4,6 +4,12 @@
 
 ![Falcons 在内置 Apple II+ 游戏兼容模式中运行](Documentation/falcons-gameplay.png)
 
+## About
+
+Apple II Emulator 是一个为 macOS 打造的原生 Apple II 模拟器。它的目标不是把经典软件包装成一个终端，而是以可读、可验证的硬件模型重现 6502、内存映射、视频软开关、Disk II 与一位扬声器的协作方式。
+
+项目使用 Swift、SwiftUI、AppKit、Foundation 和 AVFoundation 构建，不依赖第三方框架。界面保留了 Apple II 时代的显示器与塑料机箱质感，同时将 ROM、磁盘映像、游戏库和输入控制保持在可直接操作的 macOS 应用中。当前重点是可靠启动和运行经典软件；部分外设与受保护磁盘格式仍在持续完善。
+
 - 65C02 核心（包含 IIc 固件所用的 65C02 指令、十进制算术、JMP 间接寻址页尾缺陷）；
 - IIc 主/辅助 RAM、80STORE、ALTZP、80 列、双高分辨率和 ROM 银行切换；
 - 键盘锁存器、扬声器软开关、40/80 列文字、Lo-Res、Hi-Res、Double Hi-Res 画面；
