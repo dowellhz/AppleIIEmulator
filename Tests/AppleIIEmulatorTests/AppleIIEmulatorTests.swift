@@ -518,7 +518,7 @@ final class AppleIIEmulatorTests: XCTestCase {
     func testBundledGamesMountWithoutFilePicker() {
         XCTAssertEqual(
             AppleIIMachine.BundledGame.allCases.map(\.title),
-            ["Galaxy", "J-Bird", "Ocean Night"]
+            ["Falcons (4am crack)", "J-Bird", "Ocean Night"]
         )
         let machine = AppleIIMachine()
         for game in AppleIIMachine.BundledGame.allCases {

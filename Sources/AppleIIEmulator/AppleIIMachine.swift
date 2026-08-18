@@ -65,7 +65,7 @@ final class AppleIIMachine: ObservableObject {
     /// A small, deterministic set of games shown in the default GAME menu.
     /// They are packaged with the app so launching one never opens a file picker.
     enum BundledGame: String, CaseIterable, Identifiable {
-        case galaxy
+        case falcons
         case jBird
         case oceanNight
 
@@ -73,7 +73,7 @@ final class AppleIIMachine: ObservableObject {
 
         var title: String {
             switch self {
-            case .galaxy: return "Galaxy"
+            case .falcons: return "Falcons (4am crack)"
             case .jBird: return "J-Bird"
             case .oceanNight: return "Ocean Night"
             }
@@ -81,7 +81,7 @@ final class AppleIIMachine: ObservableObject {
 
         var resourceName: String {
             switch self {
-            case .galaxy: return "galaxy"
+            case .falcons: return "Falcons (4am crack)"
             case .jBird: return "j-bird"
             case .oceanNight: return "Ocean Night (compatiboot)"
             }
@@ -89,14 +89,13 @@ final class AppleIIMachine: ObservableObject {
 
         var resourceExtension: String {
             switch self {
-            case .galaxy: return "do"
-            case .jBird, .oceanNight: return "dsk"
+            case .falcons, .jBird, .oceanNight: return "dsk"
             }
         }
 
         var diskFirmware: AppleIIMemory.DiskIIFirmware {
             switch self {
-            case .galaxy, .jBird, .oceanNight: return .sixteenSector
+            case .falcons, .jBird, .oceanNight: return .sixteenSector
             }
         }
 
