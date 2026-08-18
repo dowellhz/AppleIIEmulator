@@ -2,5 +2,5 @@
 .build/
 build/
 Downloads/
-Games/
+/Games/
 *.xcuserstate

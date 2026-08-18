@@ -1,196 +1,92 @@
 import AppKit
 import SwiftUI
 
-/// HGR colour is decoded in pairs of adjacent memory dots (140 effective
-/// colour pixels per row). Bit 7 selects the blue/orange phase palette for
-/// its seven-dot byte; two illuminated dots are white in either palette.
-enum AppleIIHiResColor: Equatable {
-    case black, green, purple, white, orange, blue
-}
-
-func appleIIHiResColors(bytes: [UInt8]) -> [AppleIIHiResColor] {
-    let storedDotCount = bytes.count * 7
-    let dotCount = storedDotCount + (storedDotCount.isMultiple(of: 2) ? 0 : 1)
-    var dots = [Bool](repeating: false, count: dotCount)
-    var phaseShifted = [Bool](repeating: false, count: dotCount)
-    for (column, byte) in bytes.enumerated() {
-        for bit in 0..<7 {
-            let x = column * 7 + bit
-            dots[x] = byte & (1 << bit) != 0
-            phaseShifted[x] = byte & 0x80 != 0
-        }
-    }
-
-    return stride(from: 0, to: dots.count, by: 2).map { x in
-        let pair = (dots[x] ? 2 : 0) | (dots[x + 1] ? 1 : 0)
-        switch (phaseShifted[x], pair) {
-        case (_, 0): return .black
-        case (false, 1): return .green
-        case (false, 2): return .purple
-        case (true, 1): return .orange
-        case (true, 2): return .blue
-        default: return .white
-        }
-    }
-}
-
 struct EmulatorView: View {
     @ObservedObject var machine: AppleIIMachine
 
     var body: some View {
-        VStack(spacing: 0) {
-            monitor
-                .frame(maxWidth: .infinity)
-            settingsPanel
-                .padding(.horizontal, 18)
-                .padding(.top, 12)
-                .padding(.bottom, 18)
+        GeometryReader { proxy in
+            let chassisWidth = min(proxy.size.width, ChassisLayout.preferredWidth)
+
+            VStack(spacing: 0) {
+                monitor(width: chassisWidth)
+                EmulatorControlsPanel(machine: machine)
+                    .frame(width: chassisWidth)
+                    .padding(.top, 12)
+                    .padding(.bottom, 18)
+            }
+            .frame(width: chassisWidth)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
+        .frame(
+            minWidth: ChassisLayout.minimumWidth,
+            idealWidth: ChassisLayout.preferredWidth,
+            minHeight: ChassisLayout.minimumHeight,
+            idealHeight: ChassisLayout.idealHeight
+        )
         .background(WindowTransparencyConfigurator())
         .preferredColorScheme(.dark)
     }
 
-    private var monitor: some View {
-        GeometryReader { proxy in
-            ZStack {
-                MonitorArtwork()
-
-                // The supplied photograph is 1448×1084.  These normalized
-                // bounds place the emulated 4:3 raster over its CRT glass,
-                // leaving the original bezel, power controls and side panel
-                // fully visible.
-                let screenWidth = proxy.size.width * 0.62
-                let screenCenter = CGPoint(x: proxy.size.width * 0.473, y: proxy.size.height * 0.50)
-                // The original photo contains a green demonstration image on
-                // its tube.  An opaque underlay covers it even at the rounded
-                // corners of the live 4:3 raster.
-                RoundedRectangle(cornerRadius: screenWidth * 0.035, style: .continuous)
-                    .fill(Color(red: 0.008, green: 0.020, blue: 0.013))
-                    .frame(width: screenWidth, height: screenWidth * 0.75)
-                    .position(screenCenter)
-                AppleIIScreen(memory: machine.memory, refreshToken: machine.refreshToken)
-                    .background(KeyboardCapture { machine.keyDown($0) })
-                    .frame(width: screenWidth)
-                    .clipShape(RoundedRectangle(cornerRadius: screenWidth * 0.035, style: .continuous))
-                    .overlay {
-                        LinearGradient(colors: [.white.opacity(0.07), .clear, .white.opacity(0.02)], startPoint: .topLeading, endPoint: .bottomTrailing)
-                            .clipShape(RoundedRectangle(cornerRadius: screenWidth * 0.035, style: .continuous))
-                            .allowsHitTesting(false)
-                    }
-                    // The photo includes the monitor's right-hand control
-                    // column, so its CRT center sits left of the full image
-                    // centerline.
-                    .position(screenCenter)
-            }
-        }
-        .aspectRatio(1448.0 / 1084.0, contentMode: .fit)
-        .frame(maxWidth: .infinity)
-        .clipShape(RoundedRectangle(cornerRadius: 30, style: .continuous))
-    }
-
-    private var settingsPanel: some View {
-        VStack(spacing: 10) {
-            HStack {
-                Label("SYSTEM SETTINGS", systemImage: "cpu")
-                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                Spacer()
-                Text(machine.status)
-                    .lineLimit(1)
-                    .font(.system(size: 10, weight: .medium, design: .monospaced))
-                    .foregroundStyle(Color.black.opacity(0.72))
-            }
-            Divider().overlay(Color.black.opacity(0.24))
-            HStack(spacing: 12) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("DRIVE 1  \(machine.diskDescription)").lineLimit(1)
-                    Text("DRIVE 2  \(machine.externalDiskDescription)").lineLimit(1)
-                }
-                .font(.system(size: 9, weight: .semibold, design: .monospaced))
-                .foregroundStyle(Color.black.opacity(0.72))
-                Spacer(minLength: 0)
-                // Use direct menu actions rather than a Picker binding.  On a
-                // transparent SwiftUI window the native menu-style Picker can
-                // show a checkmark yet fail to commit the clicked value.
-                Menu {
-                    ForEach(AppleIIMachine.BootROM.allCases) { rom in
-                        Button {
-                            machine.selectROM(rom)
-                        } label: {
-                            if machine.selectedBootROM == rom {
-                                Label(rom.title, systemImage: "checkmark")
-                            } else {
-                                Text(rom.title)
-                            }
-                        }
-                    }
-                } label: {
-                    HStack(spacing: 7) {
-                        Text(machine.selectedBootROM.title)
-                            .lineLimit(1)
-                        Image(systemName: "chevron.up.chevron.down")
-                            .font(.system(size: 9, weight: .bold))
-                    }
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(Color.white.opacity(0.90))
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 9)
-                    .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Color.black.opacity(0.18)))
-                    .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).stroke(Color.white.opacity(0.18), lineWidth: 1))
-                }
-                .menuStyle(.borderlessButton)
-                Menu {
-                    if !machine.downloadedGames.isEmpty {
-                        Menu("已下载游戏（\(machine.downloadedGames.count)）") {
-                            ForEach(machine.downloadedGameInitials, id: \.self) { initial in
-                                Menu(initial) {
-                                    ForEach(machine.downloadedGames(startingWith: initial)) { game in
-                                        Button(game.title) { machine.loadDownloadedGame(game) }
-                                    }
-                                }
-                            }
-                        }
-                        Divider()
-                    }
-                    Button("从已下载游戏库打开…") { machine.chooseDownloadedGame() }
-                    Divider()
-                    ForEach(AppleIIMachine.BundledGame.allCases) { game in
-                        Button(game.title) { machine.loadBundledGame(game) }
-                    }
-                } label: {
-                    HStack(spacing: 7) {
-                        Text("GAME")
-                        Image(systemName: "gamecontroller")
-                            .font(.system(size: 10, weight: .bold))
-                    }
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(Color.white.opacity(0.90))
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 9)
-                    .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Color.black.opacity(0.18)))
-                    .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).stroke(Color.white.opacity(0.18), lineWidth: 1))
-                }
-                .menuStyle(.borderlessButton)
-                Button(machine.isRunning ? "PAUSE" : "RUN") { machine.toggleRunning() }
-                    .buttonStyle(MetalButtonStyle())
-                Button("RESET") { machine.reset() }
-                    .buttonStyle(MetalButtonStyle())
-            }
-            Text("GAME CONTROLS  \u{2190}\u{2191}\u{2192}\u{2193}: JOYSTICK   \u{2318}/\u{2325}: BUTTONS")
-                .font(.system(size: 9, weight: .semibold, design: .monospaced))
-                .foregroundStyle(Color.black.opacity(0.62))
-        }
-        .padding(14)
-        .foregroundStyle(Color(red: 0.10, green: 0.10, blue: 0.08))
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(LinearGradient(colors: [Color(red: 0.56, green: 0.50, blue: 0.40), Color(red: 0.38, green: 0.33, blue: 0.25)], startPoint: .top, endPoint: .bottom))
-                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Color.white.opacity(0.25), lineWidth: 1))
+    private func monitor(width chassisWidth: CGFloat) -> some View {
+        let monitorHeight = ChassisLayout.monitorHeight(for: chassisWidth)
+        let screenWidth = chassisWidth * 0.62
+        let screenHeight = screenWidth * 0.75
+        let screenCenter = CGPoint(
+            x: chassisWidth * 0.473,
+            y: monitorHeight * 0.50
         )
-        .accessibilityHint("选择游戏后会自动装入磁盘；方向键控制摇杆，Command 和 Option 对应两个游戏按钮")
+
+        return ZStack {
+            MonitorArtwork()
+                .frame(width: chassisWidth, height: monitorHeight)
+
+            // The supplied photograph is 1448×1084.  These normalized bounds
+            // place the emulated 4:3 raster over its CRT glass, leaving the
+            // original bezel, power controls and side panel fully visible.
+            RoundedRectangle(cornerRadius: screenWidth * 0.035, style: .continuous)
+                .fill(Color(red: 0.008, green: 0.020, blue: 0.013))
+                .frame(width: screenWidth, height: screenHeight)
+                .position(screenCenter)
+            AppleIIScreen(memory: machine.memory, refreshToken: machine.refreshToken)
+                .background(KeyboardCapture { machine.keyDown($0) })
+                .frame(width: screenWidth, height: screenHeight)
+                .clipShape(RoundedRectangle(cornerRadius: screenWidth * 0.035, style: .continuous))
+                .overlay {
+                    LinearGradient(colors: [.white.opacity(0.07), .clear, .white.opacity(0.02)], startPoint: .topLeading, endPoint: .bottomTrailing)
+                        .clipShape(RoundedRectangle(cornerRadius: screenWidth * 0.035, style: .continuous))
+                        .allowsHitTesting(false)
+                }
+                // The photo includes the monitor's right-hand control column,
+                // so its CRT center sits left of the full image centerline.
+                .position(screenCenter)
+        }
+        .frame(width: chassisWidth, height: monitorHeight)
+        // Keep the enclosure only subtly rounded.  The reference monitor has
+        // nearly square corners, rather than the large modern-card radius.
+        .clipShape(RoundedRectangle(cornerRadius: 7.5, style: .continuous))
     }
+
 }
 
-private struct MetalButtonStyle: ButtonStyle {
+/// All visible parts of the emulator enclosure share these dimensions.  This
+/// prevents a flexible SwiftUI child from making the control panel and monitor
+/// negotiate different widths.
+private enum ChassisLayout {
+    static let preferredWidth: CGFloat = 960
+    static let minimumWidth: CGFloat = 720
+    static let panelHeight: CGFloat = 118
+    static let verticalSpacing: CGFloat = 30
+
+    static func monitorHeight(for width: CGFloat) -> CGFloat {
+        width / (1448.0 / 1084.0)
+    }
+
+    static let minimumHeight = monitorHeight(for: minimumWidth) + panelHeight + verticalSpacing
+    static let idealHeight = monitorHeight(for: preferredWidth) + panelHeight + verticalSpacing
+}
+
+struct MetalButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 10, weight: .bold, design: .monospaced))
@@ -267,12 +163,13 @@ private struct AppleIIScreen: View {
             // Referencing this published refresh value invalidates Canvas at 60 Hz.
             _ = refreshToken
             context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(Color(red: 0.018, green: 0.04, blue: 0.025)))
-            if memory.textMode {
-                drawText(in: &context, size: size)
+            let video = memory.videoState
+            if video.textMode {
+                drawText(in: &context, size: size, video: video)
             } else {
-                let graphicRows = memory.mixedMode ? 160 : 192
-                drawGraphics(in: &context, size: size, rows: graphicRows)
-                if memory.mixedMode { drawText(in: &context, size: size, rows: 20..<24) }
+                let graphicRows = video.mixedMode ? 160 : 192
+                drawGraphics(in: &context, size: size, rows: graphicRows, video: video)
+                if video.mixedMode { drawText(in: &context, size: size, rows: 20..<24, video: video) }
             }
         }
         .aspectRatio(4.0 / 3.0, contentMode: .fit)
@@ -281,8 +178,8 @@ private struct AppleIIScreen: View {
         .accessibilityLabel("Apple II display")
     }
 
-    private func drawText(in context: inout GraphicsContext, size: CGSize, rows: Range<Int> = 0..<24) {
-        let columns = memory.column80 ? 80 : 40
+    private func drawText(in context: inout GraphicsContext, size: CGSize, rows: Range<Int> = 0..<24, video: AppleIIVideoState) {
+        let columns = video.column80 ? 80 : 40
         let cell = CGSize(width: size.width / CGFloat(columns), height: size.height / 24)
         // The hardware's character flasher alternates its $40-$7F bank while
         // ALTCHARSET is off.  A 60 Hz refresh counter gives its half-second
@@ -290,9 +187,9 @@ private struct AppleIIScreen: View {
         let flashOn = (refreshToken / 30).isMultiple(of: 2)
         for row in rows {
             for col in 0..<columns {
-                let byte = memory.textByte(column: col, row: row)
+                let byte = video.textByte(col, row)
                 guard byte != 0 else { continue }
-                let presentation = appleIITextCell(byte: byte, alternateCharset: memory.alternateCharset, flashOn: flashOn)
+                let presentation = appleIITextCell(byte: byte, alternateCharset: video.alternateCharset, flashOn: flashOn)
                 let (character, inverse) = appleCharacter(presentation)
                 let rect = CGRect(x: CGFloat(col) * cell.width, y: CGFloat(row) * cell.height, width: cell.width, height: cell.height)
                 if inverse { context.fill(Path(rect.insetBy(dx: 1, dy: 1)), with: .color(green)) }
@@ -304,22 +201,22 @@ private struct AppleIIScreen: View {
         }
     }
 
-    private func drawGraphics(in context: inout GraphicsContext, size: CGSize, rows: Int) {
-        if memory.hires {
-            if memory.doubleHires { drawDoubleHiRes(in: &context, size: size, rows: rows) }
-            else { drawHiRes(in: &context, size: size, rows: rows) }
+    private func drawGraphics(in context: inout GraphicsContext, size: CGSize, rows: Int, video: AppleIIVideoState) {
+        if video.hires {
+            if video.doubleHires { drawDoubleHiRes(in: &context, size: size, rows: rows, video: video) }
+            else { drawHiRes(in: &context, size: size, rows: rows, video: video) }
         } else {
-            drawLoRes(in: &context, size: size, rows: rows)
+            drawLoRes(in: &context, size: size, rows: rows, video: video)
         }
     }
 
-    private func drawLoRes(in context: inout GraphicsContext, size: CGSize, rows: Int) {
+    private func drawLoRes(in context: inout GraphicsContext, size: CGSize, rows: Int, video: AppleIIVideoState) {
         let displayRows = min(24, rows / 8)
         let width = size.width / 40
         let height = size.height / 48
         for row in 0..<displayRows {
             for column in 0..<40 {
-                let value = memory.loresByte(column: column, row: row)
+                let value = video.loresByte(column, row)
                 let x = CGFloat(column) * width
                 let y = CGFloat(row * 2) * height
                 context.fill(Path(CGRect(x: x, y: y, width: width + 0.2, height: height + 0.2)), with: .color(loresPalette[Int(value & 0x0F)]))
@@ -328,8 +225,8 @@ private struct AppleIIScreen: View {
         }
     }
 
-    private func drawHiRes(in context: inout GraphicsContext, size: CGSize, rows: Int) {
-        let pixelWidth = size.width / 140
+    private func drawHiRes(in context: inout GraphicsContext, size: CGSize, rows: Int, video: AppleIIVideoState) {
+        let pixelWidth = size.width / 280
         let pixelHeight = size.height / 192
         let palette: [AppleIIHiResColor: Color] = [
             .green: Color(red: 0.20, green: 0.82, blue: 0.26),
@@ -340,8 +237,8 @@ private struct AppleIIScreen: View {
         ]
         var paths = [AppleIIHiResColor: Path]()
         for row in 0..<rows {
-            let bytes = (0..<40).map { memory.hgrByte(column: $0, row: row) }
-            for (x, color) in appleIIHiResColors(bytes: bytes).enumerated() where color != .black {
+            let bytes = (0..<40).map { video.hgrByte($0, row, false) }
+            for (x, color) in appleIIHiResDots(bytes: bytes).enumerated() where color != .black {
                 var path = paths[color, default: Path()]
                 path.addRect(CGRect(x: CGFloat(x) * pixelWidth, y: CGFloat(row) * pixelHeight, width: pixelWidth + 0.1, height: pixelHeight + 0.15))
                 paths[color] = path
@@ -352,14 +249,14 @@ private struct AppleIIScreen: View {
         }
     }
 
-    private func drawDoubleHiRes(in context: inout GraphicsContext, size: CGSize, rows: Int) {
+    private func drawDoubleHiRes(in context: inout GraphicsContext, size: CGSize, rows: Int, video: AppleIIVideoState) {
         let pixelWidth = size.width / 560
         let pixelHeight = size.height / 192
         var paths = [Color: Path]()
         for row in 0..<rows {
             for column in 0..<40 {
-                let aux = UInt16(memory.hgrByte(column: column, row: row, auxiliary: true) & 0x7F)
-                let main = UInt16(memory.hgrByte(column: column, row: row) & 0x7F)
+                let aux = UInt16(video.hgrByte(column, row, true) & 0x7F)
+                let main = UInt16(video.hgrByte(column, row, false) & 0x7F)
                 let bits = aux | (main << 7)
                 for group in 0..<7 {
                     let color = doubleHiresPalette[Int((bits >> UInt16(group * 2)) & 0x0F)]

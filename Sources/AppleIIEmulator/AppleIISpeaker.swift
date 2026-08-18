@@ -1,4 +1,5 @@
 import AVFoundation
+import AppleIIRealtime
 import Foundation
 
 /// Apple II's speaker is a flip-flop, not a host-side click generator.  The
@@ -8,7 +9,6 @@ import Foundation
 /// and prevents UI scheduling jitter from modulating the audible pitch.
 final class AppleIISpeaker {
     private let engine = AVAudioEngine()
-    private let lock = NSLock()
     private let sampleRate = 44_100.0
     private let appleIICyclesPerSecond = 1_021_800.0
     private let cyclesPerSample = 1_021_800.0 / 44_100.0
@@ -16,6 +16,7 @@ final class AppleIISpeaker {
     private let queueCapacity = 32_768
     private let warmupSamples = 2_048
     private var source: AVAudioSourceNode?
+    private let fifo: OpaquePointer
 
     // These are only used by the emulation (main) thread.
     private var edgeCycles = [Int]()
@@ -24,11 +25,10 @@ final class AppleIISpeaker {
     private var renderCycle: Double?
     private var lastEdgeCycle: Int?
 
-    // These are shared solely by producer and audio callback.
-    private var samples = [Float](repeating: 0, count: 32_768)
-    private var readIndex = 0
-    private var writeIndex = 0
-    private var sampleCount = 0
+    // Single-producer (emulation) / single-consumer (Core Audio) storage is
+    // implemented with C11 atomics. The realtime callback never takes a lock
+    // or allocates, so an emulator slice cannot cause an audible callback
+    // priority inversion.
     private var isPrimed = false
     // Audio-thread-only state. A small Apple II speaker and its C12
     // capacitor do not reproduce the ultrasonic PWM carrier as a harsh host
@@ -37,6 +37,10 @@ final class AppleIISpeaker {
     private var filteredOutput: Float = 0
 
     init() {
+        guard let fifo = appleii_audio_fifo_create(queueCapacity) else {
+            fatalError("Unable to allocate Apple II audio FIFO")
+        }
+        self.fifo = fifo
         let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1)!
         let node = AVAudioSourceNode { [weak self] _, _, frameCount, audioBufferList in
             self?.dequeue(frameCount: Int(frameCount), into: audioBufferList)
@@ -103,19 +107,12 @@ final class AppleIISpeaker {
 
     private func enqueue(_ produced: [Float]) {
         guard !produced.isEmpty else { return }
-        lock.lock()
-        for sample in produced {
-            // Keeping a modest latency is preferable to blocking emulation;
-            // if the host stalls for more than 0.7 s, discard oldest audio.
-            if sampleCount == queueCapacity {
-                readIndex = (readIndex + 1) % queueCapacity
-                sampleCount -= 1
-            }
-            samples[writeIndex] = sample
-            writeIndex = (writeIndex + 1) % queueCapacity
-            sampleCount += 1
+        produced.withUnsafeBufferPointer { buffer in
+            guard let base = buffer.baseAddress else { return }
+            // A full FIFO means the host is already behind. Drop the newest
+            // generated tail rather than ever blocking the emulation thread.
+            _ = appleii_audio_fifo_write(fifo, base, buffer.count)
         }
-        lock.unlock()
     }
 
     private func dequeue(frameCount: Int, into audioBufferList: UnsafeMutablePointer<AudioBufferList>) {
@@ -123,14 +120,12 @@ final class AppleIISpeaker {
         guard let first = buffers.first, let rawData = first.mData else { return }
         let output = rawData.assumingMemoryBound(to: Float.self)
 
-        lock.lock()
-        if !isPrimed, sampleCount >= warmupSamples { isPrimed = true }
+        if !isPrimed, appleii_audio_fifo_available(fifo) >= warmupSamples { isPrimed = true }
         for index in 0..<frameCount {
             let target: Float
-            if isPrimed, sampleCount > 0 {
-                target = samples[readIndex]
-                readIndex = (readIndex + 1) % queueCapacity
-                sampleCount -= 1
+            var sample: Float = 0
+            if isPrimed, appleii_audio_fifo_read(fifo, &sample, 1) == 1 {
+                target = sample
             } else {
                 target = 0
                 isPrimed = false
@@ -139,7 +134,6 @@ final class AppleIISpeaker {
             filteredOutput += 0.300 * (target - filteredOutput)
             output[index] = abs(filteredOutput) < 0.012 ? 0 : filteredOutput
         }
-        lock.unlock()
 
         for buffer in buffers.dropFirst() {
             guard let rawData = buffer.mData else { continue }
@@ -147,5 +141,8 @@ final class AppleIISpeaker {
         }
     }
 
-    deinit { engine.stop() }
+    deinit {
+        engine.stop()
+        appleii_audio_fifo_destroy(fifo)
+    }
 }

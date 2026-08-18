@@ -104,39 +104,18 @@ final class AppleIIMachine: ObservableObject {
 
     }
 
-    /// Games imported from the local archive and shipped inside the app
-    /// bundle. Keeping the resource URL lets the menu load them without a
-    /// file picker or a dependency on the original download directory.
-    struct DownloadedGame: Identifiable {
-        let url: URL
-
-        var id: URL { url }
-        var title: String { url.deletingPathExtension().lastPathComponent }
-        var initial: String {
-            guard let first = title.first else { return "#" }
-            let value = String(first).uppercased()
-            return value.rangeOfCharacter(from: .letters) == nil ? "#" : value
-        }
-    }
-
     @Published private(set) var isRunning = true
     @Published private(set) var hasExternalROM = false
-    @Published private(set) var status = "内置诊断 ROM"
+    @Published private(set) var status = "Apple II+（内置） · 未插入磁盘"
     @Published private(set) var refreshToken = 0
-    @Published private(set) var selectedBootROM: BootROM = .appleIIcROM04
+    @Published private(set) var selectedBootROM: BootROM = .appleIIPlus
     @Published private(set) var diskDescription = "未插入"
     @Published private(set) var externalDiskDescription = "未插入"
 
+    private let gameLibrary = GameLibrary()
     /// Grouping keeps the in-app GAME menu navigable even with a large game
     /// collection rather than presenting hundreds of entries in one list.
-    let downloadedGames: [DownloadedGame] = ((try? FileManager.default.contentsOfDirectory(
-        at: Bundle.module.bundleURL,
-        includingPropertiesForKeys: nil,
-        options: [.skipsHiddenFiles]
-    )) ?? [])
-        .filter { ["dsk", "do", "d13", "po", "nib", "2mg", "2img"].contains($0.pathExtension.lowercased()) }
-        .map(DownloadedGame.init(url:))
-        .sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+    var downloadedGames: [GameLibrary.Game] { gameLibrary.games }
 
     let memory = AppleIIMemory()
     private var cpu: MOS6502!
@@ -151,21 +130,20 @@ final class AppleIIMachine: ObservableObject {
     // and turns game audio into a burst of distorted clicks.
     private var lastEmulationTick = ProcessInfo.processInfo.systemUptime
     private var fractionalCPUCycles = 0.0
-    // A physical Apple joystick is an analogue device.  The host keyboard
-    // supplies a practical digital equivalent: keep each direction asserted
-    // until key-up, then present the matching paddle value to games polling
-    // PDL(0/1).  Mirroring it on PDL(2/3) also covers titles configured for
-    // the second game connector.
-    private var heldJoystickKeys = Set<UInt16>()
+    private var inputState = AppleIIInputState()
+    /// A diskless Apple II+ reaches ROM Applesoft through the Autostart ROM's
+    /// warm-reset path after it has shown the power-on banner.
+    private var applesoftWarmStartDeadline: TimeInterval?
 
     init() {
         memory.speakerDidToggleAtCycle = { [weak speaker] cycle in
             speaker?.toggle(atEmulatedCycle: cycle)
         }
         cpu = MOS6502(bus: memory)
-        // A real IIc ROM plus a small bundled boot disk make first launch a
-        // usable computer, without asking the user to hunt for ROM files.
-        selectROM(.appleIIcROM04)
+        // Start as an unmodified Apple II+: the real autostart ROM produces
+        // its familiar `APPLE ][` power-on screen.  A diagnostic disk is an
+        // explicit menu tool, never the user's default operating environment.
+        selectROM(.appleIIPlus)
         // AppKit delivers this before the responder chain, so Apple II input
         // works even when Canvas is not the current first responder.
         keyboardMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -214,6 +192,13 @@ final class AppleIIMachine: ObservableObject {
         let cycles = Int(fractionalCPUCycles)
         fractionalCPUCycles -= Double(cycles)
         if cycles > 0 { cpu.run(cycles: cycles) }
+        if let deadline = applesoftWarmStartDeadline, now >= deadline {
+            // This deliberately resets only the CPU. Resetting I/O hardware
+            // would erase the ROM's cold-start marker and restart disk boot.
+            cpu.reset()
+            applesoftWarmStartDeadline = nil
+            status = "Apple II+（内置） · Applesoft BASIC"
+        }
         speaker.advance(toEmulatedCycle: cpu.totalCycles)
         refreshToken &+= 1
     }
@@ -238,6 +223,7 @@ final class AppleIIMachine: ObservableObject {
     var hasExecutedRAMCode: Bool { cpu.hasExecutedRAMInstruction }
 
     func reset() {
+        applesoftWarmStartDeadline = nil
         memory.resetHardwareState()
         cpu.reset()
         isRunning = true
@@ -277,20 +263,9 @@ final class AppleIIMachine: ObservableObject {
     }
 
     private func updateJoystick(for keyCode: UInt16, pressed: Bool) {
-        // macOS virtual-key codes for the four cursor keys.  We deliberately
-        // still latch their Apple II keyboard equivalents in `keyDown`, so a
-        // title using cursor-key input keeps working too.
-        guard [123, 124, 125, 126].contains(keyCode) else { return }
-        if pressed { heldJoystickKeys.insert(keyCode) }
-        else { heldJoystickKeys.remove(keyCode) }
-
-        let left = heldJoystickKeys.contains(123)
-        let right = heldJoystickKeys.contains(124)
-        let down = heldJoystickKeys.contains(125)
-        let up = heldJoystickKeys.contains(126)
-        let horizontal: UInt8 = left == right ? 127 : (left ? 0 : 255)
-        let vertical: UInt8 = up == down ? 127 : (up ? 0 : 255)
-        memory.setPaddles([horizontal, vertical, horizontal, vertical])
+        if let paddles = inputState.setJoystickKey(keyCode, pressed: pressed) {
+            memory.setPaddles(paddles)
+        }
     }
 
     /// The Apple II keyboard presents uppercase ASCII plus a strobe bit.  We
@@ -316,10 +291,6 @@ final class AppleIIMachine: ObservableObject {
         case .appleIIPlus:
             do {
                 try memory.loadBundledAppleIIPlusROM(diskFirmware: .sixteenSector)
-                if !memory.hasDisk(in: 0) {
-                    try memory.mountDSK(DiskII.diagnosticDSK())
-                    diskDescription = "测试启动盘（.dsk）"
-                }
                 hasExternalROM = true
                 status = "Apple II+（内置） · \(diskDescription)"
             } catch {
@@ -329,10 +300,6 @@ final class AppleIIMachine: ObservableObject {
         case .appleIIcROM00, .appleIIcROM03, .appleIIcROM04, .appleIIcROMFF:
             do {
                 try memory.loadBundledAppleIIcROM(named: choice.resourceName!)
-                if !memory.hasDisk(in: 0) {
-                    try memory.mountDSK(DiskII.diagnosticDSK())
-                    diskDescription = "测试启动盘（.dsk）"
-                }
                 hasExternalROM = true
                 status = "\(choice.title)（内置） · \(diskDescription)"
             } catch {
@@ -345,6 +312,7 @@ final class AppleIIMachine: ObservableObject {
             status = "内置诊断 ROM"
         }
         reset()
+        scheduleApplesoftWarmStartIfDiskless()
     }
 
     private func installDiagnosticROM() {
@@ -392,14 +360,14 @@ final class AppleIIMachine: ObservableObject {
     }
 
     var downloadedGameInitials: [String] {
-        Array(Set(downloadedGames.map(\.initial))).sorted()
+        gameLibrary.initials
     }
 
-    func downloadedGames(startingWith initial: String) -> [DownloadedGame] {
-        downloadedGames.filter { $0.initial == initial }
+    func downloadedGames(startingWith initial: String) -> [GameLibrary.Game] {
+        gameLibrary.games(startingWith: initial)
     }
 
-    func loadDownloadedGame(_ game: DownloadedGame) {
+    func loadDownloadedGame(_ game: GameLibrary.Game) {
         loadDownloadedGame(at: game.url, title: game.title)
     }
 
@@ -475,6 +443,7 @@ final class AppleIIMachine: ObservableObject {
         setDiskDescription("未插入", drive: drive)
         status = "\(selectedBootROM.title) · 驱动器 \(drive + 1) 未插入磁盘"
         reset()
+        scheduleApplesoftWarmStartIfDiskless()
     }
 
     func saveDiskAsNIB(drive: Int = 0) {
@@ -500,9 +469,16 @@ final class AppleIIMachine: ObservableObject {
         if drive == 0 { diskDescription = description }
         else { externalDiskDescription = description }
     }
+
+    private func scheduleApplesoftWarmStartIfDiskless() {
+        guard selectedBootROM == .appleIIPlus, !memory.hasDisk(in: 0) else { return }
+        // The bundled ROM needs about half a million emulated cycles to set
+        // its cold-start marker before a warm RESET can enter Applesoft.
+        applesoftWarmStartDeadline = ProcessInfo.processInfo.systemUptime + 0.60
+    }
 }
 
-final class AppleIIMemory {
+final class AppleIIMemory: AppleIIBus {
     enum Model: Equatable { case appleIIPlus, appleIIc }
     enum DiskIIFirmware: Equatable {
         case thirteenSector, sixteenSector
@@ -538,7 +514,7 @@ final class AppleIIMemory {
     private(set) var doubleHires = false
     private(set) var alternateZeroPage = false
     private(set) var alternateCharset = false
-    private let diskII = DiskII()
+    private let diskController = IWMController()
     private(set) var speakerFlips = 0
     var speakerDidToggle: (() -> Void)?
     var speakerDidToggleAtCycle: ((Int) -> Void)?
@@ -554,6 +530,16 @@ final class AppleIIMemory {
     private var paddles: [UInt8] = [127, 127, 127, 127]
     private var openAppleDown = false
     private var closedAppleDown = false
+    var videoState: AppleIIVideoState {
+        AppleIIVideoState(
+            textMode: textMode, mixedMode: mixedMode, hires: hires,
+            doubleHires: doubleHires, column80: column80,
+            alternateCharset: alternateCharset,
+            textByte: { [weak self] column, row in self?.textByte(column: column, row: row) ?? 0 },
+            loresByte: { [weak self] column, row in self?.loresByte(column: column, row: row) ?? 0 },
+            hgrByte: { [weak self] column, row, auxiliary in self?.hgrByte(column: column, row: row, auxiliary: auxiliary) ?? 0 }
+        )
+    }
     private static let cyclesPerLine = 65
     private static let linesPerFrame = 262
 
@@ -751,7 +737,7 @@ final class AppleIIMemory {
         doubleHires = false
         alternateZeroPage = false
         alternateCharset = false
-        diskII.reset()
+        diskController.reset()
         videoClock = 0
         iiCVBLFlag = false
         iicIOUDisabled = false
@@ -806,7 +792,7 @@ final class AppleIIMemory {
         // Disk II hardware is clocked by the machine, not by reads of its
         // soft switches.  Keeping it on the same cycle source as video and
         // paddles preserves the timing expected by boot loaders.
-        diskII.advance(by: cycles)
+        diskController.advance(by: cycles)
         if model == .appleIIc, iicVBLEnabled, oldLine < 192, (newLine >= 192 || newLine < oldLine) {
             iiCVBLFlag = true
         }
@@ -823,23 +809,23 @@ final class AppleIIMemory {
         for index in paddles.indices where values.indices.contains(index) { paddles[index] = values[index] }
     }
 
-    func mountDSK(_ data: Data, drive: Int = 0) throws { try diskII.mountDSK(data, drive: drive) }
-    func mountThirteenSectorDisk(_ data: Data, drive: Int = 0) throws { try diskII.mountThirteenSectorImage(data, drive: drive) }
-    func mountDiskImage(at url: URL, drive: Int = 0) throws { try diskII.mountImage(Data(contentsOf: url), fileExtension: url.pathExtension, drive: drive) }
-    func mountDiskImageData(_ data: Data, fileExtension: String, drive: Int = 0) throws { try diskII.mountImage(data, fileExtension: fileExtension, drive: drive) }
-    func nibImage(drive: Int = 0) -> Data? { diskII.nibImage(drive: drive) }
-    func ejectDisk(drive: Int = 0) { diskII.eject(drive: drive) }
-    var hasDisk: Bool { diskII.hasDisk }
-    func hasDisk(in drive: Int) -> Bool { diskII.hasDisk(in: drive) }
-    var diskNibbleReads: Int { diskII.nibbleReads }
-    var diskNibbleWrites: Int { diskII.nibbleWrites }
-    var diskTrack: Int { diskII.currentTrack() }
+    func mountDSK(_ data: Data, drive: Int = 0) throws { try diskController.mountDSK(data, drive: drive) }
+    func mountThirteenSectorDisk(_ data: Data, drive: Int = 0) throws { try diskController.mountThirteenSectorImage(data, drive: drive) }
+    func mountDiskImage(at url: URL, drive: Int = 0) throws { try diskController.mountImage(Data(contentsOf: url), fileExtension: url.pathExtension, drive: drive) }
+    func mountDiskImageData(_ data: Data, fileExtension: String, drive: Int = 0) throws { try diskController.mountImage(data, fileExtension: fileExtension, drive: drive) }
+    func nibImage(drive: Int = 0) -> Data? { diskController.nibImage(drive: drive) }
+    func ejectDisk(drive: Int = 0) { diskController.eject(drive: drive) }
+    var hasDisk: Bool { diskController.hasDisk }
+    func hasDisk(in drive: Int) -> Bool { diskController.hasDisk(in: drive) }
+    var diskNibbleReads: Int { diskController.nibbleReads }
+    var diskNibbleWrites: Int { diskController.nibbleWrites }
+    var diskTrack: Int { diskController.currentTrack() }
 
     /// The IIc's integrated IWM occupies slot-zero I/O ($C080-$C08F). This
     /// models its control latch and data path; the sector stream is attached
     /// to this same state machine by the disk-image layer.
     private func accessIWM(_ address: Int, write value: UInt8?) -> UInt8 {
-        diskII.access(address, write: value)
+        diskController.access(address, write: value)
     }
 
     func installDiagnosticProgram() {

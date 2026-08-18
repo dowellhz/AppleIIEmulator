@@ -4,7 +4,7 @@ import Foundation
 /// separately from Apple II hardware, allowing the same core to be exercised
 /// with conformance ROMs and a simple test bus.
 final class MOS6502 {
-    private let bus: AppleIIMemory
+    private let bus: AppleIIBus
     private(set) var a: UInt8 = 0
     private(set) var x: UInt8 = 0
     private(set) var y: UInt8 = 0
@@ -33,7 +33,7 @@ final class MOS6502 {
 
     private enum Mode { case immediate, zeroPage, zeroPageX, zeroPageY, absolute, absoluteX, absoluteY, indexedIndirect, indirectIndexed, zeroPageIndirect }
 
-    init(bus: AppleIIMemory) { self.bus = bus }
+    init(bus: AppleIIBus) { self.bus = bus }
 
     func reset() {
         a = 0; x = 0; y = 0; sp = 0xFD; p = unused | interrupt

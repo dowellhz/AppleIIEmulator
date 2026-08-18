@@ -19,6 +19,7 @@
 
 - `$C030` toggles a one-bit speaker flip-flop. Record every edge with its emulated cycle; never turn each access into an independent host-side click.
 - Generate PCM into a bounded producer/consumer buffer. The audio callback must only dequeue prepared samples and must not inspect emulator state or allocate memory.
+- `Sources/AppleIIRealtime` is the one permitted C11 target: use it only for lock-free realtime primitives with explicit atomic memory ordering. Do not add a package dependency merely to obtain an atomic queue.
 - Keep CPU execution and audio on a shared monotonic time base. UI timer jitter must not change audio pitch.
 - Avoid arbitrary audio filters. Any filtering/noise suppression must be documented as a speaker-path approximation and kept configurable if it materially changes game audio.
 

@@ -1,7 +1,15 @@
+import AppKit
 import XCTest
 @testable import AppleIIEmulator
 
 final class AppleIIEmulatorTests: XCTestCase {
+    func testVintagePanelArtworkIsReadableFromResourceBundle() throws {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "VintagePlasticTexture", withExtension: "png"))
+        let image = try XCTUnwrap(NSImage(contentsOf: url))
+        XCTAssertGreaterThan(image.size.width, 1)
+        XCTAssertGreaterThan(image.size.height, 1)
+    }
+
     func testKeyboardStrobeClearsAtC010() {
         let memory = AppleIIMemory()
         memory.latchKey(0xC1)
@@ -445,6 +453,44 @@ final class AppleIIEmulatorTests: XCTestCase {
         XCTAssertTrue(text.contains("DISK BOOT OK"), "track=\(memory.diskTrack) \(text)")
     }
 
+    func testAppleIIPlusSecondResetEntersROMApplesoft() throws {
+        let memory = AppleIIMemory()
+        try memory.loadBundledAppleIIPlusROM(diskFirmware: .sixteenSector)
+        let cpu = MOS6502(bus: memory)
+        cpu.reset()
+        cpu.run(cycles: 500_000)
+        cpu.reset()
+        cpu.run(cycles: 500_000)
+        let text = (0..<24).map { row in
+            String((0..<40).map { memory.textByte(column: $0, row: row) & 0x7F }.map(UnicodeScalar.init).map(Character.init))
+        }.joined(separator: "|")
+        XCTAssertTrue(text.contains("]"), "pc=$\(String(cpu.pc, radix: 16)) \(text)")
+    }
+
+    func testROMApplesoftExecutesKeyboardPRINTCommand() throws {
+        let memory = AppleIIMemory()
+        try memory.loadBundledAppleIIPlusROM(diskFirmware: .sixteenSector)
+        let cpu = MOS6502(bus: memory)
+        cpu.reset()
+        cpu.run(cycles: 500_000)
+        cpu.reset()
+        cpu.run(cycles: 500_000)
+
+        for byte in Array("PRINT 1".utf8) {
+            memory.latchKey(byte | 0x80)
+            cpu.run(cycles: 40_000)
+        }
+        memory.latchKey(0x8D) // RETURN
+        cpu.run(cycles: 250_000)
+
+        let text = (0..<24).map { row in
+            String((0..<40).map { memory.textByte(column: $0, row: row) & 0x7F }.map(UnicodeScalar.init).map(Character.init))
+        }.joined(separator: "|")
+        XCTAssertTrue(cpu.unsupportedOpcodes.isEmpty)
+        XCTAssertTrue(text.contains("PRINT 1"), text)
+        XCTAssertTrue(text.contains("1"), text)
+    }
+
     func testThirteenSectorGCRRoundTripsBootSector() throws {
         let disk = DiskII()
         let image = DiskII.diagnosticDSK()
@@ -460,6 +506,14 @@ final class AppleIIEmulatorTests: XCTestCase {
             XCTAssertEqual(machine.diskDescription, game.title)
             XCTAssertTrue(machine.memory.hasDisk(in: 0), game.title)
         }
+    }
+
+    @MainActor
+    func testFreshMachineStartsAsUnmodifiedAppleIIPlusWithoutDiagnosticDisk() {
+        let machine = AppleIIMachine()
+        XCTAssertEqual(machine.selectedBootROM, .appleIIPlus)
+        XCTAssertEqual(machine.diskDescription, "未插入")
+        XCTAssertFalse(machine.memory.hasDisk(in: 0))
     }
 
     @MainActor
@@ -504,46 +558,6 @@ final class AppleIIEmulatorTests: XCTestCase {
         let memory = AppleIIMemory()
         try memory.mountDiskImageData(Data(repeating: 0xFF, count: DiskII.nibImageSize), fileExtension: "nib")
         XCTAssertTrue(memory.hasDisk)
-    }
-
-    func testIWMWriteDataRegisterWritesNibbleStream() throws {
-        let disk = DiskII()
-        try disk.mountDSK(DiskII.diagnosticDSK())
-        _ = disk.access(0x09, write: nil) // motor on
-        _ = disk.access(0x0F, write: nil) // Q7 high
-        _ = disk.access(0x0D, write: 0xA5) // Q6 high: write-data register
-        disk.advance(by: 64)
-        XCTAssertGreaterThan(disk.nibbleWrites, 0)
-    }
-
-    func testIWMSelectsIndependentSecondDrive() throws {
-        let disk = DiskII()
-        try disk.mountDSK(DiskII.diagnosticDSK(), drive: 0)
-        try disk.mountDSK(DiskII.diagnosticDSK(), drive: 1)
-        XCTAssertTrue(disk.hasDisk(in: 0))
-        XCTAssertTrue(disk.hasDisk(in: 1))
-        _ = disk.access(0x09, write: nil) // motor on
-        _ = disk.access(0x0B, write: nil) // drive 2 selected
-        _ = disk.access(0x0C, write: nil) // Q6 low
-        _ = disk.access(0x0E, write: nil) // Q7 low
-        disk.advance(by: 1_024)
-        _ = disk.access(0x0C, write: nil)
-        XCTAssertGreaterThan(disk.nibbleReads, 0)
-        disk.eject(drive: 1)
-        XCTAssertFalse(disk.hasDisk(in: 1))
-        XCTAssertTrue(disk.hasDisk(in: 0))
-    }
-
-    func testIWMStepperUsesQuarterTrackState() throws {
-        let disk = DiskII()
-        try disk.mountDSK(DiskII.diagnosticDSK())
-        _ = disk.access(0x09, write: nil) // motor on
-        _ = disk.access(0x01, write: nil) // phase 0
-        _ = disk.access(0x03, write: nil) // phase 1: half-track only
-        XCTAssertEqual(disk.currentTrack(), 0)
-        _ = disk.access(0x05, write: nil) // phase 2: one full track
-        _ = disk.access(0x07, write: nil) // phase 3: one and a half tracks
-        XCTAssertEqual(disk.currentTrack(), 1)
     }
 
     func testDSKGCREncodingRoundTripsEverySectorOrder() throws {

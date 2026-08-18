@@ -4,18 +4,9 @@ import Foundation
 /// `.dsk/.do`, ProDOS-order `.po`, pre-nibblized 35-track `.nib`, and their
 /// common 2IMG (`.2mg/.2img`) wrappers, exposing the same GCR byte stream that
 /// the original controller delivers to firmware.
-final class DiskII {
-    private struct BitTrack {
-        var bytes: [UInt8]
-        var bitCount: Int
-    }
-
-    private struct EncodedTrack {
-        var nibbles: [UInt8]
-        var sync: [Bool]
-        var syncTrailingZeros: Int
-    }
-
+/// IWM/P6 soft-switch state machine. Media container decoding is delegated to
+/// `DiskImageCodec`; callers may keep using the historical `DiskII` alias.
+final class IWMController {
     static let imageSize = 35 * 16 * 256
     static let thirteenSectorImageSize = 35 * 13 * 256
     static let nibImageSize = 35 * 6_656
@@ -70,17 +61,7 @@ final class DiskII {
         return decodeP6PROM(normalizeThirteenSectorP6Dump(Array(raw)))
     }()
 
-    private var driveTracks = [[[UInt8]]](repeating: [], count: 2)
-    // The visible nibble stream is retained for import/export and decoding;
-    // the controller consumes this separate packed bit stream.  In particular,
-    // a self-sync $FF cell occupies ten bits on a real Disk II disk.
-    private var driveBitTracks = [[BitTrack]](repeating: [], count: 2)
-    private var thirteenSectorMedia = [false, false]
-    // The stepper moves in half tracks.  Keeping this separately from the
-    // 35 stored data tracks avoids skipping every other physical track when
-    // DOS changes phase magnets in the normal 0→1→2→3 sequence.
-    private var quarterTrack = [0, 0]
-    private var bitPositions = [0, 0]
+    private var drives = [DiskDrive(), DiskDrive()]
     private var phaseStates: UInt8 = 0
     private var q6 = false
     private var q7 = false
@@ -95,21 +76,18 @@ final class DiskII {
     private(set) var nibbleReads = 0
     private(set) var nibbleWrites = 0
 
-    var hasDisk: Bool { driveTracks.contains { !$0.isEmpty } }
-    func hasDisk(in drive: Int) -> Bool { driveTracks.indices.contains(drive) && !driveTracks[drive].isEmpty }
+    var hasDisk: Bool { drives.contains { $0.hasDisk } }
+    func hasDisk(in drive: Int) -> Bool { drives.indices.contains(drive) && drives[drive].hasDisk }
 
     func reset() {
-        quarterTrack = [0, 0]; bitPositions = [0, 0]; phaseStates = 0; q6 = false; q7 = false
+        for index in drives.indices { drives[index].quarterTrack = 0; drives[index].bitPosition = 0 }
+        phaseStates = 0; q6 = false; q7 = false
         motorOn = false; motorOffDelay = 0; selectedDrive = 0; dataLatch = 0; busData = 0; sequencerState = 0; sequencerPhase = 0; writeLevel = 0; nibbleReads = 0; nibbleWrites = 0
     }
 
     func eject(drive: Int = 0) {
-        guard driveTracks.indices.contains(drive) else { return }
-        driveTracks[drive].removeAll()
-        driveBitTracks[drive].removeAll()
-        quarterTrack[drive] = 0
-        bitPositions[drive] = 0
-        thirteenSectorMedia[drive] = false
+        guard drives.indices.contains(drive) else { return }
+        drives[drive].eject()
     }
 
     func mountDSK(_ data: Data, drive: Int = 0) throws {
@@ -132,7 +110,7 @@ final class DiskII {
     }
 
     func mountThirteenSectorImage(_ data: Data, drive: Int) throws {
-        guard driveTracks.indices.contains(drive),
+        guard drives.indices.contains(drive),
               data.count == Self.thirteenSectorImageSize || data.count == Self.imageSize else {
             throw CocoaError(.fileReadCorruptFile)
         }
@@ -143,11 +121,7 @@ final class DiskII {
         let compactImageIsPadded = data.count == Self.imageSize && image[Self.thirteenSectorImageSize...].allSatisfy { $0 == 0 }
         let sectorsPerTrack = data.count == Self.thirteenSectorImageSize || compactImageIsPadded ? 13 : 16
         let tracks = (0..<35).map { Self.nibblizeThirteenSectorTrack($0, image: image, sectorsPerTrack: sectorsPerTrack) }
-        driveTracks[drive] = tracks.map(\.nibbles)
-        driveBitTracks[drive] = tracks.map { Self.bitTrack(nibbles: $0.nibbles, sync: $0.sync, trailingZeros: $0.syncTrailingZeros) }
-        thirteenSectorMedia[drive] = true
-        quarterTrack[drive] = 0
-        bitPositions[drive] = 0
+        drives[drive].install(tracks: tracks.map(\.nibbles), bitTracks: tracks.map { Self.bitTrack(nibbles: $0.nibbles, sync: $0.sync, trailingZeros: $0.syncTrailingZeros) }, thirteenSector: true)
     }
 
     private func mountProDOS(_ data: Data, drive: Int) throws {
@@ -155,39 +129,38 @@ final class DiskII {
     }
 
     private func mountSectorImage(_ data: Data, sectorOrder: [Int], drive: Int) throws {
-        guard driveTracks.indices.contains(drive), data.count == Self.imageSize else { throw CocoaError(.fileReadCorruptFile) }
+        guard drives.indices.contains(drive), data.count == Self.imageSize else { throw CocoaError(.fileReadCorruptFile) }
         let image = Array(data)
         let tracks = (0..<35).map { Self.nibblizeTrack($0, image: image, sectorOrder: sectorOrder) }
-        driveTracks[drive] = tracks.map(\.nibbles)
-        driveBitTracks[drive] = tracks.map { Self.bitTrack(nibbles: $0.nibbles, sync: $0.sync, trailingZeros: $0.syncTrailingZeros) }
-        thirteenSectorMedia[drive] = false
-        quarterTrack[drive] = 0
-        bitPositions[drive] = 0
+        drives[drive].install(tracks: tracks.map(\.nibbles), bitTracks: tracks.map { Self.bitTrack(nibbles: $0.nibbles, sync: $0.sync, trailingZeros: $0.syncTrailingZeros) }, thirteenSector: false)
     }
 
     func mountImage(_ data: Data, fileExtension: String, drive: Int = 0) throws {
-        switch fileExtension.lowercased() {
-        case "dsk", "do": try mountDSK(data, drive: drive)
-        case "d13": try mountThirteenSectorImage(data, drive: drive)
-        case "po": try mountProDOS(data, drive: drive)
-        case "2mg", "2img": try mountTwoIMG(data, drive: drive)
-        case "nib":
-            guard driveTracks.indices.contains(drive), data.count == Self.nibImageSize else { throw CocoaError(.fileReadCorruptFile) }
+        guard let format = DiskImageFormat(fileExtension: fileExtension) else {
+            throw CocoaError(.fileReadUnsupportedScheme)
+        }
+        try mount(DiskImageCodec.decode(data, format: format), drive: drive)
+    }
+
+    private func mount(_ payload: DiskImagePayload, drive: Int) throws {
+        switch payload {
+        case let .dos(data): try mountDSK(data, drive: drive)
+        case let .thirteenSector(data): try mountThirteenSectorImage(data, drive: drive)
+        case let .prodos(data): try mountProDOS(data, drive: drive)
+        case let .nib(data):
+            guard drives.indices.contains(drive), data.count == Self.nibImageSize else { throw CocoaError(.fileReadCorruptFile) }
             let bytes = Array(data)
-            driveTracks[drive] = (0..<35).map { index in
+            let tracks = (0..<35).map { index in
                 let start = index * 6_656
                 return Array(bytes[start..<(start + 6_656)])
             }
-            driveBitTracks[drive] = driveTracks[drive].map { stream in
+            let bitTracks = tracks.map { stream in
                 // Raw NIB does not preserve an explicit sync map. $FF is the
                 // canonical self-sync fill byte, so this remains compatible
                 // with conventional NIB images while DSK conversion is exact.
                 Self.bitTrack(nibbles: stream, sync: stream.map { $0 == 0xFF }, trailingZeros: 2)
             }
-            thirteenSectorMedia[drive] = false
-            quarterTrack[drive] = 0
-            bitPositions[drive] = 0
-        default: throw CocoaError(.fileReadUnsupportedScheme)
+            drives[drive].install(tracks: tracks, bitTracks: bitTracks, thirteenSector: false)
         }
     }
 
@@ -195,40 +168,7 @@ final class DiskII {
     /// This is deliberately limited to 140 KB 5.25-inch payloads: larger
     /// ProDOS hard-disk images require SmartPort hardware, not the IIc IWM.
     private func mountTwoIMG(_ data: Data, drive: Int) throws {
-        let bytes = Array(data)
-        guard bytes.count >= 64,
-              Array(bytes[0..<4]) == [0x32, 0x49, 0x4D, 0x47] else {
-            throw CocoaError(.fileReadCorruptFile)
-        }
-
-        func little16(at offset: Int) -> Int {
-            Int(bytes[offset]) | (Int(bytes[offset + 1]) << 8)
-        }
-        func little32(at offset: Int) -> Int {
-            Int(bytes[offset]) |
-                (Int(bytes[offset + 1]) << 8) |
-                (Int(bytes[offset + 2]) << 16) |
-                (Int(bytes[offset + 3]) << 24)
-        }
-
-        let headerLength = little16(at: 8)
-        let format = little32(at: 12)
-        let dataOffset = little32(at: 24)
-        let dataLength = little32(at: 28)
-        guard headerLength >= 64,
-              dataOffset >= headerLength,
-              dataOffset <= bytes.count,
-              dataLength <= bytes.count - dataOffset else {
-            throw CocoaError(.fileReadCorruptFile)
-        }
-
-        let payload = Data(bytes[dataOffset..<(dataOffset + dataLength)])
-        switch format {
-        case 0: try mountDSK(payload, drive: drive)       // DOS sector order
-        case 1: try mountProDOS(payload, drive: drive)    // ProDOS sector order
-        case 2: try mountImage(payload, fileExtension: "nib", drive: drive)
-        default: throw CocoaError(.fileReadUnsupportedScheme)
-        }
+        try mount(DiskImageCodec.decode(data, format: .twoIMG), drive: drive)
     }
 
     /// Returns the byte visible on the IWM data/status bus after a slot-six
@@ -276,19 +216,27 @@ final class DiskII {
 
     private func setPhase(_ phase: Int, enabled: Bool) {
         let mask = UInt8(1 << phase)
+        let wasEnabled = phaseStates & mask != 0
         if enabled { phaseStates |= mask } else { phaseStates &= ~mask }
-        let aligned = (quarterTrack[selectedDrive] >> 1) & 3
-        var direction = 0
-        if phaseStates & UInt8(1 << ((aligned + 1) & 3)) != 0 { direction += 1 }
-        if phaseStates & UInt8(1 << ((aligned + 3) & 3)) != 0 { direction -= 1 }
-        if direction != 0 { quarterTrack[selectedDrive] = min(139, max(0, quarterTrack[selectedDrive] + direction * 2)) }
+        // Advance only on a phase's rising edge. Looking at all active coils
+        // makes the normal 0→1→2→3 stepping sequence cancel itself once more
+        // than one magnet is energized. A newly selected adjacent phase moves
+        // the head by one half-track (two quarter-track units).
+        guard enabled, !wasEnabled else { return }
+        let currentPhase = (drives[selectedDrive].quarterTrack >> 1) & 3
+        let delta = (phase - currentPhase + 4) & 3
+        if delta == 1 {
+            drives[selectedDrive].quarterTrack = min(139, drives[selectedDrive].quarterTrack + 2)
+        } else if delta == 3 {
+            drives[selectedDrive].quarterTrack = max(0, drives[selectedDrive].quarterTrack - 2)
+        }
     }
 
     private func clockSequencer() {
         let pulse: UInt8 = sequencerPhase == 4 && !q7 ? readBit() : 0
         let qa = (dataLatch >> 7) & 1
         let address = Int((sequencerState << 4) | (q7 ? 0x08 : 0) | (q6 ? 0x04 : 0) | (qa << 1) | (pulse == 0 ? 1 : 0))
-        let p6 = thirteenSectorMedia[selectedDrive] ? Self.thirteenSectorP6 : Self.p6
+        let p6 = drives[selectedDrive].isThirteenSector ? Self.thirteenSectorP6 : Self.p6
         let operation = p6[address]
         switch operation & 0x0F {
         case 0...7: dataLatch = 0
@@ -306,33 +254,33 @@ final class DiskII {
 
     private func readBit() -> UInt8 {
         guard hasDisk(in: selectedDrive) else { return 0 }
-        let track = quarterTrack[selectedDrive] / 4
-        guard driveBitTracks[selectedDrive].indices.contains(track) else { return 0 }
-        let stream = driveBitTracks[selectedDrive][track]
+        let track = drives[selectedDrive].quarterTrack / 4
+        guard drives[selectedDrive].bitTracks.indices.contains(track) else { return 0 }
+        let stream = drives[selectedDrive].bitTracks[track]
         guard stream.bitCount > 0 else { return 0 }
-        let position = bitPositions[selectedDrive] % stream.bitCount
+        let position = drives[selectedDrive].bitPosition % stream.bitCount
         let result = (stream.bytes[position / 8] >> UInt8(7 - (position & 7))) & 1
-        bitPositions[selectedDrive] = (position + 1) % stream.bitCount
+        drives[selectedDrive].bitPosition = (position + 1) % stream.bitCount
         nibbleReads &+= 1
         return result
     }
 
     private func writeBit(_ bit: UInt8) {
         guard hasDisk(in: selectedDrive) else { return }
-        let track = quarterTrack[selectedDrive] / 4
-        guard driveBitTracks[selectedDrive].indices.contains(track) else { return }
-        let count = driveBitTracks[selectedDrive][track].bitCount
+        let track = drives[selectedDrive].quarterTrack / 4
+        guard drives[selectedDrive].bitTracks.indices.contains(track) else { return }
+        let count = drives[selectedDrive].bitTracks[track].bitCount
         guard count > 0 else { return }
-        let position = bitPositions[selectedDrive] % count
+        let position = drives[selectedDrive].bitPosition % count
         let byte = position / 8
         let shift = UInt8(7 - (position & 7))
-        driveBitTracks[selectedDrive][track].bytes[byte] &= ~(UInt8(1) << shift)
-        driveBitTracks[selectedDrive][track].bytes[byte] |= (bit & 1) << shift
-        bitPositions[selectedDrive] = (position + 1) % count
+        drives[selectedDrive].bitTracks[track].bytes[byte] &= ~(UInt8(1) << shift)
+        drives[selectedDrive].bitTracks[track].bytes[byte] |= (bit & 1) << shift
+        drives[selectedDrive].bitPosition = (position + 1) % count
         nibbleWrites &+= 1
     }
 
-    private static func nibblizeTrack(_ track: Int, image: [UInt8], sectorOrder: [Int]) -> EncodedTrack {
+    private static func nibblizeTrack(_ track: Int, image: [UInt8], sectorOrder: [Int]) -> EncodedDiskTrack {
         var output = [UInt8]()
         var sync = [Bool]()
         func data(_ values: [UInt8]) { output += values; sync += Array(repeating: false, count: values.count) }
@@ -354,7 +302,7 @@ final class DiskII {
             data([0xDE, 0xAA, 0xEB])
             gap(24)
         }
-        return EncodedTrack(nibbles: output, sync: sync, syncTrailingZeros: 2)
+        return EncodedDiskTrack(nibbles: output, sync: sync, syncTrailingZeros: 2)
     }
 
     /// Nibblizes a DOS 3.1/3.2 13-sector track.  The earlier controller's
@@ -362,7 +310,7 @@ final class DiskII {
     /// 6-and-2 packing used above.  Early games commonly ship as padded
     /// 140 KB .dsk files, so `sectorsPerTrack` is intentionally independent
     /// from the 13 sectors actually emitted to the floppy stream.
-    private static func nibblizeThirteenSectorTrack(_ track: Int, image: [UInt8], sectorsPerTrack: Int) -> EncodedTrack {
+    private static func nibblizeThirteenSectorTrack(_ track: Int, image: [UInt8], sectorsPerTrack: Int) -> EncodedDiskTrack {
         var output = [UInt8]()
         var sync = [Bool]()
         func data(_ values: [UInt8]) { output += values; sync += Array(repeating: false, count: values.count) }
@@ -384,10 +332,10 @@ final class DiskII {
             data([0xDE, 0xAA, 0xEB])
             gap(28)
         }
-        return EncodedTrack(nibbles: output, sync: sync, syncTrailingZeros: 1)
+        return EncodedDiskTrack(nibbles: output, sync: sync, syncTrailingZeros: 1)
     }
 
-    private static func bitTrack(nibbles: [UInt8], sync: [Bool], trailingZeros: Int) -> BitTrack {
+    private static func bitTrack(nibbles: [UInt8], sync: [Bool], trailingZeros: Int) -> DiskBitTrack {
         precondition(nibbles.count == sync.count)
         precondition(trailingZeros >= 0)
         let bitCount = zip(nibbles, sync).reduce(0) { $0 + ($1.1 ? 8 + trailingZeros : 8) }
@@ -402,7 +350,7 @@ final class DiskII {
             }
             if isSync { position += trailingZeros }
         }
-        return BitTrack(bytes: bytes, bitCount: bitCount)
+        return DiskBitTrack(bytes: bytes, bitCount: bitCount)
     }
 
     private static func decodeP6PROM(_ raw: [UInt8]) -> [UInt8] {
@@ -503,8 +451,8 @@ final class DiskII {
     /// diagnosing third-party images: a `.dsk` must survive this same 6-and-2
     /// transformation before the ROM can ever load it.
     func decodedSector(track: Int, physicalSector: Int, drive: Int = 0) -> [UInt8]? {
-        guard driveTracks.indices.contains(drive), driveTracks[drive].indices.contains(track), (0..<16).contains(physicalSector) else { return nil }
-        let stream = driveTracks[drive][track]
+        guard drives.indices.contains(drive), drives[drive].tracks.indices.contains(track), (0..<16).contains(physicalSector) else { return nil }
+        let stream = drives[drive].tracks[track]
         guard stream.count >= 3 else { return nil }
         for header in 0..<(stream.count - 2) where stream[header] == 0xD5 && stream[header + 1] == 0xAA && stream[header + 2] == 0x96 {
             guard header + 11 < stream.count else { continue }
@@ -524,8 +472,8 @@ final class DiskII {
     }
 
     func decodedThirteenSector(track: Int, physicalSector: Int, drive: Int = 0) -> [UInt8]? {
-        guard driveTracks.indices.contains(drive), driveTracks[drive].indices.contains(track), (0..<13).contains(physicalSector) else { return nil }
-        let stream = driveTracks[drive][track]
+        guard drives.indices.contains(drive), drives[drive].tracks.indices.contains(track), (0..<13).contains(physicalSector) else { return nil }
+        let stream = drives[drive].tracks[track]
         for header in 0..<(stream.count - 2) where stream[header] == 0xD5 && stream[header + 1] == 0xAA && stream[header + 2] == 0xB5 {
             guard header + 11 < stream.count,
                   decode44(stream[header + 5], stream[header + 6]) == UInt8(track),
@@ -542,16 +490,16 @@ final class DiskII {
     }
 
     func nibImage(drive: Int = 0) -> Data? {
-        guard driveTracks.indices.contains(drive), driveTracks[drive].count == 35, driveTracks[drive].allSatisfy({ $0.count == 6_656 }) else { return nil }
-        return Data(driveTracks[drive].flatMap { $0 })
+        guard drives.indices.contains(drive), drives[drive].tracks.count == 35, drives[drive].tracks.allSatisfy({ $0.count == 6_656 }) else { return nil }
+        return Data(drives[drive].tracks.flatMap { $0 })
     }
 
 
     /// Current full data-track selection; retained as a small observable for
     /// hardware regression tests of the quarter-track stepper state machine.
     func currentTrack(in drive: Int = 0) -> Int {
-        guard quarterTrack.indices.contains(drive) else { return 0 }
-        return quarterTrack[drive] / 4
+        guard drives.indices.contains(drive) else { return 0 }
+        return drives[drive].quarterTrack / 4
     }
 
     private func decode44(_ high: UInt8, _ low: UInt8) -> UInt8 { ((high << 1) | 1) & low }
@@ -625,3 +573,6 @@ final class DiskII {
         return Data(image)
     }
 }
+
+/// Source-compatible name for the original 5¼-inch controller API.
+typealias DiskII = IWMController
