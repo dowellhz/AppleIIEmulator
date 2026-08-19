@@ -134,9 +134,19 @@ final class AppleIIMachine: ObservableObject {
         case visiCalc137
         case systemUtilities32
         case copyIIPlus55
-        case applePascalBoot
+        case applePascal13Boot
 
         var id: Self { self }
+
+        /// Media inserted when a bundled program starts.  Keeping the drive
+        /// layout next to the software metadata makes multi-disk programs a
+        /// single launch configuration rather than a collection of UI-only
+        /// special cases.
+        struct StartupDisk {
+            let resourceName: String
+            let resourceExtension: String
+            let description: String
+        }
 
         var title: String {
             switch self {
@@ -146,36 +156,46 @@ final class AppleIIMachine: ObservableObject {
             case .visiCalc137: return "VisiCalc 1.37"
             case .systemUtilities32: return "Apple II System Utilities 3.2"
             case .copyIIPlus55: return "Copy II Plus 5.5"
-            case .applePascalBoot: return "Apple Pascal 启动盘"
+            case .applePascal13Boot: return "Apple Pascal 1.3 启动盘（APPLE1）"
             }
         }
 
-        var resourceName: String {
+        private var primaryDisk: StartupDisk {
             switch self {
-            case .appleWriter10: return "Apple Writer 1.0"
-            case .appleWriter11: return "Apple Writer 1.1"
-            case .wordPerfect11: return "WordPerfect 1.1 IIe-IIc"
-            case .visiCalc137: return "VisiCalc 1.37"
-            case .systemUtilities32: return "Apple II System Utilities 3.2"
-            case .copyIIPlus55: return "Copy II Plus 5.5"
-            case .applePascalBoot: return "Apple Pascal Boot"
+            case .appleWriter10: return .init(resourceName: "Apple Writer 1.0", resourceExtension: "dsk", description: "Apple Writer 1.0")
+            case .appleWriter11: return .init(resourceName: "Apple Writer 1.1", resourceExtension: "do", description: "Apple Writer 1.1")
+            case .wordPerfect11: return .init(resourceName: "WordPerfect 1.1 IIe-IIc", resourceExtension: "dsk", description: "WordPerfect 1.1（IIe/IIc）")
+            case .visiCalc137: return .init(resourceName: "VisiCalc 1.37", resourceExtension: "dsk", description: "VisiCalc 1.37")
+            case .systemUtilities32: return .init(resourceName: "Apple II System Utilities 3.2", resourceExtension: "dsk", description: "Apple II System Utilities 3.2")
+            case .copyIIPlus55: return .init(resourceName: "Copy II Plus 5.5", resourceExtension: "dsk", description: "Copy II Plus 5.5")
+            case .applePascal13Boot: return .init(resourceName: "Apple Pascal 1.3 APPLE1 Boot", resourceExtension: "dsk", description: "Apple Pascal 1.3 启动盘（APPLE1）")
             }
         }
 
-        var resourceExtension: String {
+        /// Drive 1 is always the boot volume. Apple Pascal's standard
+        /// two-drive layout keeps APPLE2 available in Drive 2 for its filer,
+        /// compiler and linker without exposing separate startup entries.
+        var startupDisks: [StartupDisk] {
             switch self {
-            case .appleWriter10, .wordPerfect11, .visiCalc137, .systemUtilities32, .copyIIPlus55:
-                return "dsk"
-            case .appleWriter11, .applePascalBoot: return "do"
+            case .applePascal13Boot:
+                return [
+                    primaryDisk,
+                    .init(resourceName: "Apple Pascal 1.3 APPLE2", resourceExtension: "dsk", description: "Apple Pascal 1.3 工具盘（APPLE2）")
+                ]
+            default:
+                return [primaryDisk]
             }
         }
 
         /// The productivity library uses IIe hardware. System Utilities 3.2
-        /// relies on the original IIe alternate character ROM for its
-        /// inverse menu highlight; the other bundled titles require or
-        /// benefit from the enhanced IIe firmware.
+        /// and Apple Pascal 1.3 rely on the original IIe alternate character
+        /// ROM; the other bundled titles require or benefit from the enhanced
+        /// IIe firmware.
         var bootROM: BootROM {
-            self == .systemUtilities32 ? .appleIIeUnenhanced : .appleIIeEnhanced
+            switch self {
+            case .systemUtilities32: return .appleIIeUnenhanced
+            default: return .appleIIeEnhanced
+            }
         }
     }
 
@@ -360,6 +380,11 @@ final class AppleIIMachine: ObservableObject {
 
     var encounteredUnsupportedCPUOpcodes: Set<UInt8> { withEmulationLock { cpu.unsupportedOpcodes } }
     var executedCPUCycles: Int { withEmulationLock { cpu.totalCycles } }
+    /// Menu enablement is evaluated on the main actor while the CPU runs on
+    /// the execution queue.  Keep even this small controller query behind
+    /// the same lock: reading a Swift Array while the IWM advances its head
+    /// position is a data race and can abort the process.
+    func hasDisk(in drive: Int) -> Bool { withEmulationLock { memory.hasDisk(in: drive) } }
     /// Current CPU location, exposed to the regression suite so a disk loader
     /// that silently falls back into BASIC cannot look like a successful boot.
     var programCounter: UInt16 { withEmulationLock { cpu.pc } }
@@ -582,20 +607,34 @@ final class AppleIIMachine: ObservableObject {
 
     func loadBundledSoftware(_ software: BundledSoftware) {
         persistWordPerfectWorkDisk()
-        guard let url = AppResources.bundle.url(
-            forResource: software.resourceName,
-            withExtension: software.resourceExtension
-        ) else {
-            status = "未找到内置软件：\(software.title)"
-            return
-        }
+        wordPerfectWorkDiskURL = nil
 
         // Select the machine before mounting so the reset vector and the
         // controller firmware belong to the software's intended hardware.
         selectROM(software.bootROM)
         do {
-            try withEmulationLock { try memory.mountDiskImage(at: url, drive: 0) }
-            diskDescription = software.title
+            let startupMedia = try software.startupDisks.enumerated().map { drive, disk in
+                guard let url = AppResources.bundle.url(
+                    forResource: disk.resourceName,
+                    withExtension: disk.resourceExtension
+                ) else {
+                    throw CocoaError(.fileNoSuchFile)
+                }
+                return (drive: drive, disk: disk, data: try Data(contentsOf: url))
+            }
+            try withEmulationLock {
+                memory.ejectDisk(drive: 0)
+                memory.ejectDisk(drive: 1)
+                for (drive, disk, data) in startupMedia {
+                    try memory.mountDiskImageData(
+                        data,
+                        fileExtension: disk.resourceExtension,
+                        drive: drive
+                    )
+                }
+            }
+            diskDescription = startupMedia[0].disk.description
+            externalDiskDescription = startupMedia.count > 1 ? startupMedia[1].disk.description : "未插入"
             if software == .wordPerfect11 {
                 try mountWordPerfectWorkDisk()
                 externalDiskDescription = "WordPerfect 工作盘（/WORK）"
@@ -1356,12 +1395,14 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
     }
 
     private func isVideoPage(_ address: Int) -> Bool {
-        // With 80STORE set, PAGE2 no longer chooses a displayed page.  It
-        // redirects CPU accesses to the auxiliary *page 1* window: text/
-        // lo-res at $0400-$07FF, or HGR at $2000-$3FFF.  Page 2 remains
-        // normal RAM in this mode.
-        if hires { return (0x2000...0x3FFF).contains(address) }
-        return (0x0400...0x07FF).contains(address)
+        // With 80STORE set, PAGE2 no longer chooses a displayed page. It
+        // selects main versus auxiliary page-1 memory. Text page 1 is
+        // *always* included; when HIRES is set, the HGR page-1 range is
+        // included as well. Pascal keeps HIRES enabled while it draws text,
+        // so omitting $0400-$07FF in that state sends every 80-column
+        // character to main RAM and leaves the auxiliary columns blank.
+        if (0x0400...0x07FF).contains(address) { return true }
+        return hires && (0x2000...0x3FFF).contains(address)
     }
 
     private func status(_ enabled: Bool) -> UInt8 { enabled ? 0x80 : 0x00 }

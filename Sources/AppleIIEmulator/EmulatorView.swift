@@ -249,6 +249,10 @@ private struct AppleIIScreen: View {
     private func drawText(in context: inout GraphicsContext, size: CGSize, rows: Range<Int> = 0..<24, video: AppleIIVideoSnapshot) {
         let columns = video.column80 ? 80 : 40
         let cell = CGSize(width: size.width / CGFloat(columns), height: size.height / 24)
+        // A 7×8 Apple glyph becomes half as wide in 80-column mode.  Font
+        // size cannot be based on row height alone or adjacent glyphs overlap
+        // and appear as corrupted text.
+        let fontSize = min(cell.height * 0.88, cell.width * 1.45)
         // The hardware's character flasher alternates its $40-$7F bank while
         // ALTCHARSET is off.  A 60 Hz refresh counter gives its half-second
         // phase without an additional UI timer.
@@ -264,7 +268,7 @@ private struct AppleIIScreen: View {
                 let rect = CGRect(x: CGFloat(col) * cell.width, y: CGFloat(row) * cell.height, width: cell.width, height: cell.height)
                 if inverse { context.fill(Path(rect.insetBy(dx: 1, dy: 1)), with: .color(green)) }
                 context.draw(
-                    Text(character).font(.system(size: cell.height * 0.88, weight: .medium, design: .monospaced)).foregroundColor(inverse ? .black : green),
+                    Text(character).font(.system(size: fontSize, weight: .medium, design: .monospaced)).foregroundColor(inverse ? .black : green),
                     at: CGPoint(x: rect.midX, y: rect.midY)
                 )
             }

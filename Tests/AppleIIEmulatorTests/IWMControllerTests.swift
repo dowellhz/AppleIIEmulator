@@ -98,15 +98,18 @@ final class IWMControllerTests: XCTestCase {
 
     func testBundledSoftwareImagesMount() throws {
         let images = [
-            ("VisiCalc 1.37", "dsk"),
-            ("Apple II System Utilities 3.2", "dsk"),
-            ("Copy II Plus 5.5", "dsk"),
-            ("Apple Pascal Boot", "do")
+            ("VisiCalc 1.37", "dsk", "dsk"),
+            ("Apple II System Utilities 3.2", "dsk", "dsk"),
+            ("Copy II Plus 5.5", "dsk", "dsk"),
+            ("Apple Pascal 1.3 APPLE0", "dsk", "dsk"),
+            ("Apple Pascal 1.3 APPLE1 Boot", "dsk", "dsk"),
+            ("Apple Pascal 1.3 APPLE2", "dsk", "dsk"),
+            ("Apple Pascal 1.3 APPLE3", "dsk", "dsk")
         ]
-        for (name, fileExtension) in images {
+        for (name, fileExtension, formatHint) in images {
             let url = try XCTUnwrap(AppResources.bundle.url(forResource: name, withExtension: fileExtension))
             let disk = IWMController()
-            try disk.mountImage(Data(contentsOf: url), fileExtension: fileExtension)
+            try disk.mountImage(Data(contentsOf: url), fileExtension: formatHint)
             XCTAssertTrue(disk.hasDisk, "\(name) should mount")
         }
     }

@@ -33,6 +33,38 @@ final class ROMLoadingTests: XCTestCase {
             XCTAssertTrue([.appleIIeEnhanced, .appleIIeUnenhanced].contains(software.bootROM), software.title)
         }
         XCTAssertEqual(AppleIIMachine.BundledSoftware.systemUtilities32.bootROM, .appleIIeUnenhanced)
+        XCTAssertEqual(AppleIIMachine.BundledSoftware.applePascal13Boot.bootROM, .appleIIeEnhanced)
+    }
+
+    @MainActor
+    func testApplePascalBootLoadsFromItsBundledDSK() throws {
+        let memory = AppleIIMemory()
+        try memory.loadBundledAppleIIeROM(.appleIIeEnhanced)
+        let url = try XCTUnwrap(AppResources.bundle.url(forResource: "Apple Pascal 1.3 APPLE1 Boot", withExtension: "dsk"))
+        try memory.mountDiskImageData(Data(contentsOf: url), fileExtension: "dsk")
+        let cpu = MOS6502(bus: memory)
+        cpu.reset()
+        cpu.run(cycles: 25_000_000)
+        let video = memory.makeVideoSnapshot()
+        XCTAssertTrue(video.column80)
+        XCTAssertTrue(video.alternateCharset)
+        XCTAssertGreaterThan(memory.diskNibbleReads, 100_000)
+        XCTAssertGreaterThanOrEqual(cpu.pc, 0xC000)
+        XCTAssertTrue(cpu.unsupportedOpcodes.isEmpty)
+        let firstRow = (0..<80).map { video.textByte(column: $0, row: 0) }
+        XCTAssertTrue(stride(from: 0, to: 80, by: 2).contains { firstRow[$0] != 0 && firstRow[$0] != 0xA0 })
+        XCTAssertTrue(stride(from: 1, to: 80, by: 2).contains { firstRow[$0] != 0 && firstRow[$0] != 0xA0 })
+    }
+
+    @MainActor
+    func testApplePascalMountsItsStandardTwoDriveStartupSet() {
+        let machine = AppleIIMachine()
+        machine.loadBundledSoftware(.applePascal13Boot)
+
+        XCTAssertTrue(machine.hasDisk(in: 0))
+        XCTAssertTrue(machine.hasDisk(in: 1))
+        XCTAssertEqual(machine.diskDescription, "Apple Pascal 1.3 启动盘（APPLE1）")
+        XCTAssertEqual(machine.externalDiskDescription, "Apple Pascal 1.3 工具盘（APPLE2）")
     }
 
     func testBundledAppleIIeROMsMapSystemAndSlotSixROM() throws {

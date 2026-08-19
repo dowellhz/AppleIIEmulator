@@ -26,14 +26,14 @@ struct AppleIIEmulatorApp: App {
                 Button("插入测试启动盘") { machine.insertDiagnosticDisk() }
                 Button("将驱动器 1 另存为 .nib…") { machine.saveDiskAsNIB(drive: 0) }
                     .keyboardShortcut("s", modifiers: [.command, .shift])
-                    .disabled(!machine.memory.hasDisk(in: 0))
+                    .disabled(!machine.hasDisk(in: 0))
                 Button("将驱动器 2 另存为 .nib…") { machine.saveDiskAsNIB(drive: 1) }
-                    .disabled(!machine.memory.hasDisk(in: 1))
+                    .disabled(!machine.hasDisk(in: 1))
                 Divider()
                 Button("推出驱动器 1") { machine.ejectDisk(drive: 0) }
-                    .disabled(!machine.memory.hasDisk(in: 0))
+                    .disabled(!machine.hasDisk(in: 0))
                 Button("推出驱动器 2") { machine.ejectDisk(drive: 1) }
-                    .disabled(!machine.memory.hasDisk(in: 1))
+                    .disabled(!machine.hasDisk(in: 1))
             }
             CommandMenu("游戏") {
                 if !machine.downloadedGames.isEmpty {
@@ -65,4 +65,5 @@ struct AppleIIEmulatorApp: App {
             }
         }
     }
+
 }

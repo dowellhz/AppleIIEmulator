@@ -89,6 +89,7 @@ struct EmulatorControlsPanel: View {
             ForEach(AppleIIMachine.BundledSoftware.allCases) { software in
                 Button(software.title) { machine.loadBundledSoftware(software) }
             }
+            Divider()
         } label: { controlLabel("SOFTWARE", icon: "document") }
         .menuStyle(.borderlessButton)
     }

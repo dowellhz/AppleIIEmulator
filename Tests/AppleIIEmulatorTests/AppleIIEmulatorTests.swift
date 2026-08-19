@@ -240,6 +240,19 @@ final class AppleIIEmulatorTests: XCTestCase {
         XCTAssertEqual(memory.read(0x4000), 0x33)
     }
 
+    func test80StoreStillRedirectsTextPageWhenHiresIsEnabled() {
+        let memory = AppleIIMemory()
+        memory.loadROM(Data(repeating: 0, count: 0x8000))
+        memory.write(0xC057, 0) // HIRES on
+        memory.write(0xC001, 0) // 80STORE on
+        memory.write(0x0400, 0xC1)
+        memory.write(0xC055, 0) // PAGE2 selects auxiliary text page 1
+        memory.write(0x0400, 0xC2)
+        memory.write(0xC00D, 0)
+        XCTAssertEqual(memory.textByte(column: 0, row: 0), 0xC2)
+        XCTAssertEqual(memory.textByte(column: 1, row: 0), 0xC1)
+    }
+
     func testTextAddressingUsesAppleIIInterleave() {
         let memory = AppleIIMemory()
         memory.write(0x0480, 0xC1) // row 1, column 0
