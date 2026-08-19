@@ -89,6 +89,8 @@ final class AppleIIEmulatorTests: XCTestCase {
         XCTAssertEqual(appleIITextCell(byte: 0x41, alternateCharset: true, flashOn: false), .alternate(0x01))
         XCTAssertEqual(appleIITextCell(byte: 0xC1, alternateCharset: true, flashOn: false), .normal(0x01))
         XCTAssertEqual(appleIITextCell(byte: 0xFF, alternateCharset: false, flashOn: true), .normal(0x3F))
+        XCTAssertEqual(appleII80ColumnTextCell(byte: 0xEF, alternateCharset: true, flashOn: false), .ascii(0x6F))
+        XCTAssertEqual(appleII80ColumnTextCell(byte: 0x41, alternateCharset: true, flashOn: false), .alternate(0x01))
     }
 
     func testHiResPairPaletteUsesTheHighBitPhase() {
@@ -108,6 +110,30 @@ final class AppleIIEmulatorTests: XCTestCase {
         memory.write(0xC030, 0)
         XCTAssertEqual(memory.speakerFlips, 2)
         XCTAssertEqual(callbacks, 2)
+    }
+
+    func testCassetteSoftSwitchesFollowBusAccessCycle() {
+        let memory = AppleIIMemory()
+        var edges = [(Int, Bool)]()
+        memory.cassetteOutputDidToggleAtCycle = { cycle, high in edges.append((cycle, high)) }
+        memory.setSpeakerCycle(123)
+        _ = memory.read(0xC020)
+        memory.setSpeakerCycle(456)
+        memory.write(0xC020, 0)
+        memory.setCassetteInput(true)
+
+        XCTAssertEqual(edges.map(\.0), [123, 456])
+        XCTAssertEqual(edges.map(\.1), [true, false])
+        XCTAssertEqual(memory.read(0xC060), 0x80)
+    }
+
+    func testAppleIIPlusAnnunciatorsUseStandardSoftSwitchPairs() {
+        let memory = AppleIIMemory()
+        _ = memory.read(0xC059) // ANN0 on
+        memory.write(0xC05D, 0) // ANN2 on
+        _ = memory.read(0xC058) // ANN0 off
+        XCTAssertFalse(memory.annunciatorEnabled(0))
+        XCTAssertTrue(memory.annunciatorEnabled(2))
     }
 
     func testAppleKeysAndPaddleTimerSoftSwitches() {

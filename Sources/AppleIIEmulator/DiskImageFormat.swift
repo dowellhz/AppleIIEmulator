@@ -9,6 +9,7 @@ enum DiskImageFormat: String, CaseIterable {
     case prodosOrder = "po"
     case nibble = "nib"
     case twoIMG = "2mg"
+    case woz = "woz"
 
     init?(fileExtension: String) {
         switch fileExtension.lowercased() {
@@ -17,6 +18,7 @@ enum DiskImageFormat: String, CaseIterable {
         case "po": self = .prodosOrder
         case "nib": self = .nibble
         case "2mg", "2img": self = .twoIMG
+        case "woz": self = .woz
         default: return nil
         }
     }
@@ -25,20 +27,22 @@ enum DiskImageFormat: String, CaseIterable {
 /// Decoded image payload handed to the drive.  Container parsing lives here;
 /// `DiskII` only turns a known 5¼-inch payload into magnetic bit tracks.
 enum DiskImagePayload {
-    case dos(Data)
-    case thirteenSector(Data)
-    case prodos(Data)
-    case nib(Data)
+    case dos(Data, writeProtected: Bool)
+    case thirteenSector(Data, writeProtected: Bool)
+    case prodos(Data, writeProtected: Bool)
+    case nib(Data, writeProtected: Bool)
+    case woz(tracks: [DiskBitTrack], quarterTrackMap: [Int], thirteenSector: Bool, emulatesWeakBits: Bool)
 }
 
 enum DiskImageCodec {
     static func decode(_ data: Data, format: DiskImageFormat) throws -> DiskImagePayload {
         switch format {
-        case .dosOrder: return .dos(data)
-        case .thirteenSector: return .thirteenSector(data)
-        case .prodosOrder: return .prodos(data)
-        case .nibble: return .nib(data)
+        case .dosOrder: return .dos(data, writeProtected: false)
+        case .thirteenSector: return .thirteenSector(data, writeProtected: false)
+        case .prodosOrder: return .prodos(data, writeProtected: false)
+        case .nibble: return .nib(data, writeProtected: false)
         case .twoIMG: return try decodeTwoIMG(data)
+        case .woz: return try decodeWOZ(data)
         }
     }
 
@@ -53,16 +57,134 @@ enum DiskImageCodec {
         }
         let headerLength = little16(8)
         let format = little32(12)
+        let flags = little32(16)
         let dataOffset = little32(24)
         let dataLength = little32(28)
         guard headerLength >= 64, dataOffset >= headerLength, dataOffset <= bytes.count,
               dataLength <= bytes.count - dataOffset else { throw CocoaError(.fileReadCorruptFile) }
         let payload = Data(bytes[dataOffset..<(dataOffset + dataLength)])
+        // 2IMG flags bit 31 is the media write-protect switch.  It belongs to
+        // the mounted disk, not the host file, so the IWM can expose it on
+        // Q6H even when the image is kept entirely in memory.
+        let writeProtected = flags & 0x8000_0000 != 0
         switch format {
-        case 0: return .dos(payload)
-        case 1: return .prodos(payload)
-        case 2: return .nib(payload)
+        case 0: return .dos(payload, writeProtected: writeProtected)
+        case 1: return .prodos(payload, writeProtected: writeProtected)
+        case 2: return .nib(payload, writeProtected: writeProtected)
         default: throw CocoaError(.fileReadUnsupportedScheme)
         }
+    }
+
+    /// Decodes WOZ 1.x and 2.x 5¼-inch bitstream layouts.  The controller can read
+    /// arbitrary-length tracks, but this loader deliberately mounts WOZ
+    /// media read-only: preserving a WOZ container requires its WRIT/CRC
+    /// metadata, which is not yet an export format in this app.
+    private static func decodeWOZ(_ data: Data) throws -> DiskImagePayload {
+        let bytes = Array(data)
+        let signature = bytes.count >= 4 ? Array(bytes[0..<4]) : []
+        let isWOZ2 = signature == Array("WOZ2".utf8)
+        guard bytes.count >= 12,
+              isWOZ2 || signature == Array("WOZ1".utf8),
+              Array(bytes[4..<8]) == [0xFF, 0x0A, 0x0D, 0x0A] else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+
+        func little16(_ offset: Int) -> Int {
+            Int(bytes[offset]) | Int(bytes[offset + 1]) << 8
+        }
+        func little32(_ offset: Int) -> Int {
+            Int(bytes[offset]) | Int(bytes[offset + 1]) << 8 |
+                Int(bytes[offset + 2]) << 16 | Int(bytes[offset + 3]) << 24
+        }
+
+        var chunks = [String: Range<Int>]()
+        var offset = 12
+        while offset + 8 <= bytes.count {
+            guard let identifier = String(bytes: bytes[offset..<(offset + 4)], encoding: .ascii) else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            let length = little32(offset + 4)
+            let dataStart = offset + 8
+            guard length <= bytes.count - dataStart else { throw CocoaError(.fileReadCorruptFile) }
+            chunks[identifier] = dataStart..<(dataStart + length)
+            offset = dataStart + length
+        }
+
+        guard let infoRange = chunks["INFO"], infoRange.count >= 3,
+              bytes[infoRange.lowerBound + 1] == 1,
+              let mapRange = chunks["TMAP"], mapRange.count >= 160,
+              let tracksRange = chunks["TRKS"], tracksRange.count >= 160 * 8 else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+
+        // A 5¼-inch WOZ map is indexed in quarter tracks.  Keep every entry
+        // (rather than collapsing to 35 whole tracks) for protected disks
+        // which intentionally overlap or leave tracks blank.
+        let quarterTrackMap = (0..<160).map { index -> Int in
+            let value = bytes[mapRange.lowerBound + index]
+            return value == 0xFF ? -1 : Int(value)
+        }
+        let trackCount: Int
+        if isWOZ2 {
+            trackCount = 160
+        } else {
+            guard tracksRange.count.isMultiple(of: 6_656) else { throw CocoaError(.fileReadCorruptFile) }
+            trackCount = tracksRange.count / 6_656
+        }
+        guard trackCount > 0, quarterTrackMap.allSatisfy({ $0 < trackCount }) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+
+        var bitTracks = [DiskBitTrack]()
+        bitTracks.reserveCapacity(trackCount)
+        if isWOZ2 {
+            for index in 0..<trackCount {
+                let entry = tracksRange.lowerBound + index * 8
+                let startBlock = little16(entry)
+                let blockCount = little16(entry + 2)
+                let bitCount = little32(entry + 4)
+                if startBlock == 0 && blockCount == 0 && bitCount == 0 {
+                    bitTracks.append(DiskBitTrack(bytes: [], bitCount: 0, nibbleBitOffsets: []))
+                    continue
+                }
+                let byteCount = (bitCount + 7) / 8
+                let dataOffset = startBlock * 512
+                guard startBlock >= 3, blockCount > 0,
+                      byteCount <= blockCount * 512,
+                      dataOffset <= bytes.count, byteCount <= bytes.count - dataOffset else {
+                    throw CocoaError(.fileReadCorruptFile)
+                }
+                bitTracks.append(DiskBitTrack(
+                    bytes: Array(bytes[dataOffset..<(dataOffset + byteCount)]),
+                    bitCount: bitCount,
+                    nibbleBitOffsets: Array(repeating: -1, count: bitCount)
+                ))
+            }
+        } else {
+            for index in 0..<trackCount {
+                let entry = tracksRange.lowerBound + index * 6_656
+                let byteCount = little16(entry + 6_646)
+                let bitCount = little16(entry + 6_648)
+                guard byteCount <= 6_646, bitCount <= byteCount * 8 else {
+                    throw CocoaError(.fileReadCorruptFile)
+                }
+                bitTracks.append(DiskBitTrack(
+                    bytes: Array(bytes[entry..<(entry + byteCount)]),
+                    bitCount: bitCount,
+                    nibbleBitOffsets: Array(repeating: -1, count: bitCount)
+                ))
+            }
+        }
+        guard quarterTrackMap.contains(where: { $0 >= 0 && bitTracks[$0].bitCount > 0 }) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        let thirteenSector = isWOZ2 && infoRange.count > 38 && bytes[infoRange.lowerBound + 38] == 2
+        // Applesauce records original weak-bit regions as zero runs once
+        // cleaned.  The IWM will reconstruct the MC3470's noisy output.
+        let emulatesWeakBits = bytes[infoRange.lowerBound + 4] != 0
+        return .woz(
+            tracks: bitTracks, quarterTrackMap: quarterTrackMap,
+            thirteenSector: thirteenSector, emulatesWeakBits: emulatesWeakBits
+        )
     }
 }

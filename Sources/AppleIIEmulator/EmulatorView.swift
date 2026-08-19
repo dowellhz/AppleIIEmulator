@@ -87,8 +87,12 @@ struct EmulatorView: View {
 
     private func emulatedScreen(width: CGFloat, height: CGFloat) -> some View {
         let cornerRadius = min(width, height) * 0.035
-        return AppleIIScreen(memory: machine.memory, refreshToken: machine.refreshToken)
-            .background(KeyboardCapture { machine.keyDown($0) })
+        return AppleIIScreen(video: machine.videoSnapshot, refreshToken: machine.refreshToken)
+            .background(KeyboardCapture(
+                keyDown: { machine.keyDown($0) },
+                mouseMoved: { machine.mouseMoved($0) },
+                mouseButton: { index, pressed in machine.mouseButton(index, pressed: pressed) }
+            ))
             .frame(width: width, height: height)
             .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
             .overlay {
@@ -207,7 +211,7 @@ private struct WindowTransparencyConfigurator: NSViewRepresentable {
 }
 
 private struct AppleIIScreen: View {
-    let memory: AppleIIMemory
+    let video: AppleIIVideoSnapshot
     let refreshToken: Int
     private let green = Color(red: 0.40, green: 1.0, blue: 0.45)
     private let loresPalette: [Color] = [
@@ -228,7 +232,6 @@ private struct AppleIIScreen: View {
             // Referencing this published refresh value invalidates Canvas at 60 Hz.
             _ = refreshToken
             context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(Color(red: 0.018, green: 0.04, blue: 0.025)))
-            let video = memory.videoState
             if video.textMode {
                 drawText(in: &context, size: size, video: video)
             } else {
@@ -243,7 +246,7 @@ private struct AppleIIScreen: View {
         .accessibilityLabel("Apple II display")
     }
 
-    private func drawText(in context: inout GraphicsContext, size: CGSize, rows: Range<Int> = 0..<24, video: AppleIIVideoState) {
+    private func drawText(in context: inout GraphicsContext, size: CGSize, rows: Range<Int> = 0..<24, video: AppleIIVideoSnapshot) {
         let columns = video.column80 ? 80 : 40
         let cell = CGSize(width: size.width / CGFloat(columns), height: size.height / 24)
         // The hardware's character flasher alternates its $40-$7F bank while
@@ -252,9 +255,11 @@ private struct AppleIIScreen: View {
         let flashOn = (refreshToken / 30).isMultiple(of: 2)
         for row in rows {
             for col in 0..<columns {
-                let byte = video.textByte(col, row)
+                let byte = video.textByte(column: col, row: row)
                 guard byte != 0 else { continue }
-                let presentation = appleIITextCell(byte: byte, alternateCharset: video.alternateCharset, flashOn: flashOn)
+                let presentation = video.column80
+                    ? appleII80ColumnTextCell(byte: byte, alternateCharset: video.alternateCharset, flashOn: flashOn)
+                    : appleIITextCell(byte: byte, alternateCharset: video.alternateCharset, flashOn: flashOn)
                 let (character, inverse) = appleCharacter(presentation)
                 let rect = CGRect(x: CGFloat(col) * cell.width, y: CGFloat(row) * cell.height, width: cell.width, height: cell.height)
                 if inverse { context.fill(Path(rect.insetBy(dx: 1, dy: 1)), with: .color(green)) }
@@ -266,7 +271,7 @@ private struct AppleIIScreen: View {
         }
     }
 
-    private func drawGraphics(in context: inout GraphicsContext, size: CGSize, rows: Int, video: AppleIIVideoState) {
+    private func drawGraphics(in context: inout GraphicsContext, size: CGSize, rows: Int, video: AppleIIVideoSnapshot) {
         if video.hires {
             if video.doubleHires { drawDoubleHiRes(in: &context, size: size, rows: rows, video: video) }
             else { drawHiRes(in: &context, size: size, rows: rows, video: video) }
@@ -275,13 +280,13 @@ private struct AppleIIScreen: View {
         }
     }
 
-    private func drawLoRes(in context: inout GraphicsContext, size: CGSize, rows: Int, video: AppleIIVideoState) {
+    private func drawLoRes(in context: inout GraphicsContext, size: CGSize, rows: Int, video: AppleIIVideoSnapshot) {
         let displayRows = min(24, rows / 8)
         let width = size.width / 40
         let height = size.height / 48
         for row in 0..<displayRows {
             for column in 0..<40 {
-                let value = video.loresByte(column, row)
+                let value = video.loresByte(column: column, row: row)
                 let x = CGFloat(column) * width
                 let y = CGFloat(row * 2) * height
                 context.fill(Path(CGRect(x: x, y: y, width: width + 0.2, height: height + 0.2)), with: .color(loresPalette[Int(value & 0x0F)]))
@@ -290,7 +295,7 @@ private struct AppleIIScreen: View {
         }
     }
 
-    private func drawHiRes(in context: inout GraphicsContext, size: CGSize, rows: Int, video: AppleIIVideoState) {
+    private func drawHiRes(in context: inout GraphicsContext, size: CGSize, rows: Int, video: AppleIIVideoSnapshot) {
         let pixelWidth = size.width / 280
         let pixelHeight = size.height / 192
         let palette: [AppleIIHiResColor: Color] = [
@@ -302,7 +307,7 @@ private struct AppleIIScreen: View {
         ]
         var paths = [AppleIIHiResColor: Path]()
         for row in 0..<rows {
-            let bytes = (0..<40).map { video.hgrByte($0, row, false) }
+            let bytes = (0..<40).map { video.hgrByte(column: $0, row: row, auxiliary: false) }
             for (x, color) in appleIIHiResDots(bytes: bytes).enumerated() where color != .black {
                 var path = paths[color, default: Path()]
                 path.addRect(CGRect(x: CGFloat(x) * pixelWidth, y: CGFloat(row) * pixelHeight, width: pixelWidth + 0.1, height: pixelHeight + 0.15))
@@ -314,14 +319,14 @@ private struct AppleIIScreen: View {
         }
     }
 
-    private func drawDoubleHiRes(in context: inout GraphicsContext, size: CGSize, rows: Int, video: AppleIIVideoState) {
+    private func drawDoubleHiRes(in context: inout GraphicsContext, size: CGSize, rows: Int, video: AppleIIVideoSnapshot) {
         let pixelWidth = size.width / 560
         let pixelHeight = size.height / 192
         var paths = [Color: Path]()
         for row in 0..<rows {
             for column in 0..<40 {
-                let aux = UInt16(video.hgrByte(column, row, true) & 0x7F)
-                let main = UInt16(video.hgrByte(column, row, false) & 0x7F)
+                let aux = UInt16(video.hgrByte(column: column, row: row, auxiliary: true) & 0x7F)
+                let main = UInt16(video.hgrByte(column: column, row: row, auxiliary: false) & 0x7F)
                 let bits = aux | (main << 7)
                 for group in 0..<7 {
                     let color = doubleHiresPalette[Int((bits >> UInt16(group * 2)) & 0x0F)]
@@ -342,6 +347,9 @@ private struct AppleIIScreen: View {
         case let .normal(value): code = value; inverse = false
         case let .inverse(value): code = value; inverse = true
         case let .alternate(value): return (alternateCharacter(value), false)
+        case let .ascii(value):
+            guard value >= 0x20, value <= 0x7E else { return (" ", false) }
+            return (String(UnicodeScalar(value)), false)
         }
         // Apple II text codes are six-bit values.  In particular $FF is
         // normal '?' ($3F), not an underscore as an ASCII mask would imply.
@@ -362,17 +370,27 @@ private struct AppleIIScreen: View {
 }
 
 private struct KeyboardCapture: NSViewRepresentable {
-    let handler: (NSEvent) -> Void
+    let keyDown: (NSEvent) -> Void
+    let mouseMoved: (NSEvent) -> Void
+    let mouseButton: (Int, Bool) -> Void
 
     func makeNSView(context: Context) -> KeyView {
         let view = KeyView()
-        view.handler = handler
+        view.keyDownHandler = keyDown
+        view.mouseMovedHandler = mouseMoved
+        view.mouseButtonHandler = mouseButton
         return view
     }
-    func updateNSView(_ nsView: KeyView, context: Context) { nsView.handler = handler }
+    func updateNSView(_ nsView: KeyView, context: Context) {
+        nsView.keyDownHandler = keyDown
+        nsView.mouseMovedHandler = mouseMoved
+        nsView.mouseButtonHandler = mouseButton
+    }
 
     final class KeyView: NSView {
-        var handler: ((NSEvent) -> Void)?
+        var keyDownHandler: ((NSEvent) -> Void)?
+        var mouseMovedHandler: ((NSEvent) -> Void)?
+        var mouseButtonHandler: ((Int, Bool) -> Void)?
         override var acceptsFirstResponder: Bool { true }
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
@@ -385,7 +403,19 @@ private struct KeyboardCapture: NSViewRepresentable {
                 window.makeFirstResponder(self)
             }
         }
-        override func mouseDown(with event: NSEvent) { window?.makeFirstResponder(self) }
-        override func keyDown(with event: NSEvent) { handler?(event) }
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            trackingAreas.forEach(removeTrackingArea)
+            addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect], owner: self, userInfo: nil))
+        }
+        override func keyDown(with event: NSEvent) { keyDownHandler?(event) }
+        override func mouseMoved(with event: NSEvent) { mouseMovedHandler?(event) }
+        override func mouseDown(with event: NSEvent) {
+            window?.makeFirstResponder(self)
+            mouseButtonHandler?(0, true)
+        }
+        override func mouseUp(with event: NSEvent) { mouseButtonHandler?(0, false) }
+        override func rightMouseDown(with event: NSEvent) { mouseButtonHandler?(1, true) }
+        override func rightMouseUp(with event: NSEvent) { mouseButtonHandler?(1, false) }
     }
 }

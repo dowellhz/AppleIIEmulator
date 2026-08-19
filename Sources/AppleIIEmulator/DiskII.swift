@@ -1,9 +1,9 @@
 import Foundation
 
 /// Slot 6 / IIc integrated IWM drive. It accepts 140 KB DOS-order
-/// `.dsk/.do`, ProDOS-order `.po`, pre-nibblized 35-track `.nib`, and their
-/// common 2IMG (`.2mg/.2img`) wrappers, exposing the same GCR byte stream that
-/// the original controller delivers to firmware.
+/// `.dsk/.do`, ProDOS-order `.po`, pre-nibblized 35-track `.nib`, common 2IMG
+/// (`.2mg/.2img`) wrappers, and read-only WOZ 1.x/2.x bitstreams, exposing the
+/// same GCR byte stream that the original controller delivers to firmware.
 /// IWM/P6 soft-switch state machine. Media container decoding is delegated to
 /// `DiskImageCodec`; callers may keep using the historical `DiskII` alias.
 final class IWMController {
@@ -75,6 +75,7 @@ final class IWMController {
     private var writeLevel: UInt8 = 0
     private(set) var nibbleReads = 0
     private(set) var nibbleWrites = 0
+    private(set) var weakBitsGenerated = 0
 
     var hasDisk: Bool { drives.contains { $0.hasDisk } }
     func hasDisk(in drive: Int) -> Bool { drives.indices.contains(drive) && drives[drive].hasDisk }
@@ -82,7 +83,7 @@ final class IWMController {
     func reset() {
         for index in drives.indices { drives[index].quarterTrack = 0; drives[index].bitPosition = 0 }
         phaseStates = 0; q6 = false; q7 = false
-        motorOn = false; motorOffDelay = 0; selectedDrive = 0; dataLatch = 0; busData = 0; sequencerState = 0; sequencerPhase = 0; writeLevel = 0; nibbleReads = 0; nibbleWrites = 0
+        motorOn = false; motorOffDelay = 0; selectedDrive = 0; dataLatch = 0; busData = 0; sequencerState = 0; sequencerPhase = 0; writeLevel = 0; nibbleReads = 0; nibbleWrites = 0; weakBitsGenerated = 0
     }
 
     func eject(drive: Int = 0) {
@@ -90,12 +91,12 @@ final class IWMController {
         drives[drive].eject()
     }
 
-    func mountDSK(_ data: Data, drive: Int = 0) throws {
+    func mountDSK(_ data: Data, drive: Int = 0, writeProtected: Bool = false) throws {
         if looksLikeThirteenSectorBootDisk(data) {
-            try mountThirteenSectorImage(data, drive: drive)
+            try mountThirteenSectorImage(data, drive: drive, writeProtected: writeProtected)
             return
         }
-        try mountSectorImage(data, sectorOrder: Self.dosSectorOrder, drive: drive)
+        try mountSectorImage(data, sectorOrder: Self.dosSectorOrder, drive: drive, writeProtected: writeProtected)
     }
 
     private func looksLikeThirteenSectorBootDisk(_ data: Data) -> Bool {
@@ -109,7 +110,7 @@ final class IWMController {
         }
     }
 
-    func mountThirteenSectorImage(_ data: Data, drive: Int) throws {
+    func mountThirteenSectorImage(_ data: Data, drive: Int, writeProtected: Bool = false) throws {
         guard drives.indices.contains(drive),
               data.count == Self.thirteenSectorImageSize || data.count == Self.imageSize else {
             throw CocoaError(.fileReadCorruptFile)
@@ -121,18 +122,25 @@ final class IWMController {
         let compactImageIsPadded = data.count == Self.imageSize && image[Self.thirteenSectorImageSize...].allSatisfy { $0 == 0 }
         let sectorsPerTrack = data.count == Self.thirteenSectorImageSize || compactImageIsPadded ? 13 : 16
         let tracks = (0..<35).map { Self.nibblizeThirteenSectorTrack($0, image: image, sectorsPerTrack: sectorsPerTrack) }
-        drives[drive].install(tracks: tracks.map(\.nibbles), bitTracks: tracks.map { Self.bitTrack(nibbles: $0.nibbles, sync: $0.sync, trailingZeros: $0.syncTrailingZeros) }, thirteenSector: true)
+        drives[drive].install(tracks: tracks.map(\.nibbles), bitTracks: tracks.map { Self.bitTrack(nibbles: $0.nibbles, sync: $0.sync, trailingZeros: $0.syncTrailingZeros) }, thirteenSector: true, writeProtected: writeProtected)
     }
 
-    private func mountProDOS(_ data: Data, drive: Int) throws {
-        try mountSectorImage(data, sectorOrder: Self.prodosSectorOrder, drive: drive)
+    private func mountProDOS(_ data: Data, drive: Int, writeProtected: Bool) throws {
+        try mountSectorImage(data, sectorOrder: Self.prodosSectorOrder, drive: drive, writeProtected: writeProtected)
     }
 
-    private func mountSectorImage(_ data: Data, sectorOrder: [Int], drive: Int) throws {
-        guard drives.indices.contains(drive), data.count == Self.imageSize else { throw CocoaError(.fileReadCorruptFile) }
+    private func mountSectorImage(_ data: Data, sectorOrder: [Int], drive: Int, writeProtected: Bool) throws {
+        let bytesPerTrack = 16 * 256
+        let trackCount = data.count / bytesPerTrack
+        // Most images are the standard 35 tracks, but archive images for
+        // 5.25-inch 37/40-track mechanisms also occur.  Retain every sector
+        // instead of rejecting software solely because it uses the outer
+        // tracks of such a drive.
+        guard drives.indices.contains(drive), data.count.isMultiple(of: bytesPerTrack),
+              (35...40).contains(trackCount) else { throw CocoaError(.fileReadCorruptFile) }
         let image = Array(data)
-        let tracks = (0..<35).map { Self.nibblizeTrack($0, image: image, sectorOrder: sectorOrder) }
-        drives[drive].install(tracks: tracks.map(\.nibbles), bitTracks: tracks.map { Self.bitTrack(nibbles: $0.nibbles, sync: $0.sync, trailingZeros: $0.syncTrailingZeros) }, thirteenSector: false)
+        let tracks = (0..<trackCount).map { Self.nibblizeTrack($0, image: image, sectorOrder: sectorOrder) }
+        drives[drive].install(tracks: tracks.map(\.nibbles), bitTracks: tracks.map { Self.bitTrack(nibbles: $0.nibbles, sync: $0.sync, trailingZeros: $0.syncTrailingZeros) }, thirteenSector: false, writeProtected: writeProtected)
     }
 
     func mountImage(_ data: Data, fileExtension: String, drive: Int = 0) throws {
@@ -144,10 +152,10 @@ final class IWMController {
 
     private func mount(_ payload: DiskImagePayload, drive: Int) throws {
         switch payload {
-        case let .dos(data): try mountDSK(data, drive: drive)
-        case let .thirteenSector(data): try mountThirteenSectorImage(data, drive: drive)
-        case let .prodos(data): try mountProDOS(data, drive: drive)
-        case let .nib(data):
+        case let .dos(data, writeProtected): try mountDSK(data, drive: drive, writeProtected: writeProtected)
+        case let .thirteenSector(data, writeProtected): try mountThirteenSectorImage(data, drive: drive, writeProtected: writeProtected)
+        case let .prodos(data, writeProtected): try mountProDOS(data, drive: drive, writeProtected: writeProtected)
+        case let .nib(data, writeProtected):
             guard drives.indices.contains(drive), data.count == Self.nibImageSize else { throw CocoaError(.fileReadCorruptFile) }
             let bytes = Array(data)
             let tracks = (0..<35).map { index in
@@ -160,7 +168,19 @@ final class IWMController {
                 // with conventional NIB images while DSK conversion is exact.
                 Self.bitTrack(nibbles: stream, sync: stream.map { $0 == 0xFF }, trailingZeros: 2)
             }
-            drives[drive].install(tracks: tracks, bitTracks: bitTracks, thirteenSector: false)
+            drives[drive].install(tracks: tracks, bitTracks: bitTracks, thirteenSector: false, writeProtected: writeProtected)
+        case let .woz(bitTracks, quarterTrackMap, thirteenSector, emulatesWeakBits):
+            guard drives.indices.contains(drive), quarterTrackMap.count == 160 else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            // Do not claim write persistence when no WOZ writer exists.  The
+            // sense line therefore reports protected even for source images
+            // whose INFO chunk did not set the archival write-protect flag.
+            drives[drive].install(
+                tracks: [], bitTracks: bitTracks, quarterTrackMap: quarterTrackMap,
+                thirteenSector: thirteenSector, writeProtected: true,
+                emulatesWeakBits: emulatesWeakBits
+            )
         }
     }
 
@@ -195,7 +215,7 @@ final class IWMController {
         if let value { busData = value; return 0 }
         // An even soft-switch address drives the sequencer's data register
         // onto the CPU bus. Q6H in read mode is the write-protect sense line.
-        if select == 13, !q7 { return 0 } // bundled media is currently writable
+        if select == 13, !q7 { return drives[selectedDrive].isWriteProtected ? 0x80 : 0 }
         return select.isMultiple(of: 2) ? dataLatch : 0
     }
 
@@ -226,7 +246,8 @@ final class IWMController {
         let currentPhase = (drives[selectedDrive].quarterTrack >> 1) & 3
         let delta = (phase - currentPhase + 4) & 3
         if delta == 1 {
-            drives[selectedDrive].quarterTrack = min(139, drives[selectedDrive].quarterTrack + 2)
+            let lastTrack = max(34, drives[selectedDrive].bitTracks.count - 1)
+            drives[selectedDrive].quarterTrack = min(lastTrack * 4 + 3, drives[selectedDrive].quarterTrack + 2)
         } else if delta == 3 {
             drives[selectedDrive].quarterTrack = max(0, drives[selectedDrive].quarterTrack - 2)
         }
@@ -254,20 +275,37 @@ final class IWMController {
 
     private func readBit() -> UInt8 {
         guard hasDisk(in: selectedDrive) else { return 0 }
-        let track = drives[selectedDrive].quarterTrack / 4
+        guard let track = selectedBitTrack(in: selectedDrive) else {
+            // WOZ's $FF map value is physically blank media, not a stream of
+            // reliable zero pulses. Its read amplifier sees the same noise as
+            // a weak-bit region.
+            guard !drives[selectedDrive].quarterTrackMap.isEmpty else { return 0 }
+            nibbleReads &+= 1
+            weakBitsGenerated &+= 1
+            return drives[selectedDrive].nextWeakBit()
+        }
         guard drives[selectedDrive].bitTracks.indices.contains(track) else { return 0 }
         let stream = drives[selectedDrive].bitTracks[track]
         guard stream.bitCount > 0 else { return 0 }
         let position = drives[selectedDrive].bitPosition % stream.bitCount
-        let result = (stream.bytes[position / 8] >> UInt8(7 - (position & 7))) & 1
+        let rawBit = (stream.bytes[position / 8] >> UInt8(7 - (position & 7))) & 1
         drives[selectedDrive].bitPosition = (position + 1) % stream.bitCount
         nibbleReads &+= 1
-        return result
+        guard drives[selectedDrive].emulatesWeakBits else { return rawBit }
+        // WOZ 2.1's MC3470 guidance: delay the raw pulse through a four-bit
+        // head window and produce a noise pulse only after four zero cells.
+        let headWindow = ((drives[selectedDrive].readHeadWindow << 1) | rawBit) & 0x0F
+        drives[selectedDrive].readHeadWindow = headWindow
+        if headWindow == 0 {
+            weakBitsGenerated &+= 1
+            return drives[selectedDrive].nextWeakBit()
+        }
+        return (headWindow >> 1) & 1
     }
 
     private func writeBit(_ bit: UInt8) {
-        guard hasDisk(in: selectedDrive) else { return }
-        let track = drives[selectedDrive].quarterTrack / 4
+        guard hasDisk(in: selectedDrive), !drives[selectedDrive].isWriteProtected else { return }
+        guard let track = selectedBitTrack(in: selectedDrive) else { return }
         guard drives[selectedDrive].bitTracks.indices.contains(track) else { return }
         let count = drives[selectedDrive].bitTracks[track].bitCount
         guard count > 0 else { return }
@@ -276,8 +314,32 @@ final class IWMController {
         let shift = UInt8(7 - (position & 7))
         drives[selectedDrive].bitTracks[track].bytes[byte] &= ~(UInt8(1) << shift)
         drives[selectedDrive].bitTracks[track].bytes[byte] |= (bit & 1) << shift
+        // A standard NIB stream has eight source bits per byte, while a
+        // physical self-sync byte also has trailing zero cells.  Only source
+        // bits can be represented in a NIB export; retain writes to those
+        // cells so saving a modified disk does not silently discard data.
+        let sourceBit = drives[selectedDrive].bitTracks[track].nibbleBitOffsets[position]
+        if sourceBit >= 0, drives[selectedDrive].tracks.indices.contains(track) {
+            let sourceOffset = Int(sourceBit)
+            let sourceByte = sourceOffset / 8
+            let sourceShift = UInt8(7 - (sourceOffset & 7))
+            drives[selectedDrive].tracks[track][sourceByte] &= ~(UInt8(1) << sourceShift)
+            drives[selectedDrive].tracks[track][sourceByte] |= (bit & 1) << sourceShift
+        }
         drives[selectedDrive].bitPosition = (position + 1) % count
         nibbleWrites &+= 1
+    }
+
+    private func selectedBitTrack(in drive: Int) -> Int? {
+        guard drives.indices.contains(drive) else { return nil }
+        let mechanism = drives[drive]
+        if !mechanism.quarterTrackMap.isEmpty {
+            guard mechanism.quarterTrackMap.indices.contains(mechanism.quarterTrack) else { return nil }
+            let mappedTrack = mechanism.quarterTrackMap[mechanism.quarterTrack]
+            return mappedTrack >= 0 && mechanism.bitTracks.indices.contains(mappedTrack) ? mappedTrack : nil
+        }
+        let track = mechanism.quarterTrack / 4
+        return mechanism.bitTracks.indices.contains(track) ? track : nil
     }
 
     private static func nibblizeTrack(_ track: Int, image: [UInt8], sectorOrder: [Int]) -> EncodedDiskTrack {
@@ -340,17 +402,24 @@ final class IWMController {
         precondition(trailingZeros >= 0)
         let bitCount = zip(nibbles, sync).reduce(0) { $0 + ($1.1 ? 8 + trailingZeros : 8) }
         var bytes = [UInt8](repeating: 0, count: (bitCount + 7) / 8)
+        var nibbleBitOffsets = [Int32]()
+        nibbleBitOffsets.reserveCapacity(bitCount)
         var position = 0
-        for (value, isSync) in zip(nibbles, sync) {
-            for bit in stride(from: 7, through: 0, by: -1) {
-                if value & (UInt8(1) << UInt8(bit)) != 0 {
+        for (nibbleIndex, pair) in zip(nibbles, sync).enumerated() {
+            let (value, isSync) = pair
+            for bitOffset in 0..<8 {
+                if value & (UInt8(1) << UInt8(7 - bitOffset)) != 0 {
                     bytes[position / 8] |= UInt8(1) << UInt8(7 - (position & 7))
                 }
+                nibbleBitOffsets.append(Int32(nibbleIndex * 8 + bitOffset))
                 position += 1
             }
-            if isSync { position += trailingZeros }
+            if isSync {
+                nibbleBitOffsets.append(contentsOf: repeatElement(-1, count: trailingZeros))
+                position += trailingZeros
+            }
         }
-        return DiskBitTrack(bytes: bytes, bitCount: bitCount)
+        return DiskBitTrack(bytes: bytes, bitCount: bitCount, nibbleBitOffsets: nibbleBitOffsets)
     }
 
     private static func decodeP6PROM(_ raw: [UInt8]) -> [UInt8] {
@@ -394,16 +463,31 @@ final class IWMController {
 
     private static func encode62(_ sector: [UInt8]) -> [UInt8] {
         var work = [UInt8](repeating: 0, count: 342)
-        for index in 0..<86 {
-            var bits = swappedPair(sector[index])
-            if index + 86 < 256 { bits |= swappedPair(sector[index + 86]) << 2 }
-            if index + 172 < 256 { bits |= swappedPair(sector[index + 172]) << 4 }
-            work[index] = bits
+        // DOS 3.3 writes the low two bits into an 86-byte buffer in reverse
+        // groups of 86.  This ordering is part of the on-disk 6-and-2
+        // format, not an implementation detail: the ROM/ProDOS decoder
+        // expects byte 0 of the buffer to contain source bytes 85, 171, and
+        // (when present) 257.  Keeping the buffer in source order happens to
+        // round-trip through our own decoder but produces sectors a real
+        // Disk II reader decodes incorrectly.
+        for index in 0..<256 {
+            let auxiliaryIndex = 85 - (index % 86)
+            let shift = UInt8((index / 86) * 2)
+            work[auxiliaryIndex] |= swappedPair(sector[index]) << shift
         }
         for index in 0..<256 { work[index + 86] = sector[index] >> 2 }
+        // The auxiliary bytes are stored in reverse order on disk, followed
+        // by the 256 high-six-bit bytes.  GCR's running XOR operates over
+        // that *on-disk* order, rather than the in-memory auxiliary buffer.
         var previous: UInt8 = 0
         var encoded = [UInt8]()
-        for value in work {
+        for index in stride(from: 85, through: 0, by: -1) {
+            let value = work[index]
+            encoded.append(gcr[Int(previous ^ value)])
+            previous = value
+        }
+        for index in 86..<342 {
+            let value = work[index]
             encoded.append(gcr[Int(previous ^ value)])
             previous = value
         }
@@ -502,6 +586,10 @@ final class IWMController {
         return drives[drive].quarterTrack / 4
     }
 
+    func isWriteProtected(in drive: Int = 0) -> Bool {
+        drives.indices.contains(drive) && drives[drive].isWriteProtected
+    }
+
     private func decode44(_ high: UInt8, _ low: UInt8) -> UInt8 { ((high << 1) | 1) & low }
 
     private func decode62(_ encoded: [UInt8]) -> [UInt8]? {
@@ -514,16 +602,16 @@ final class IWMController {
             let value = inverse[Int(encoded[index])]
             guard value != 0xFF else { return nil }
             let decoded = previous ^ value
-            if index < 342 { work[index] = decoded }
+            if index < 86 { work[85 - index] = decoded }
+            else if index < 342 { work[index] = decoded }
             else if decoded != 0 { return nil }
             previous = decoded
         }
         var sector = [UInt8](repeating: 0, count: 256)
         for index in 0..<256 {
-            let pair: UInt8
-            if index < 86 { pair = work[index] & 0x03 }
-            else if index < 172 { pair = (work[index - 86] >> 2) & 0x03 }
-            else { pair = (work[index - 172] >> 4) & 0x03 }
+            let auxiliaryIndex = 85 - (index % 86)
+            let shift = UInt8((index / 86) * 2)
+            let pair = (work[auxiliaryIndex] >> shift) & 0x03
             sector[index] = (work[index + 86] << 2) | Self.swappedPair(pair)
         }
         return sector

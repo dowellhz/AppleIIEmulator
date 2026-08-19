@@ -8,4 +8,8 @@ protocol AppleIIBus: AnyObject {
     func write(_ address: UInt16, _ value: UInt8)
     func setSpeakerCycle(_ cycle: Int)
     func advanceVideoClock(by cycles: Int)
+    /// Level-sensitive maskable interrupt line sampled between instructions.
+    /// Peripherals assert this through the same emulated cycle path as all
+    /// other bus effects; it is never driven from a render-frame callback.
+    var irqPending: Bool { get }
 }
