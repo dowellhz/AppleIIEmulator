@@ -42,6 +42,26 @@
 
 - Do not leave both `swift run` and `build/AppleIIEmulator.app` instances open. Prefer the Logo app for user testing.
 
+## Release signing and Apple notarization
+
+- A public GitHub Release is a distributable, not a development build. Do not
+  upload an ad-hoc-signed (`codesign --sign -`) app as a release asset.
+- Before creating or replacing a public release asset, sign the app with the
+  configured `Developer ID Application` identity, Hardened Runtime and a
+  secure timestamp. Keep the signing identity out of source control.
+- Submit the final ZIP (made with `ditto -c -k --sequesterRsrc --keepParent`)
+  to Apple notarization using a `notarytool` Keychain profile. Never put an
+  Apple ID password, app-specific password, API key, or `.p8` file in the
+  repository, command output, or release notes.
+- Wait for notarization to succeed, staple the ticket to
+  `build/AppleIIEmulator.app`, then validate it with both
+  `xcrun stapler validate build/AppleIIEmulator.app` and
+  `spctl --assess --type execute --verbose=4 build/AppleIIEmulator.app`.
+- Upload the ZIP to GitHub only after signature verification, notarization,
+  stapling and Gatekeeper assessment all pass. If notarization credentials are
+  unavailable, stop before publishing and ask the user to provide an existing
+  Keychain profile name or App Store Connect API-key details.
+
 ## Validation
 
 - Build after source changes that affect the app target.
