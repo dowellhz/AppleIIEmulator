@@ -16,13 +16,13 @@ enum AppleIITextCell: Equatable {
     case ascii(UInt8)
 }
 
-func appleIITextCell(byte: UInt8, alternateCharset: Bool, flashOn: Bool) -> AppleIITextCell {
+func appleIITextCell(byte: UInt8, alternateCharset: Bool, flashOn: Bool, supportsMouseText: Bool = true) -> AppleIITextCell {
     let glyph = byte & 0x3F
     switch byte & 0xC0 {
     case 0x00:
         return .inverse(glyph)
     case 0x40:
-        if alternateCharset { return .alternate(glyph) }
+        if alternateCharset { return supportsMouseText ? .alternate(glyph) : .inverse(glyph) }
         return flashOn ? .normal(glyph) : .inverse(glyph)
     default:
         return .normal(glyph)
@@ -32,9 +32,9 @@ func appleIITextCell(byte: UInt8, alternateCharset: Bool, flashOn: Bool) -> Appl
 /// Decode a IIe 80-column cell.  The high-bit text bank is ASCII rather than
 /// the 40-column six-bit character encoding; the lower banks retain the
 /// normal/flash/MouseText behavior used for WordPerfect's window borders.
-func appleII80ColumnTextCell(byte: UInt8, alternateCharset: Bool, flashOn: Bool) -> AppleIITextCell {
+func appleII80ColumnTextCell(byte: UInt8, alternateCharset: Bool, flashOn: Bool, supportsMouseText: Bool = true) -> AppleIITextCell {
     if byte & 0x80 != 0 { return .ascii(byte & 0x7F) }
-    return appleIITextCell(byte: byte, alternateCharset: alternateCharset, flashOn: flashOn)
+    return appleIITextCell(byte: byte, alternateCharset: alternateCharset, flashOn: flashOn, supportsMouseText: supportsMouseText)
 }
 
 /// Apple II+ motherboard model. The CPU owns no memory: every bus access goes
@@ -167,11 +167,12 @@ final class AppleIIMachine: ObservableObject {
             }
         }
 
-        /// The productivity library is standardised on the enhanced IIe.  It
-        /// supplies 128 KB, 80-column firmware and the Language Card while
-        /// retaining the Disk II slot used by these 5.25-inch releases.
+        /// The productivity library uses IIe hardware. System Utilities 3.2
+        /// relies on the original IIe alternate character ROM for its
+        /// inverse menu highlight; the other bundled titles require or
+        /// benefit from the enhanced IIe firmware.
         var bootROM: BootROM {
-            .appleIIeEnhanced
+            self == .systemUtilities32 ? .appleIIeUnenhanced : .appleIIeEnhanced
         }
     }
 
@@ -848,6 +849,7 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
     private var plusSlot6ROM = [UInt8]()
     private var plusDiskFirmware: DiskIIFirmware?
     private(set) var model: Model = .appleIIPlus
+    private(set) var supportsMouseText = false
     var modelName: String {
         switch model {
         case .appleIIPlus: return "Apple II+"
@@ -899,7 +901,7 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
         AppleIIVideoState(
             textMode: textMode, mixedMode: mixedMode, hires: hires,
             doubleHires: doubleHires, column80: column80,
-            alternateCharset: alternateCharset,
+            alternateCharset: alternateCharset, supportsMouseText: supportsMouseText,
             textByte: { [weak self] column, row in self?.textByte(column: column, row: row) ?? 0 },
             loresByte: { [weak self] column, row in self?.loresByte(column: column, row: row) ?? 0 },
             hgrByte: { [weak self] column, row, auxiliary in self?.hgrByte(column: column, row: row, auxiliary: auxiliary) ?? 0 }
@@ -914,6 +916,7 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
             doubleHires: doubleHires,
             column80: column80,
             alternateCharset: alternateCharset,
+            supportsMouseText: supportsMouseText,
             text: (0..<24).flatMap { row in (0..<80).map { textByte(column: $0, row: row) } },
             lores: (0..<24).flatMap { row in (0..<40).map { loresByte(column: $0, row: row) } },
             hgrMain: (0..<192).flatMap { row in (0..<40).map { hgrByte(column: $0, row: row) } },
@@ -1105,11 +1108,13 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
     func loadROM(_ data: Data) {
         if data.count == 0x8000 {
             model = .appleIIc
+            supportsMouseText = true
             iicROM = Array(data)
             iicROMBank = 0
             iieROM = []
         } else {
             model = .appleIIPlus
+            supportsMouseText = false
             iicROM = []
             iieROM = []
             let start = 0x10000 - data.count
@@ -1123,6 +1128,7 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
         switch data.count {
         case 0x3000:
             model = .appleIIPlus
+            supportsMouseText = false
             iicROM = []
             iicROMBank = 0
             iieROM = []
@@ -1132,12 +1138,14 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
             bytes.replaceSubrange(0xD000..<0x10000, with: data)
         case 0x4000:
             model = .appleIIc
+            supportsMouseText = true
             let bank = Array(data)
             iicROM = bank + bank
             iicROMBank = 0
             iieROM = []
         case 0x8000:
             model = .appleIIc
+            supportsMouseText = true
             iicROM = Array(data)
             iicROMBank = 0
             iieROM = []
@@ -1153,6 +1161,7 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
         let data = try Data(contentsOf: url)
         guard data.count == 0x4000 || data.count == 0x8000 else { throw CocoaError(.fileReadCorruptFile) }
         model = .appleIIc
+        supportsMouseText = true
         let bank = Array(data)
         iicROM = data.count == 0x4000 ? bank + bank : bank
         iicROMBank = 0
@@ -1168,6 +1177,7 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
         let diskROM = try Data(contentsOf: diskURL)
         guard systemROM.count == 0x3000, diskROM.count == 0x100 else { throw CocoaError(.fileReadCorruptFile) }
         model = .appleIIPlus
+        supportsMouseText = false
         iicROM = []
         iicROMBank = 0
         iieROM = []
@@ -1209,6 +1219,7 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
         let diskROM = try Data(contentsOf: diskURL)
         guard diskROM.count == 0x100 else { throw CocoaError(.fileReadCorruptFile) }
         model = .appleIIe
+        supportsMouseText = choice == .appleIIeEnhanced
         iicROM = []
         iicROMBank = 0
         iieROM = Array(image)
@@ -1467,6 +1478,7 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
 
     func installDiagnosticProgram() {
         model = .appleIIPlus
+        supportsMouseText = false
         iicROM = []
         iicROMBank = 0
         iieROM = []

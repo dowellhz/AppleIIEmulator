@@ -87,10 +87,12 @@ final class AppleIIEmulatorTests: XCTestCase {
         XCTAssertEqual(appleIITextCell(byte: 0x41, alternateCharset: false, flashOn: true), .normal(0x01))
         XCTAssertEqual(appleIITextCell(byte: 0x41, alternateCharset: false, flashOn: false), .inverse(0x01))
         XCTAssertEqual(appleIITextCell(byte: 0x41, alternateCharset: true, flashOn: false), .alternate(0x01))
+        XCTAssertEqual(appleIITextCell(byte: 0x41, alternateCharset: true, flashOn: false, supportsMouseText: false), .inverse(0x01))
         XCTAssertEqual(appleIITextCell(byte: 0xC1, alternateCharset: true, flashOn: false), .normal(0x01))
         XCTAssertEqual(appleIITextCell(byte: 0xFF, alternateCharset: false, flashOn: true), .normal(0x3F))
         XCTAssertEqual(appleII80ColumnTextCell(byte: 0xEF, alternateCharset: true, flashOn: false), .ascii(0x6F))
         XCTAssertEqual(appleII80ColumnTextCell(byte: 0x41, alternateCharset: true, flashOn: false), .alternate(0x01))
+        XCTAssertEqual(appleII80ColumnTextCell(byte: 0x41, alternateCharset: true, flashOn: false, supportsMouseText: false), .inverse(0x01))
     }
 
     func testHiResPairPaletteUsesTheHighBitPhase() {

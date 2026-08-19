@@ -28,10 +28,11 @@ final class ROMLoadingTests: XCTestCase {
         XCTAssertThrowsError(try AppleIIMemory().loadCustomROM(Data(repeating: 0, count: 0x2000)))
     }
 
-    func testAllBundledProductivitySoftwareUsesEnhancedAppleIIe() {
+    func testBundledProductivitySoftwareUsesAnAppleIIeROM() {
         for software in AppleIIMachine.BundledSoftware.allCases {
-            XCTAssertEqual(software.bootROM, .appleIIeEnhanced, software.title)
+            XCTAssertTrue([.appleIIeEnhanced, .appleIIeUnenhanced].contains(software.bootROM), software.title)
         }
+        XCTAssertEqual(AppleIIMachine.BundledSoftware.systemUtilities32.bootROM, .appleIIeUnenhanced)
     }
 
     func testBundledAppleIIeROMsMapSystemAndSlotSixROM() throws {
@@ -136,6 +137,19 @@ final class ROMLoadingTests: XCTestCase {
         XCTAssertTrue(memory.videoState.column80)
         XCTAssertTrue(text.contains("WordPerfect"), text)
         XCTAssertFalse(text.contains("INSERT SYSTEM DISK AND RESTART"), text)
+    }
+
+    func testSystemUtilitiesUsesTheStandardCharsetForItsMenuHighlight() throws {
+        let memory = AppleIIMemory()
+        try memory.loadBundledAppleIIeROM(.appleIIeUnenhanced)
+        let url = try XCTUnwrap(AppResources.bundle.url(forResource: "Apple II System Utilities 3.2", withExtension: "dsk"))
+        try memory.mountDiskImage(at: url)
+        let cpu = MOS6502(bus: memory)
+        cpu.reset()
+        cpu.run(cycles: 20_000_000)
+
+        XCTAssertTrue(memory.videoState.column80)
+        XCTAssertFalse(memory.videoState.supportsMouseText)
     }
 
     @MainActor
