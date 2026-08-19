@@ -347,6 +347,7 @@ private struct AppleIIScreen: View {
         case let .normal(value): code = value; inverse = false
         case let .inverse(value): code = value; inverse = true
         case let .alternate(value): return (alternateCharacter(value), false)
+        case let .alternateInverse(value): return (legacyAlternateCharacter(value), true)
         case let .ascii(value):
             guard value >= 0x20, value <= 0x7E else { return (" ", false) }
             return (String(UnicodeScalar(value)), false)
@@ -366,6 +367,16 @@ private struct AppleIIScreen: View {
         if code < 0x20 { return mouseText[Int(code)] }
         if (0x21...0x3A).contains(code) { return String(UnicodeScalar(code + 0x60)) }
         return String(UnicodeScalar(code))
+    }
+
+    private func legacyAlternateCharacter(_ code: UInt8) -> String {
+        // On an unenhanced IIe, the alternate bank retains inverse uppercase
+        // at $40-$5F and contributes inverse lowercase at $60-$7F.
+        // The renderer has already reduced the screen byte to six glyph bits,
+        // so both ranges are restored by adding $40: $01 -> "A" and
+        // $21 -> "a". Adding $60 to the latter would address a C1 control
+        // character rather than a lowercase letter.
+        return String(UnicodeScalar(code + 0x40))
     }
 }
 

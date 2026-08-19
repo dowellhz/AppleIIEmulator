@@ -11,6 +11,9 @@ enum AppleIITextCell: Equatable {
     case normal(UInt8)
     case inverse(UInt8)
     case alternate(UInt8)
+    /// The original IIe alternate character ROM has inverse lowercase in
+    /// $60-$7F. It is distinct from the enhanced IIe/IIc MouseText bank.
+    case alternateInverse(UInt8)
     /// The IIe 80-column firmware can store seven-bit ASCII with bit 7 set.
     /// Applications such as WordPerfect use this for mixed-case text.
     case ascii(UInt8)
@@ -22,7 +25,7 @@ func appleIITextCell(byte: UInt8, alternateCharset: Bool, flashOn: Bool, support
     case 0x00:
         return .inverse(glyph)
     case 0x40:
-        if alternateCharset { return supportsMouseText ? .alternate(glyph) : .inverse(glyph) }
+        if alternateCharset { return supportsMouseText ? .alternate(glyph) : .alternateInverse(glyph) }
         return flashOn ? .normal(glyph) : .inverse(glyph)
     default:
         return .normal(glyph)
