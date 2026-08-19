@@ -235,7 +235,11 @@ final class AppleIIMachine: ObservableObject {
         // explicit menu tool, never the user's default operating environment.
         selectROM(.appleIIPlus)
         // AppKit delivers this before the responder chain, so Apple II input
-        // works even when Canvas is not the current first responder.
+        // works even when Canvas is not the current first responder.  Consume
+        // the event after latching it: KeyboardCapture is also a first
+        // responder and letting the event continue would latch every key
+        // twice.  In particular, WordPerfect treats two RETURN strobes as an
+        // immediate confirmation followed by an unexpected command.
         keyboardMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             // macOS normally reserves Escape for transient UI, but the
             // emulator's display owns keyboard focus.  In full screen it must
@@ -247,7 +251,7 @@ final class AppleIIMachine: ObservableObject {
                 return nil
             }
             self?.keyDown(event)
-            return event
+            return nil
         }
         keyboardReleaseMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyUp) { [weak self] event in
             self?.keyUp(event)
