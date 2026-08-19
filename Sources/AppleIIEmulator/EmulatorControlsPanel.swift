@@ -24,22 +24,35 @@ struct EmulatorControlsPanel: View {
                     Spacer(minLength: 0)
                     romMenu
                     gameMenu
+                    softwareMenu
+                    hardDiskMenu
                     Button(machine.isRunning ? "PAUSE" : "RUN") { machine.toggleRunning() }.buttonStyle(MetalButtonStyle())
                     Button("RESET") { machine.reset() }.buttonStyle(MetalButtonStyle())
                 }
-                Text("GAME CONTROLS  ←↑→↓: JOYSTICK   ⌘/⌥: BUTTONS").font(.system(size: 9, weight: .semibold, design: .monospaced)).foregroundStyle(Color.black.opacity(0.62))
+                HStack {
+                    Text("GAME CONTROLS  ←↑→↓: JOYSTICK   ⌘/⌥: BUTTONS")
+                    Spacer()
+                    Toggle(isOn: $machine.isCPUAccelerated) {
+                        Text("CPU 2×")
+                    }
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .fixedSize()
+                }
+                .foregroundStyle(Color.black.opacity(0.62))
             }
             .padding(16)
         }
         .frame(maxWidth: .infinity)
         .foregroundStyle(Color(red: 0.12, green: 0.105, blue: 0.075))
-        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
         .accessibilityHint("选择游戏后会自动装入磁盘；方向键控制摇杆，Command 和 Option 对应两个游戏按钮")
     }
 
     private var romMenu: some View {
         Menu {
-            ForEach(AppleIIMachine.BootROM.allCases) { rom in
+            ForEach(AppleIIMachine.BootROM.menuChoices) { rom in
                 Button { machine.selectROM(rom) } label: {
                     if machine.selectedBootROM == rom {
                         Label(rom.title, systemImage: "checkmark")
@@ -48,7 +61,9 @@ struct EmulatorControlsPanel: View {
                     }
                 }
             }
-        } label: { controlLabel(machine.selectedBootROM.title, icon: "chevron.up.chevron.down") }
+            Divider()
+            Button("打开外部 ROM…") { machine.chooseExternalROM() }
+        } label: { controlLabel(machine.currentROMTitle, icon: "chevron.up.chevron.down") }
         .menuStyle(.borderlessButton)
     }
 
@@ -66,6 +81,26 @@ struct EmulatorControlsPanel: View {
             Divider()
             ForEach(AppleIIMachine.BundledGame.allCases) { game in Button(game.title) { machine.loadBundledGame(game) } }
         } label: { controlLabel("GAME", icon: "gamecontroller") }
+        .menuStyle(.borderlessButton)
+    }
+
+    private var softwareMenu: some View {
+        Menu {
+            ForEach(AppleIIMachine.BundledSoftware.allCases) { software in
+                Button(software.title) { machine.loadBundledSoftware(software) }
+            }
+        } label: { controlLabel("SOFTWARE", icon: "document") }
+        .menuStyle(.borderlessButton)
+    }
+
+    private var hardDiskMenu: some View {
+        Menu {
+            Button("插入 SmartPort 硬盘映像…") { machine.chooseHardDiskImage() }
+            if machine.hardDiskDescription != "未插入" {
+                Divider()
+                Button("弹出 SmartPort 硬盘") { machine.ejectHardDisk() }
+            }
+        } label: { controlLabel("HARD DISK", icon: "externaldrive") }
         .menuStyle(.borderlessButton)
     }
 

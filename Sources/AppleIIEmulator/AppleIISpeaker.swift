@@ -76,7 +76,7 @@ struct AppleIISpeakerWaveform {
 /// Apple II's speaker is a flip-flop, not a host-side click generator.  The
 /// emulation thread converts its cycle-timestamped edges into a bounded PCM
 /// FIFO; the real-time callback only dequeues prepared samples.
-final class AppleIISpeaker {
+final class AppleIISpeaker: @unchecked Sendable {
     private let engine = AVAudioEngine()
     private let sampleRate = 44_100.0
     private let queueCapacity = 32_768

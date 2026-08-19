@@ -3,7 +3,7 @@ import Foundation
 /// 65C02 instruction-level core. It deliberately models the processor
 /// separately from Apple II hardware, allowing the same core to be exercised
 /// with conformance ROMs and a simple test bus.
-final class MOS6502 {
+final class MOS6502: @unchecked Sendable {
     private let bus: AppleIIBus
     private(set) var a: UInt8 = 0
     private(set) var x: UInt8 = 0
@@ -26,6 +26,11 @@ final class MOS6502 {
     // Most software does not notice the distinction, but speaker PWM does:
     // its $C030 edge must be stamped at the access cycle, not at opcode fetch.
     private var instructionBusCycle = 0
+    /// Number of instruction cycles already handed to the hardware while the
+    /// current instruction is executing.  Disk II loaders poll $C0Ex in very
+    /// tight loops, so deferring every device clock until instruction end
+    /// shifts those accesses by several 6502 cycles and loses bit cells.
+    private var advancedBusCycles = 0
 
     private let carry: UInt8 = 0x01, zero: UInt8 = 0x02, interrupt: UInt8 = 0x04
     private let decimal: UInt8 = 0x08, brk: UInt8 = 0x10, unused: UInt8 = 0x20
@@ -52,11 +57,15 @@ final class MOS6502 {
     func run(cycles budget: Int) {
         var elapsed = 0
         while elapsed < budget {
-            bus.setSpeakerCycle(totalCycles)
             let cost = step()
             elapsed += cost
             totalCycles += cost
-            bus.advanceVideoClock(by: cost)
+            finishInstructionBusCycles(total: cost)
+            if bus.irqPending {
+                let cyclesBeforeIRQ = totalCycles
+                irq()
+                elapsed += totalCycles - cyclesBeforeIRQ
+            }
         }
     }
 
@@ -66,6 +75,7 @@ final class MOS6502 {
     func irq() {
         waitingForInterrupt = false
         guard !stopped, !flag(interrupt) else { return }
+        beginInstructionBusTiming()
         bus.setSpeakerCycle(totalCycles)
         push(UInt8(truncatingIfNeeded: pc >> 8))
         push(UInt8(truncatingIfNeeded: pc))
@@ -73,13 +83,14 @@ final class MOS6502 {
         set(interrupt, true)
         pc = word(at: 0xFFFE)
         totalCycles += 7
-        bus.advanceVideoClock(by: 7)
+        finishInstructionBusCycles(total: 7)
     }
 
     /// Assert the non-maskable interrupt input.
     func nmi() {
         waitingForInterrupt = false
         guard !stopped else { return }
+        beginInstructionBusTiming()
         bus.setSpeakerCycle(totalCycles)
         push(UInt8(truncatingIfNeeded: pc >> 8))
         push(UInt8(truncatingIfNeeded: pc))
@@ -87,14 +98,14 @@ final class MOS6502 {
         set(interrupt, true)
         pc = word(at: 0xFFFA)
         totalCycles += 7
-        bus.advanceVideoClock(by: 7)
+        finishInstructionBusCycles(total: 7)
     }
 
     @discardableResult
     func step() -> Int {
         guard !stopped, !waitingForInterrupt else { return 1 }
         cyclePenalty = 0
-        instructionBusCycle = 0
+        beginInstructionBusTiming()
         lastInstructionAddress = pc
         if lastInstructionAddress < 0xC000 { hasExecutedRAMInstruction = true }
         let opcode = fetch()
@@ -304,15 +315,38 @@ final class MOS6502 {
     }
     private func modify(_ mode: Mode, _ transform: (UInt8) -> UInt8) { let a = address(mode); write(a, transform(read(a))) }
     private func read(_ a: UInt16) -> UInt8 {
-        bus.setSpeakerCycle(totalCycles + instructionBusCycle)
-        instructionBusCycle += 1
+        advanceHardwareToCurrentBusAccess()
         return bus.read(a)
     }
 
     private func write(_ a: UInt16, _ v: UInt8) {
-        bus.setSpeakerCycle(totalCycles + instructionBusCycle)
-        instructionBusCycle += 1
+        advanceHardwareToCurrentBusAccess()
         bus.write(a, v)
+    }
+
+    private func beginInstructionBusTiming() {
+        instructionBusCycle = 0
+        advancedBusCycles = 0
+    }
+
+    /// Advances devices to the exact cycle of this memory transaction.  The
+    /// instruction model intentionally stays separate from the bus, but this
+    /// makes I/O effects observable at their access cycle rather than after
+    /// the instruction's remaining internal cycles have elapsed.
+    private func advanceHardwareToCurrentBusAccess() {
+        let accessCycle = instructionBusCycle
+        if accessCycle > advancedBusCycles {
+            bus.advanceVideoClock(by: accessCycle - advancedBusCycles)
+            advancedBusCycles = accessCycle
+        }
+        bus.setSpeakerCycle(totalCycles + accessCycle)
+        instructionBusCycle += 1
+    }
+
+    private func finishInstructionBusCycles(total cost: Int) {
+        guard cost > advancedBusCycles else { return }
+        bus.advanceVideoClock(by: cost - advancedBusCycles)
+        advancedBusCycles = cost
     }
     private func fetch() -> UInt8 { defer { pc &+= 1 }; return read(pc) }
     private func fetchWord() -> UInt16 { let lo = fetch(); return UInt16(lo) | UInt16(fetch()) << 8 }

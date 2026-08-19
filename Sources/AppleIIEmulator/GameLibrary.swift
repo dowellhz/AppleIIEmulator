@@ -15,7 +15,7 @@ struct GameLibrary {
         }
     }
 
-    private static let imageExtensions: Set<String> = ["dsk", "do", "d13", "po", "nib", "2mg", "2img"]
+    private static let imageExtensions: Set<String> = ["dsk", "do", "d13", "po", "nib", "2mg", "2img", "woz"]
 
     let games: [Game]
 

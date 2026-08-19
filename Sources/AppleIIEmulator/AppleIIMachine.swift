@@ -11,6 +11,9 @@ enum AppleIITextCell: Equatable {
     case normal(UInt8)
     case inverse(UInt8)
     case alternate(UInt8)
+    /// The IIe 80-column firmware can store seven-bit ASCII with bit 7 set.
+    /// Applications such as WordPerfect use this for mixed-case text.
+    case ascii(UInt8)
 }
 
 func appleIITextCell(byte: UInt8, alternateCharset: Bool, flashOn: Bool) -> AppleIITextCell {
@@ -26,6 +29,14 @@ func appleIITextCell(byte: UInt8, alternateCharset: Bool, flashOn: Bool) -> Appl
     }
 }
 
+/// Decode a IIe 80-column cell.  The high-bit text bank is ASCII rather than
+/// the 40-column six-bit character encoding; the lower banks retain the
+/// normal/flash/MouseText behavior used for WordPerfect's window borders.
+func appleII80ColumnTextCell(byte: UInt8, alternateCharset: Bool, flashOn: Bool) -> AppleIITextCell {
+    if byte & 0x80 != 0 { return .ascii(byte & 0x7F) }
+    return appleIITextCell(byte: byte, alternateCharset: alternateCharset, flashOn: flashOn)
+}
+
 /// Apple II+ motherboard model. The CPU owns no memory: every bus access goes
 /// through this object, so soft switches remain observable and testable.
 @MainActor
@@ -36,7 +47,11 @@ final class AppleIIMachine: ObservableObject {
         case appleIIcROM03
         case appleIIcROM04
         case appleIIcROMFF
+        case appleIIeEnhanced
+        case appleIIeUnenhanced
+        case appleIIeCF
         case diagnostic
+        case external
 
         var id: Self { self }
         var title: String {
@@ -46,7 +61,11 @@ final class AppleIIMachine: ObservableObject {
             case .appleIIcROM03: return "Apple IIc ROM 03"
             case .appleIIcROM04: return "Apple IIc ROM 04"
             case .appleIIcROMFF: return "Apple IIc ROM FF"
+            case .appleIIeEnhanced: return "Apple IIe 增强型"
+            case .appleIIeUnenhanced: return "Apple IIe 非增强型"
+            case .appleIIeCF: return "Apple IIe CF ROM"
             case .diagnostic: return "内置诊断 ROM"
+            case .external: return "外部 ROM"
             }
         }
 
@@ -57,9 +76,11 @@ final class AppleIIMachine: ObservableObject {
             case .appleIIcROM03: return "AppleIIc-ROM03-341-0445-A"
             case .appleIIcROM04: return "AppleIIc-ROM04-341-0445-B"
             case .appleIIcROMFF: return "AppleIIc-ROMFF-342-0272-A"
-            case .diagnostic: return nil
+            case .appleIIeEnhanced, .appleIIeUnenhanced, .appleIIeCF, .diagnostic, .external: return nil
             }
         }
+
+        static let menuChoices: [BootROM] = [.appleIIPlus, .appleIIcROM00, .appleIIcROM03, .appleIIcROM04, .appleIIcROMFF, .appleIIeEnhanced, .appleIIeUnenhanced, .appleIIeCF, .diagnostic]
     }
 
     /// A small, deterministic set of games shown in the default GAME menu.
@@ -101,13 +122,73 @@ final class AppleIIMachine: ObservableObject {
 
     }
 
+    /// Productivity disks are deliberately kept separate from the game picker:
+    /// the two menus describe different ways people used an Apple II.
+    enum BundledSoftware: String, CaseIterable, Identifiable {
+        case appleWriter10
+        case appleWriter11
+        case wordPerfect11
+        case visiCalc137
+        case systemUtilities32
+        case copyIIPlus55
+        case applePascalBoot
+
+        var id: Self { self }
+
+        var title: String {
+            switch self {
+            case .appleWriter10: return "Apple Writer 1.0"
+            case .appleWriter11: return "Apple Writer 1.1"
+            case .wordPerfect11: return "WordPerfect 1.1（IIe/IIc）"
+            case .visiCalc137: return "VisiCalc 1.37"
+            case .systemUtilities32: return "Apple II System Utilities 3.2"
+            case .copyIIPlus55: return "Copy II Plus 5.5"
+            case .applePascalBoot: return "Apple Pascal 启动盘"
+            }
+        }
+
+        var resourceName: String {
+            switch self {
+            case .appleWriter10: return "Apple Writer 1.0"
+            case .appleWriter11: return "Apple Writer 1.1"
+            case .wordPerfect11: return "WordPerfect 1.1 IIe-IIc"
+            case .visiCalc137: return "VisiCalc 1.37"
+            case .systemUtilities32: return "Apple II System Utilities 3.2"
+            case .copyIIPlus55: return "Copy II Plus 5.5"
+            case .applePascalBoot: return "Apple Pascal Boot"
+            }
+        }
+
+        var resourceExtension: String {
+            switch self {
+            case .appleWriter10, .wordPerfect11, .visiCalc137, .systemUtilities32, .copyIIPlus55:
+                return "dsk"
+            case .appleWriter11, .applePascalBoot: return "do"
+            }
+        }
+
+        /// The productivity library is standardised on the enhanced IIe.  It
+        /// supplies 128 KB, 80-column firmware and the Language Card while
+        /// retaining the Disk II slot used by these 5.25-inch releases.
+        var bootROM: BootROM {
+            .appleIIeEnhanced
+        }
+    }
+
     @Published private(set) var isRunning = true
+    /// Runs the same 6502/bus path at twice the normal 1.0218 MHz rate.  This
+    /// is deliberately a clock multiplier rather than a UI shortcut: every
+    /// disk, paddle and speaker effect still observes its actual CPU cycle.
+    @Published var isCPUAccelerated = false
     @Published private(set) var hasExternalROM = false
     @Published private(set) var status = "Apple II+（内置） · 未插入磁盘"
     @Published private(set) var refreshToken = 0
+    @Published private(set) var videoSnapshot = AppleIIVideoSnapshot.blank
     @Published private(set) var selectedBootROM: BootROM = .appleIIPlus
+    @Published private(set) var externalROMName: String?
     @Published private(set) var diskDescription = "未插入"
     @Published private(set) var externalDiskDescription = "未插入"
+    @Published private(set) var hardDiskDescription = "未插入"
 
     private let gameLibrary = GameLibrary()
     /// Grouping keeps the in-app GAME menu navigable even with a large game
@@ -121,6 +202,16 @@ final class AppleIIMachine: ObservableObject {
     private var keyboardMonitor: Any?
     private var keyboardReleaseMonitor: Any?
     private var modifierMonitor: Any?
+    private var terminationObserver: NSObjectProtocol?
+    private var wordPerfectWorkDiskURL: URL?
+    private let workDiskWriteQueue = DispatchQueue(label: "AppleIIEmulator.WordPerfectWorkDisk")
+    /// CPU and bus execution are serialised away from SwiftUI.  UI work only
+    /// receives immutable video snapshots after each slice, so an accelerated
+    /// 6502 cannot monopolise the main actor.
+    private let emulationQueue = DispatchQueue(label: "AppleIIEmulator.Execution", qos: .userInteractive)
+    private let emulationLock = NSLock()
+    private var cpuSliceQueued = false
+    private var executionGeneration = 0
     // The speaker is timed by CPU cycles, so the CPU must follow a monotonic
     // clock rather than assuming the UI timer always arrives at exactly 60 Hz.
     // A delayed SwiftUI/AppKit frame otherwise stretches every 1-bit waveform
@@ -132,6 +223,8 @@ final class AppleIIMachine: ObservableObject {
     /// warm-reset path after it has shown the power-on banner.
     private var applesoftWarmStartDeadline: TimeInterval?
 
+    var currentROMTitle: String { externalROMName ?? selectedBootROM.title }
+
     init() {
         memory.speakerDidToggleAtCycle = { [weak speaker] cycle in
             speaker?.toggle(atEmulatedCycle: cycle)
@@ -142,10 +235,23 @@ final class AppleIIMachine: ObservableObject {
         // explicit menu tool, never the user's default operating environment.
         selectROM(.appleIIPlus)
         // AppKit delivers this before the responder chain, so Apple II input
-        // works even when Canvas is not the current first responder.
+        // works even when Canvas is not the current first responder.  Consume
+        // the event after latching it: KeyboardCapture is also a first
+        // responder and letting the event continue would latch every key
+        // twice.  In particular, WordPerfect treats two RETURN strobes as an
+        // immediate confirmation followed by an unexpected command.
         keyboardMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            // macOS normally reserves Escape for transient UI, but the
+            // emulator's display owns keyboard focus.  In full screen it must
+            // retain the conventional macOS escape hatch rather than passing
+            // the key through as Apple II Escape.
+            if event.keyCode == 53, let window = event.window,
+               window.styleMask.contains(.fullScreen) {
+                window.toggleFullScreen(nil)
+                return nil
+            }
             self?.keyDown(event)
-            return event
+            return nil
         }
         keyboardReleaseMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyUp) { [weak self] event in
             self?.keyUp(event)
@@ -154,6 +260,15 @@ final class AppleIIMachine: ObservableObject {
         modifierMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
             self?.modifierFlagsChanged(event.modifierFlags)
             return event
+        }
+        terminationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.persistWordPerfectWorkDisk()
+            }
         }
         // `swift run` launches from Terminal, which otherwise remains the key
         // application on some macOS versions. Claim foreground activation once
@@ -174,58 +289,94 @@ final class AppleIIMachine: ObservableObject {
         if let keyboardMonitor { NSEvent.removeMonitor(keyboardMonitor) }
         if let keyboardReleaseMonitor { NSEvent.removeMonitor(keyboardReleaseMonitor) }
         if let modifierMonitor { NSEvent.removeMonitor(modifierMonitor) }
+        if let terminationObserver { NotificationCenter.default.removeObserver(terminationObserver) }
     }
 
     func tick() {
         let now = ProcessInfo.processInfo.systemUptime
         defer { lastEmulationTick = now }
-        guard isRunning else { return }
+        guard isRunning, !cpuSliceQueued else { return }
         // Audio output is clocked independently of the UI. Derive the work
         // budget from elapsed wall time so a slow frame does not slow the
         // emulated speaker and lower the pitch. Cap catch-up to avoid a long
         // foreground pause making the UI unresponsive.
         let elapsed = min(0.050, max(0, now - lastEmulationTick))
-        fractionalCPUCycles += elapsed * 1_021_800.0
+        let clockMultiplier = isCPUAccelerated ? 2.0 : 1.0
+        fractionalCPUCycles += elapsed * 1_021_800.0 * clockMultiplier
         let cycles = Int(fractionalCPUCycles)
         fractionalCPUCycles -= Double(cycles)
-        if cycles > 0 { cpu.run(cycles: cycles) }
-        if let deadline = applesoftWarmStartDeadline, now >= deadline {
-            // This deliberately resets only the CPU. Resetting I/O hardware
-            // would erase the ROM's cold-start marker and restart disk boot.
-            cpu.reset()
-            applesoftWarmStartDeadline = nil
-            status = "Apple II+（内置） · Applesoft BASIC"
+        guard cycles > 0 else { return }
+        cpuSliceQueued = true
+        let generation = executionGeneration
+        let warmStart = applesoftWarmStartDeadline.map { now >= $0 } ?? false
+        let cpu = cpu!
+        let memory = memory
+        let speaker = speaker
+        let lock = emulationLock
+        emulationQueue.async { [weak self] in
+            lock.lock()
+            cpu.run(cycles: cycles)
+            if warmStart { cpu.reset() }
+            speaker.advance(toEmulatedCycle: cpu.totalCycles)
+            let snapshot = memory.makeVideoSnapshot()
+            lock.unlock()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.cpuSliceQueued = false
+                guard self.executionGeneration == generation else { return }
+                if warmStart {
+                    self.applesoftWarmStartDeadline = nil
+                    self.status = "Apple II+（内置） · Applesoft BASIC"
+                }
+                self.videoSnapshot = snapshot
+                self.refreshToken &+= 1
+            }
         }
-        speaker.advance(toEmulatedCycle: cpu.totalCycles)
-        refreshToken &+= 1
+    }
+
+    private func withEmulationLock<T>(_ body: () throws -> T) rethrows -> T {
+        try emulationQueue.sync {
+            emulationLock.lock()
+            defer { emulationLock.unlock() }
+            return try body()
+        }
     }
 
     /// Narrow diagnostic seam for regression tests: it runs the same CPU and
     /// bus path as the display timer without needing an AppKit run loop.
     func runForVerification(cycles: Int) {
-        cpu.run(cycles: cycles)
-        speaker.advance(toEmulatedCycle: cpu.totalCycles)
+        let snapshot = withEmulationLock {
+            cpu.run(cycles: cycles)
+            speaker.advance(toEmulatedCycle: cpu.totalCycles)
+            return memory.makeVideoSnapshot()
+        }
+        videoSnapshot = snapshot
         refreshToken &+= 1
     }
 
-    var encounteredUnsupportedCPUOpcodes: Set<UInt8> { cpu.unsupportedOpcodes }
-    var executedCPUCycles: Int { cpu.totalCycles }
+    var encounteredUnsupportedCPUOpcodes: Set<UInt8> { withEmulationLock { cpu.unsupportedOpcodes } }
+    var executedCPUCycles: Int { withEmulationLock { cpu.totalCycles } }
     /// Current CPU location, exposed to the regression suite so a disk loader
     /// that silently falls back into BASIC cannot look like a successful boot.
-    var programCounter: UInt16 { cpu.pc }
-    var lastUnsupportedInstructionAddress: UInt16 { cpu.lastUnsupportedInstructionAddress }
-    var recentInstructions: [(UInt16, UInt8)] { cpu.recentInstructions }
+    var programCounter: UInt16 { withEmulationLock { cpu.pc } }
+    var lastUnsupportedInstructionAddress: UInt16 { withEmulationLock { cpu.lastUnsupportedInstructionAddress } }
+    var recentInstructions: [(UInt16, UInt8)] { withEmulationLock { cpu.recentInstructions } }
     /// Observable boot-progress seam: disk-loaded Apple II programs execute
     /// from RAM below $C000, whereas the reset firmware lives in ROM above it.
-    var hasExecutedRAMCode: Bool { cpu.hasExecutedRAMInstruction }
+    var hasExecutedRAMCode: Bool { withEmulationLock { cpu.hasExecutedRAMInstruction } }
 
     func reset() {
         applesoftWarmStartDeadline = nil
-        memory.resetHardwareState()
-        cpu.reset()
+        executionGeneration &+= 1
+        let snapshot = withEmulationLock {
+            memory.resetHardwareState()
+            cpu.reset()
+            return memory.makeVideoSnapshot()
+        }
         isRunning = true
         fractionalCPUCycles = 0
         lastEmulationTick = ProcessInfo.processInfo.systemUptime
+        videoSnapshot = snapshot
         refreshToken &+= 1
     }
 
@@ -252,16 +403,26 @@ final class AppleIIMachine: ObservableObject {
                   let translated = Self.appleKeyboardByte(forASCII: scalar.value, control: event.modifierFlags.contains(.control)) else { return }
             key = translated
         }
-        memory.latchKey(key)
+        applyInput { $0.latchKey(key) }
     }
 
     func keyUp(_ event: NSEvent) {
         updateJoystick(for: event.keyCode, pressed: false)
     }
 
+    func mouseMoved(_ event: NSEvent) {
+        // The IIc mouse reports relative quadrature motion. AppKit supplies
+        // the same relative movement independent of window geometry.
+        let deltaX = Int(event.deltaX.rounded())
+        let deltaY = -Int(event.deltaY.rounded())
+        applyInput { $0.moveMouse(deltaX: deltaX, deltaY: deltaY) }
+    }
+
+    func mouseButton(_ index: Int, pressed: Bool) { applyInput { $0.setMouseButton(index, pressed: pressed) } }
+
     private func updateJoystick(for keyCode: UInt16, pressed: Bool) {
         if let paddles = inputState.setJoystickKey(keyCode, pressed: pressed) {
-            memory.setPaddles(paddles)
+            applyInput { $0.setPaddles(paddles) }
         }
     }
 
@@ -279,15 +440,26 @@ final class AppleIIMachine: ObservableObject {
     func modifierFlagsChanged(_ flags: NSEvent.ModifierFlags) {
         // The IIc has no physical joystick buttons on the keyboard, but its
         // Open-Apple/Closed-Apple keys feed the standard PB0/PB1 softswitches.
-        memory.setButtons(openApple: flags.contains(.command), closedApple: flags.contains(.option))
+        let openApple = flags.contains(.command)
+        let closedApple = flags.contains(.option)
+        applyInput { $0.setButtons(openApple: openApple, closedApple: closedApple) }
+    }
+
+    /// Host input is queued at the next CPU boundary synchronously, so a
+    /// physical key cannot be overtaken by another timer slice. The critical
+    /// section is limited to one already-bounded emulation slice.
+    private func applyInput(_ operation: (AppleIIMemory) -> Void) {
+        withEmulationLock { operation(memory) }
     }
 
     func selectROM(_ choice: BootROM) {
+        guard choice != .external else { return }
         selectedBootROM = choice
+        externalROMName = nil
         switch choice {
         case .appleIIPlus:
             do {
-                try memory.loadBundledAppleIIPlusROM(diskFirmware: .sixteenSector)
+                try withEmulationLock { try memory.loadBundledAppleIIPlusROM(diskFirmware: .sixteenSector) }
                 hasExternalROM = true
                 status = "Apple II+（内置） · \(diskDescription)"
             } catch {
@@ -296,7 +468,16 @@ final class AppleIIMachine: ObservableObject {
             }
         case .appleIIcROM00, .appleIIcROM03, .appleIIcROM04, .appleIIcROMFF:
             do {
-                try memory.loadBundledAppleIIcROM(named: choice.resourceName!)
+                try withEmulationLock { try memory.loadBundledAppleIIcROM(named: choice.resourceName!) }
+                hasExternalROM = true
+                status = "\(choice.title)（内置） · \(diskDescription)"
+            } catch {
+                installDiagnosticROM()
+                status = "内置诊断 ROM（\(choice.title) 未找到）"
+            }
+        case .appleIIeEnhanced, .appleIIeUnenhanced, .appleIIeCF:
+            do {
+                try withEmulationLock { try memory.loadBundledAppleIIeROM(choice) }
                 hasExternalROM = true
                 status = "\(choice.title)（内置） · \(diskDescription)"
             } catch {
@@ -307,18 +488,57 @@ final class AppleIIMachine: ObservableObject {
             installDiagnosticROM()
             hasExternalROM = false
             status = "内置诊断 ROM"
+        case .external:
+            return
         }
         reset()
         scheduleApplesoftWarmStartIfDiskless()
     }
 
+    /// Opens a ROM supplied by the user. Disk reads happen off the main actor;
+    /// only the validated bytes are handed back to the emulated memory bus.
+    func chooseExternalROM() {
+        let panel = NSOpenPanel()
+        panel.title = "打开 Apple II ROM"
+        panel.message = "支持 Apple II/II+ 12 KB ROM，或 Apple IIc 16 KB / 32 KB ROM"
+        // ROM dumps are often distributed without a standard extension. The
+        // byte-length validator below is authoritative, so allow any binary
+        // data file rather than hiding a valid dump because it is named .dat.
+        panel.allowedContentTypes = [.data]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        status = "正在读取 (url.lastPathComponent)…"
+        Task { [weak self] in
+            let result = await Task.detached { Result { try Data(contentsOf: url) } }.value
+            guard let self else { return }
+            switch result {
+            case let .success(data): self.loadExternalROM(data, name: url.lastPathComponent)
+            case .failure: self.status = "无法读取 (url.lastPathComponent)"
+            }
+        }
+    }
+
+    private func loadExternalROM(_ data: Data, name: String) {
+        do {
+            try withEmulationLock { try memory.loadCustomROM(data) }
+            selectedBootROM = .external
+            externalROMName = "外部 ROM：\(name)"
+            hasExternalROM = true
+            status = "\(currentROMTitle) · \(diskDescription)"
+            reset()
+        } catch {
+            status = "ROM 格式无效：仅支持 12 KB Apple II/II+，或 16 KB / 32 KB Apple IIc ROM"
+        }
+    }
+
     private func installDiagnosticROM() {
-        memory.installDiagnosticProgram()
+        withEmulationLock { memory.installDiagnosticProgram() }
     }
 
     func insertDiagnosticDisk() {
         do {
-            try memory.mountDSK(DiskII.diagnosticDSK())
+            try withEmulationLock { try memory.mountDSK(DiskII.diagnosticDSK()) }
             diskDescription = "测试启动盘（.dsk）"
             status = "\(selectedBootROM.title) · \(diskDescription)"
             reset()
@@ -337,15 +557,15 @@ final class AppleIIMachine: ObservableObject {
         }
 
         do {
-            try memory.loadBundledAppleIIPlusROM(diskFirmware: game.diskFirmware)
+            try withEmulationLock { try memory.loadBundledAppleIIPlusROM(diskFirmware: game.diskFirmware) }
             // Legacy 13-sector archival images are often padded to the
             // modern 140 KB .dsk length, so their byte count alone cannot
             // identify the format. The bundled title declares its controller
             // firmware and mounts through the matching sector codec.
             if game.diskFirmware == .thirteenSector {
-                try memory.mountThirteenSectorDisk(Data(contentsOf: url), drive: 0)
+                try withEmulationLock { try memory.mountThirteenSectorDisk(Data(contentsOf: url), drive: 0) }
             } else {
-                try memory.mountDiskImage(at: url, drive: 0)
+                try withEmulationLock { try memory.mountDiskImage(at: url, drive: 0) }
             }
             selectedBootROM = .appleIIPlus
             diskDescription = game.title
@@ -353,6 +573,33 @@ final class AppleIIMachine: ObservableObject {
             reset()
         } catch {
             status = "无法装入内置游戏：\(game.title)"
+        }
+    }
+
+    func loadBundledSoftware(_ software: BundledSoftware) {
+        persistWordPerfectWorkDisk()
+        guard let url = AppResources.bundle.url(
+            forResource: software.resourceName,
+            withExtension: software.resourceExtension
+        ) else {
+            status = "未找到内置软件：\(software.title)"
+            return
+        }
+
+        // Select the machine before mounting so the reset vector and the
+        // controller firmware belong to the software's intended hardware.
+        selectROM(software.bootROM)
+        do {
+            try withEmulationLock { try memory.mountDiskImage(at: url, drive: 0) }
+            diskDescription = software.title
+            if software == .wordPerfect11 {
+                try mountWordPerfectWorkDisk()
+                externalDiskDescription = "WordPerfect 工作盘（/WORK）"
+            }
+            status = "\(software.bootROM.title) · \(software.title)"
+            reset()
+        } catch {
+            status = "无法装入内置软件：\(software.title)"
         }
     }
 
@@ -375,7 +622,7 @@ final class AppleIIMachine: ObservableObject {
         let panel = NSOpenPanel()
         panel.title = "从已下载游戏库装入游戏"
         panel.message = "选择一个 Apple II 5¼ 英寸游戏映像；将自动装入驱动器 1 并以 Apple II+ 启动"
-        panel.allowedContentTypes = ["dsk", "do", "d13", "po", "nib", "2mg", "2img"].compactMap { UTType(filenameExtension: $0) }
+        panel.allowedContentTypes = ["dsk", "do", "d13", "po", "nib", "2mg", "2img", "woz"].compactMap { UTType(filenameExtension: $0) }
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
         if let directory = Self.downloadedGamesDirectory() {
@@ -388,8 +635,10 @@ final class AppleIIMachine: ObservableObject {
 
     private func loadDownloadedGame(at url: URL, title: String) {
         do {
-            try memory.loadBundledAppleIIPlusROM(diskFirmware: .sixteenSector)
-            try memory.mountDiskImage(at: url, drive: 0)
+            try withEmulationLock {
+                try memory.loadBundledAppleIIPlusROM(diskFirmware: .sixteenSector)
+                try memory.mountDiskImage(at: url, drive: 0)
+            }
             selectedBootROM = .appleIIPlus
             diskDescription = title
             status = "Apple II+ · Disk II 16 扇区 · \(title)"
@@ -421,30 +670,70 @@ final class AppleIIMachine: ObservableObject {
         let panel = NSOpenPanel()
         panel.title = "插入 Apple II 磁盘映像到驱动器 \(drive + 1)"
         panel.message = "支持 .dsk/.do、13 扇区 .d13、ProDOS .po、.nib，以及 5¼ 英寸 .2mg/.2img 映像"
-        panel.allowedContentTypes = ["dsk", "do", "d13", "po", "nib", "2mg", "2img"].compactMap { UTType(filenameExtension: $0) }
+        panel.allowedContentTypes = ["dsk", "do", "d13", "po", "nib", "2mg", "2img", "woz"].compactMap { UTType(filenameExtension: $0) }
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
-            try memory.mountDiskImage(at: url, drive: drive)
+            try withEmulationLock { try memory.mountDiskImage(at: url, drive: drive) }
             setDiskDescription(url.lastPathComponent, drive: drive)
-            status = "\(selectedBootROM.title) · 驱动器 \(drive + 1)：\(url.lastPathComponent)"
+            status = "\(currentROMTitle) · 驱动器 \(drive + 1)：\(url.lastPathComponent)"
             reset()
         } catch {
             status = "无法读取 \(url.lastPathComponent)：仅支持 .dsk/.do/.d13/.po/.nib/.2mg/.2img"
         }
     }
 
+    /// Mounts a true SmartPort/ProDOS block image in slot 7.  Its media is
+    /// intentionally kept separate from the two 5.25-inch Disk II drives.
+    func chooseHardDiskImage() {
+        let panel = NSOpenPanel()
+        panel.title = "插入 SmartPort 硬盘映像"
+        panel.message = "支持 ProDOS .po、.hdv/.img，以及硬盘格式的 .2mg/.2img（512 字节块）"
+        panel.allowedContentTypes = ["po", "hdv", "img", "2mg", "2img"].compactMap { UTType(filenameExtension: $0) }
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        status = "正在读取 SmartPort 硬盘 \(url.lastPathComponent)…"
+        Task { [weak self] in
+            let result = await Task.detached { Result { try Data(contentsOf: url) } }.value
+            guard let self else { return }
+            switch result {
+            case let .success(data):
+                do {
+                    let blocks = try self.withEmulationLock {
+                        try self.memory.mountHardDiskImageData(data, fileExtension: url.pathExtension)
+                        return self.memory.hardDiskBlockCount(in: 0)
+                    }
+                    self.hardDiskDescription = "\(url.lastPathComponent)（\(blocks) 块）"
+                    self.status = "\(self.currentROMTitle) · SmartPort：\(url.lastPathComponent)"
+                } catch {
+                    self.status = "无法读取 \(url.lastPathComponent)：仅支持 512 字节块 .po/.hdv/.img/.2mg/.2img"
+                }
+            case .failure:
+                self.status = "无法读取 SmartPort 硬盘 \(url.lastPathComponent)"
+            }
+        }
+    }
+
+    func ejectHardDisk() {
+        withEmulationLock { memory.ejectHardDisk() }
+        hardDiskDescription = "未插入"
+        status = "\(currentROMTitle) · SmartPort 硬盘未插入"
+    }
+
     func ejectDisk(drive: Int = 0) {
-        memory.ejectDisk(drive: drive)
+        if drive == 1 { persistWordPerfectWorkDisk() }
+        withEmulationLock { memory.ejectDisk(drive: drive) }
+        if drive == 1 { wordPerfectWorkDiskURL = nil }
         setDiskDescription("未插入", drive: drive)
-        status = "\(selectedBootROM.title) · 驱动器 \(drive + 1) 未插入磁盘"
+        status = "\(currentROMTitle) · 驱动器 \(drive + 1) 未插入磁盘"
         reset()
         scheduleApplesoftWarmStartIfDiskless()
     }
 
     func saveDiskAsNIB(drive: Int = 0) {
-        guard let data = memory.nibImage(drive: drive) else {
+        guard let data = withEmulationLock({ memory.nibImage(drive: drive) }) else {
             status = "驱动器 \(drive + 1) 的磁盘无法导出为 .nib"
             return
         }
@@ -467,16 +756,61 @@ final class AppleIIMachine: ObservableObject {
         else { externalDiskDescription = description }
     }
 
+    private func mountWordPerfectWorkDisk() throws {
+        let persistentURL = try Self.wordPerfectWorkDiskStorageURL()
+        wordPerfectWorkDiskURL = persistentURL
+        if FileManager.default.fileExists(atPath: persistentURL.path) {
+            try withEmulationLock { try memory.mountDiskImage(at: persistentURL, drive: 1) }
+            return
+        }
+        guard let bundledURL = AppResources.bundle.url(
+            forResource: "WordPerfect 1.1 Work Disk",
+            withExtension: "dsk"
+        ) else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        try withEmulationLock { try memory.mountDiskImage(at: bundledURL, drive: 1) }
+        persistWordPerfectWorkDisk()
+    }
+
+    private func persistWordPerfectWorkDisk() {
+        guard let url = wordPerfectWorkDiskURL,
+              let snapshot = withEmulationLock({ memory.nibImage(drive: 1) }) else { return }
+        workDiskWriteQueue.async {
+            try? snapshot.write(to: url, options: .atomic)
+        }
+    }
+
+    private static func wordPerfectWorkDiskStorageURL() throws -> URL {
+        let isRunningTests = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+            || Bundle.allBundles.contains { $0.bundleURL.pathExtension == "xctest" }
+        let base: URL
+        if isRunningTests {
+            base = FileManager.default.temporaryDirectory
+        } else {
+            base = try FileManager.default.url(
+                for: .applicationSupportDirectory,
+                in: .userDomainMask,
+                appropriateFor: nil,
+                create: true
+            )
+        }
+        let directory = base.appendingPathComponent("AppleIIEmulator", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory.appendingPathComponent("WordPerfect Work Disk.nib")
+    }
+
     private func scheduleApplesoftWarmStartIfDiskless() {
-        guard selectedBootROM == .appleIIPlus, !memory.hasDisk(in: 0) else { return }
+        guard selectedBootROM == .appleIIPlus,
+              !withEmulationLock({ memory.hasDisk(in: 0) }) else { return }
         // The bundled ROM needs about half a million emulated cycles to set
         // its cold-start marker before a warm RESET can enter Applesoft.
         applesoftWarmStartDeadline = ProcessInfo.processInfo.systemUptime + 0.60
     }
 }
 
-final class AppleIIMemory: AppleIIBus {
-    enum Model: Equatable { case appleIIPlus, appleIIc }
+final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
+    enum Model: Equatable { case appleIIPlus, appleIIc, appleIIe }
     enum DiskIIFirmware: Equatable {
         case thirteenSector, sixteenSector
 
@@ -491,12 +825,36 @@ final class AppleIIMemory: AppleIIBus {
     }
     private(set) var bytes = [UInt8](repeating: 0, count: 65_536)
     private var auxiliaryBytes = [UInt8](repeating: 0, count: 65_536)
+    // A 16 KB Language Card turns a 48 KB Apple II+ into the conventional
+    // 64 KB configuration required by ProDOS and tools such as Copy II Plus.
+    // $D000-$DFFF has two selectable 4 KB banks; $E000-$FFFF is the shared
+    // 8 KB bank.  Keep it independent of IIc auxiliary RAM because its
+    // $C080-$C08F access protocol is real, observable Apple II+ hardware.
+    private var languageCardBank1 = [UInt8](repeating: 0, count: 0x1000)
+    private var languageCardBank2 = [UInt8](repeating: 0, count: 0x1000)
+    private var languageCardHigh = [UInt8](repeating: 0, count: 0x2000)
+    // A 128 KB IIe has a second language-card window in auxiliary memory.
+    // ALTZP selects which complete set of $D000-$FFFF RAM banks is visible.
+    private var auxiliaryLanguageCardBank1 = [UInt8](repeating: 0, count: 0x1000)
+    private var auxiliaryLanguageCardBank2 = [UInt8](repeating: 0, count: 0x1000)
+    private var auxiliaryLanguageCardHigh = [UInt8](repeating: 0, count: 0x2000)
+    private var languageCardRAMRead = false
+    private var languageCardBank2Selected = true
+    private var languageCardWriteArmed = false
+    private var languageCardWriteEnabled = false
     private var iicROM = [UInt8]()
     private var iicROMBank = 0
+    private var iieROM = [UInt8]()
     private var plusSlot6ROM = [UInt8]()
     private var plusDiskFirmware: DiskIIFirmware?
     private(set) var model: Model = .appleIIPlus
-    var modelName: String { model == .appleIIc ? "Apple IIc" : "Apple II+" }
+    var modelName: String {
+        switch model {
+        case .appleIIPlus: return "Apple II+"
+        case .appleIIc: return "Apple IIc"
+        case .appleIIe: return "Apple IIe"
+        }
+    }
     private var keyLatch: UInt8 = 0
     private(set) var textMode = true
     private(set) var mixedMode = false
@@ -512,10 +870,20 @@ final class AppleIIMemory: AppleIIBus {
     private(set) var alternateZeroPage = false
     private(set) var alternateCharset = false
     private let diskController = IWMController()
+    // Slot 7 is a separate block device. It must never share the Disk II
+    // controller, whose GCR timing and 140 KB media geometry are unrelated.
+    private let smartPortController = SmartPortController()
+    private var serialPort1 = ACIA6551()
+    private var serialPort2 = ACIA6551()
+    private var mouseController = AppleIIMouseInterface()
     private(set) var speakerFlips = 0
     var speakerDidToggle: (() -> Void)?
     var speakerDidToggleAtCycle: ((Int) -> Void)?
     private var speakerCycle = 0
+    private var cassetteInput = false
+    private var cassetteOutput = false
+    private var annunciators = [false, false, false, false]
+    var cassetteOutputDidToggleAtCycle: ((Int, Bool) -> Void)?
     // NTSC Apple II timing: 65 CPU cycles × 262 scan lines per frame.  The
     // display renderer does not require every scanline, but software polling
     // $C019 absolutely does.
@@ -537,8 +905,24 @@ final class AppleIIMemory: AppleIIBus {
             hgrByte: { [weak self] column, row, auxiliary in self?.hgrByte(column: column, row: row, auxiliary: auxiliary) ?? 0 }
         )
     }
+
+    func makeVideoSnapshot() -> AppleIIVideoSnapshot {
+        AppleIIVideoSnapshot(
+            textMode: textMode,
+            mixedMode: mixedMode,
+            hires: hires,
+            doubleHires: doubleHires,
+            column80: column80,
+            alternateCharset: alternateCharset,
+            text: (0..<24).flatMap { row in (0..<80).map { textByte(column: $0, row: row) } },
+            lores: (0..<24).flatMap { row in (0..<40).map { loresByte(column: $0, row: row) } },
+            hgrMain: (0..<192).flatMap { row in (0..<40).map { hgrByte(column: $0, row: row) } },
+            hgrAuxiliary: (0..<192).flatMap { row in (0..<40).map { hgrByte(column: $0, row: row, auxiliary: true) } }
+        )
+    }
     private static let cyclesPerLine = 65
     private static let linesPerFrame = 262
+    var irqPending: Bool { serialPort1.irqPending || serialPort2.irqPending || mouseController.irqPending }
 
     func read(_ address: UInt16) -> UInt8 {
         let a = Int(address)
@@ -560,15 +944,19 @@ final class AppleIIMemory: AppleIIBus {
         case 0xC00E: alternateCharset = false; return 0
         case 0xC00F: alternateCharset = true; return 0
         case 0xC010: keyLatch &= 0x7F; return keyLatch
-        case 0xC011: return status(false) // IIc's bank-2 language-card status
-        case 0xC012: return status(false) // ROM selected at $D000-$FFFF
+        case 0xC011: return status(model == .appleIIe && languageCardBank2Selected)
+        case 0xC012: return status(model == .appleIIe && languageCardRAMRead)
         case 0xC013: return status(ramReadAuxiliary)
         case 0xC014: return status(ramWriteAuxiliary)
+        // RDCXROM is high when the motherboard Cx ROM is selected.  The
+        // write switches are C006 = slot ROM and C007 = internal ROM.
         case 0xC015: return status(internalCXROM)
         case 0xC016: return status(alternateZeroPage)
         case 0xC017: return status(slot3ROM)
         case 0xC018: return status(store80)
         case 0xC019: return model == .appleIIc ? status(iiCVBLFlag) : status(!verticalBlank)
+        case 0xC020: toggleCassetteOutput(); return 0
+        case 0xC060: return status(cassetteInput)
         case 0xC061: return status(openAppleDown)
         case 0xC062: return status(closedAppleDown)
         case 0xC063: return 0
@@ -586,10 +974,20 @@ final class AppleIIMemory: AppleIIBus {
         case 0xC01D: return status(hires)
         case 0xC01E: return status(alternateCharset)
         case 0xC01F: return status(column80)
-        case 0xC080...0xC08F where model == .appleIIc:
-            return accessIWM(a, write: nil)
+        case 0xC080...0xC08F:
+            if model == .appleIIc { return accessIWM(a, write: nil) }
+            accessLanguageCard(a)
+            return 0
+        case 0xC098...0xC09B where model == .appleIIc:
+            return serialPort1.read(register: a - 0xC098)
+        case 0xC0A8...0xC0AB where model == .appleIIc:
+            return serialPort2.read(register: a - 0xC0A8)
+        case 0xC0C0...0xC0C3 where model == .appleIIc:
+            return mouseController.read(register: a - 0xC0C0)
         case 0xC0E0...0xC0EF:
             return accessIWM(a, write: nil)
+        case 0xC0F0...0xC0FF:
+            return smartPortController.access(a, write: nil, bus: self)
         case 0xC030: toggleSpeaker(); return 0
         case 0xC050: textMode = false; return 0
         case 0xC051: textMode = true; return 0
@@ -599,13 +997,21 @@ final class AppleIIMemory: AppleIIBus {
         case 0xC055: page2 = true; return 0
         case 0xC056: hires = false; return 0
         case 0xC057: hires = true; return 0
+        case 0xC058...0xC05F where model == .appleIIPlus:
+            setAnnunciator(index: (a - 0xC058) / 2, enabled: !a.isMultiple(of: 2))
+            return 0
+        case 0xC05E where model == .appleIIe: doubleHires = true; return 0
+        case 0xC05F where model == .appleIIe: doubleHires = false; return 0
+        case 0xC058...0xC05D where model == .appleIIe:
+            setAnnunciator(index: (a - 0xC058) / 2, enabled: !a.isMultiple(of: 2))
+            return 0
         case 0xC05A where model == .appleIIc: iicVBLEnabled = false; return 0
         case 0xC05B where model == .appleIIc: iicVBLEnabled = iicIOUDisabled; return 0
         // On an Apple II/II+, these are AN3 (annunciator 3) accesses. They
         // become the DHIRES switches only when the IIc IOU is disabled:
         // C05E enables double-hi-res and C05F disables it.
-        case 0xC05E where model == .appleIIc && iicIOUDisabled: doubleHires = true; return 0
-        case 0xC05F where model == .appleIIc && iicIOUDisabled: doubleHires = false; return 0
+        case 0xC05E where model == .appleIIc && iicIOUDisabled || model == .appleIIe: doubleHires = true; return 0
+        case 0xC05F where model == .appleIIc && iicIOUDisabled || model == .appleIIe: doubleHires = false; return 0
         case 0xC05E, 0xC05F: return 0
         case 0xC028 where model == .appleIIc:
             iicROMBank ^= 1
@@ -616,8 +1022,14 @@ final class AppleIIMemory: AppleIIBus {
             if model == .appleIIc, a >= 0xC100, iicROM.count == 0x8000 {
                 return iicROM[iicROMBank * 0x4000 + (a - 0xC000)]
             }
-            if model == .appleIIPlus, (0xC600...0xC6FF).contains(a), plusSlot6ROM.count == 0x100 {
+            if (model == .appleIIPlus || model == .appleIIe), (0xC600...0xC6FF).contains(a), !internalCXROM, plusSlot6ROM.count == 0x100 {
                 return plusSlot6ROM[a - 0xC600]
+            }
+            if model != .appleIIc, a >= 0xD000, languageCardRAMRead {
+                return languageCardByte(at: a)
+            }
+            if model == .appleIIe, a >= 0xC100, iieROM.count == 0x4000 {
+                return iieROM[a - 0xC000]
             }
             return useAuxiliaryRead(for: a) ? auxiliaryBytes[a] : bytes[a]
         }
@@ -643,9 +1055,16 @@ final class AppleIIMemory: AppleIIBus {
         case 0xC00E: alternateCharset = false
         case 0xC00F: alternateCharset = true
         case 0xC010...0xC01F: keyLatch &= 0x7F
-        case 0xC080...0xC08F where model == .appleIIc: _ = accessIWM(a, write: value)
+        case 0xC080...0xC08F:
+            if model == .appleIIc { _ = accessIWM(a, write: value) }
+            else { accessLanguageCard(a) }
+        case 0xC098...0xC09B where model == .appleIIc: serialPort1.write(value, register: a - 0xC098)
+        case 0xC0A8...0xC0AB where model == .appleIIc: serialPort2.write(value, register: a - 0xC0A8)
+        case 0xC0C0...0xC0C3 where model == .appleIIc: mouseController.write(value, register: a - 0xC0C0)
         case 0xC0E0...0xC0EF: _ = accessIWM(a, write: value)
+        case 0xC0F0...0xC0FF: _ = smartPortController.access(a, write: value, bus: self)
         case 0xC030: toggleSpeaker()
+        case 0xC020: toggleCassetteOutput()
         case 0xC050: textMode = false
         case 0xC051: textMode = true
         case 0xC052: mixedMode = false
@@ -654,10 +1073,16 @@ final class AppleIIMemory: AppleIIBus {
         case 0xC055: page2 = true
         case 0xC056: hires = false
         case 0xC057: hires = true
+        case 0xC058...0xC05F where model == .appleIIPlus:
+            setAnnunciator(index: (a - 0xC058) / 2, enabled: !a.isMultiple(of: 2))
+        case 0xC05E where model == .appleIIe: doubleHires = true
+        case 0xC05F where model == .appleIIe: doubleHires = false
+        case 0xC058...0xC05D where model == .appleIIe:
+            setAnnunciator(index: (a - 0xC058) / 2, enabled: !a.isMultiple(of: 2))
         case 0xC05A where model == .appleIIc: iicVBLEnabled = false
         case 0xC05B where model == .appleIIc: iicVBLEnabled = iicIOUDisabled
-        case 0xC05E where model == .appleIIc && iicIOUDisabled: doubleHires = true
-        case 0xC05F where model == .appleIIc && iicIOUDisabled: doubleHires = false
+        case 0xC05E where model == .appleIIc && iicIOUDisabled || model == .appleIIe: doubleHires = true
+        case 0xC05F where model == .appleIIc && iicIOUDisabled || model == .appleIIe: doubleHires = false
         case 0xC05E, 0xC05F: break
         case 0xC070: iiCVBLFlag = false; paddleElapsedCycles = 0
         case 0xC07E where model == .appleIIc: iiCVBLFlag = false
@@ -665,8 +1090,12 @@ final class AppleIIMemory: AppleIIBus {
         case 0xC028 where model == .appleIIc: iicROMBank ^= 1
         default:
             if model == .appleIIc, a >= 0xC100 { return }
-            if model == .appleIIPlus, (0xC600...0xC6FF).contains(a) { return }
-            if model == .appleIIPlus, a >= 0xD000 { return }
+            if (model == .appleIIPlus || model == .appleIIe), (0xC600...0xC6FF).contains(a), !internalCXROM { return }
+            if model != .appleIIc, a >= 0xD000 {
+                if languageCardWriteEnabled { setLanguageCardByte(value, at: a) }
+                return
+            }
+            if model == .appleIIe, a >= 0xC100 { return }
             if useAuxiliaryWrite(for: a) { auxiliaryBytes[a] = value } else { bytes[a] = value }
         }
     }
@@ -678,11 +1107,42 @@ final class AppleIIMemory: AppleIIBus {
             model = .appleIIc
             iicROM = Array(data)
             iicROMBank = 0
+            iieROM = []
         } else {
             model = .appleIIPlus
             iicROM = []
+            iieROM = []
             let start = 0x10000 - data.count
             bytes.replaceSubrange(start..<0x10000, with: data)
+        }
+    }
+
+    /// Raw ROM container validation. Apple II/II+ maps 12 KB at $D000, while
+    /// an IIc image is either one 16 KB ROM bank or both 16 KB banks.
+    func loadCustomROM(_ data: Data) throws {
+        switch data.count {
+        case 0x3000:
+            model = .appleIIPlus
+            iicROM = []
+            iicROMBank = 0
+            iieROM = []
+            bytes = [UInt8](repeating: 0, count: 65_536)
+            auxiliaryBytes = [UInt8](repeating: 0, count: 65_536)
+            clearLanguageCard()
+            bytes.replaceSubrange(0xD000..<0x10000, with: data)
+        case 0x4000:
+            model = .appleIIc
+            let bank = Array(data)
+            iicROM = bank + bank
+            iicROMBank = 0
+            iieROM = []
+        case 0x8000:
+            model = .appleIIc
+            iicROM = Array(data)
+            iicROMBank = 0
+            iieROM = []
+        default:
+            throw CocoaError(.fileReadCorruptFile)
         }
     }
 
@@ -696,6 +1156,7 @@ final class AppleIIMemory: AppleIIBus {
         let bank = Array(data)
         iicROM = data.count == 0x4000 ? bank + bank : bank
         iicROMBank = 0
+        iieROM = []
     }
 
     func loadBundledAppleIIPlusROM(diskFirmware: DiskIIFirmware) throws {
@@ -709,11 +1170,53 @@ final class AppleIIMemory: AppleIIBus {
         model = .appleIIPlus
         iicROM = []
         iicROMBank = 0
+        iieROM = []
         plusSlot6ROM = Array(diskROM)
         plusDiskFirmware = diskFirmware
         bytes = [UInt8](repeating: 0, count: 65_536)
         auxiliaryBytes = [UInt8](repeating: 0, count: 65_536)
+        clearLanguageCard()
         bytes.replaceSubrange(0xD000..<0x10000, with: systemROM)
+    }
+
+    /// The IIe keeps a 16 KB motherboard ROM at $C000-$FFFF, with I/O
+    /// overlays in the $C0xx page and the Disk II controller ROM in slot 6.
+    /// Paired 2764 dumps are stored in address order: CD ($C000-$DFFF), then
+    /// EF ($E000-$FFFF). The CF 27128 dump contains that same 16 KB image.
+    func loadBundledAppleIIeROM(_ choice: AppleIIMachine.BootROM) throws {
+        let names: [String]
+        switch choice {
+        case .appleIIeEnhanced:
+            names = ["AppleIIe-CD-Enhanced-342-0304-A", "AppleIIe-EF-Enhanced-342-0303-A"]
+        case .appleIIeUnenhanced:
+            names = ["AppleIIe-CD-Unenhanced-342-0135-B", "AppleIIe-EF-Unenhanced-342-0134-A"]
+        case .appleIIeCF:
+            names = ["AppleIIe-CF-342-0349-B"]
+        default:
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        var image = Data()
+        for name in names {
+            guard let url = AppResources.bundle.url(forResource: name, withExtension: "bin") else {
+                throw CocoaError(.fileNoSuchFile)
+            }
+            image.append(try Data(contentsOf: url))
+        }
+        guard image.count == 0x4000 else { throw CocoaError(.fileReadCorruptFile) }
+        guard let diskURL = AppResources.bundle.url(forResource: DiskIIFirmware.sixteenSector.resourceName, withExtension: "rom") else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        let diskROM = try Data(contentsOf: diskURL)
+        guard diskROM.count == 0x100 else { throw CocoaError(.fileReadCorruptFile) }
+        model = .appleIIe
+        iicROM = []
+        iicROMBank = 0
+        iieROM = Array(image)
+        plusSlot6ROM = Array(diskROM)
+        plusDiskFirmware = .sixteenSector
+        bytes = [UInt8](repeating: 0, count: 65_536)
+        auxiliaryBytes = [UInt8](repeating: 0, count: 65_536)
+        clearLanguageCard()
     }
 
     func resetROMBank() { iicROMBank = 0 }
@@ -734,7 +1237,18 @@ final class AppleIIMemory: AppleIIBus {
         doubleHires = false
         alternateZeroPage = false
         alternateCharset = false
+        languageCardRAMRead = false
+        languageCardBank2Selected = true
+        languageCardWriteArmed = false
+        languageCardWriteEnabled = false
         diskController.reset()
+        smartPortController.reset()
+        serialPort1.reset()
+        serialPort2.reset()
+        mouseController.reset()
+        cassetteInput = false
+        cassetteOutput = false
+        annunciators = [false, false, false, false]
         videoClock = 0
         iiCVBLFlag = false
         iicIOUDisabled = false
@@ -743,15 +1257,86 @@ final class AppleIIMemory: AppleIIBus {
     }
 
     private func useAuxiliaryRead(for address: Int) -> Bool {
-        guard model == .appleIIc, address < 0xC000 else { return false }
-        if alternateZeroPage && address < 0x0200 { return true }
+        guard (model == .appleIIc || model == .appleIIe), address < 0xC000 else { return false }
+        // RAMRD/RAMWRT cover $0200-$BFFF only.  The zero page and stack
+        // remain in main memory unless the distinct ALTZP switch is set.
+        if address < 0x0200 { return alternateZeroPage }
         if store80 && isVideoPage(address) { return page2 }
         return ramReadAuxiliary
     }
 
+    /// Language Card soft switches.  Each group of eight addresses is mirrored
+    /// at $C088-$C08F.  Low bits select the ROM/RAM read path and whether a
+    /// write-enable access is being made:
+    ///
+    ///     $C080/$C083 = bank 2 RAM read; $C081/$C082 = ROM read
+    ///     $C084/$C087 = bank 1 RAM read; $C085/$C086 = ROM read
+    ///
+    /// The odd addresses are the write-enable variants. Two successive
+    /// accesses to one are required before writes reach card RAM. This
+    /// protects the ROM area from a single accidental I/O touch, just as the
+    /// original 16 KB card did.
+    private func accessLanguageCard(_ address: Int) {
+        // $C084-$C087 mirror the bank-2 controls at $C080-$C083, while
+        // $C08C-$C08F mirror bank 1 at $C088-$C08B.
+        languageCardBank2Selected = address & 0x08 == 0
+        let selector = address & 0x03
+        languageCardRAMRead = selector == 0 || selector == 3
+        if address.isMultiple(of: 2) {
+            languageCardWriteArmed = false
+            languageCardWriteEnabled = false
+        } else if languageCardWriteArmed {
+            languageCardWriteEnabled = true
+        } else {
+            languageCardWriteArmed = true
+            languageCardWriteEnabled = false
+        }
+    }
+
+    private func languageCardByte(at address: Int) -> UInt8 {
+        let bank1 = alternateZeroPage ? auxiliaryLanguageCardBank1 : languageCardBank1
+        let bank2 = alternateZeroPage ? auxiliaryLanguageCardBank2 : languageCardBank2
+        let high = alternateZeroPage ? auxiliaryLanguageCardHigh : languageCardHigh
+        if address < 0xE000 {
+            let offset = address - 0xD000
+            return languageCardBank2Selected ? bank2[offset] : bank1[offset]
+        }
+        return high[address - 0xE000]
+    }
+
+    private func setLanguageCardByte(_ value: UInt8, at address: Int) {
+        if address < 0xE000 {
+            let offset = address - 0xD000
+            if alternateZeroPage {
+                if languageCardBank2Selected { auxiliaryLanguageCardBank2[offset] = value }
+                else { auxiliaryLanguageCardBank1[offset] = value }
+            } else {
+                if languageCardBank2Selected { languageCardBank2[offset] = value }
+                else { languageCardBank1[offset] = value }
+            }
+        } else {
+            let offset = address - 0xE000
+            if alternateZeroPage { auxiliaryLanguageCardHigh[offset] = value }
+            else { languageCardHigh[offset] = value }
+        }
+    }
+
+    private func clearLanguageCard() {
+        languageCardBank1 = [UInt8](repeating: 0, count: 0x1000)
+        languageCardBank2 = [UInt8](repeating: 0, count: 0x1000)
+        languageCardHigh = [UInt8](repeating: 0, count: 0x2000)
+        auxiliaryLanguageCardBank1 = [UInt8](repeating: 0, count: 0x1000)
+        auxiliaryLanguageCardBank2 = [UInt8](repeating: 0, count: 0x1000)
+        auxiliaryLanguageCardHigh = [UInt8](repeating: 0, count: 0x2000)
+        languageCardRAMRead = false
+        languageCardBank2Selected = true
+        languageCardWriteArmed = false
+        languageCardWriteEnabled = false
+    }
+
     private func useAuxiliaryWrite(for address: Int) -> Bool {
-        guard model == .appleIIc, address < 0xC000 else { return false }
-        if alternateZeroPage && address < 0x0200 { return true }
+        guard (model == .appleIIc || model == .appleIIe), address < 0xC000 else { return false }
+        if address < 0x0200 { return alternateZeroPage }
         if store80 && isVideoPage(address) { return page2 }
         return ramWriteAuxiliary
     }
@@ -790,8 +1375,14 @@ final class AppleIIMemory: AppleIIBus {
         // soft switches.  Keeping it on the same cycle source as video and
         // paddles preserves the timing expected by boot loaders.
         diskController.advance(by: cycles)
+        smartPortController.advance(by: cycles)
+        serialPort1.advance(by: cycles)
+        serialPort2.advance(by: cycles)
         if model == .appleIIc, iicVBLEnabled, oldLine < 192, (newLine >= 192 || newLine < oldLine) {
             iiCVBLFlag = true
+        }
+        if model == .appleIIc, oldLine < 192, (newLine >= 192 || newLine < oldLine) {
+            mouseController.verticalBlank()
         }
     }
 
@@ -806,6 +1397,21 @@ final class AppleIIMemory: AppleIIBus {
         for index in paddles.indices where values.indices.contains(index) { paddles[index] = values[index] }
     }
 
+    func moveMouse(deltaX: Int, deltaY: Int) {
+        guard model == .appleIIc else { return }
+        mouseController.move(deltaX: deltaX, deltaY: deltaY)
+    }
+
+    func setMouseButton(_ index: Int, pressed: Bool) {
+        guard model == .appleIIc else { return }
+        mouseController.setButton(index, pressed: pressed)
+    }
+
+    func setCassetteInput(_ high: Bool) { cassetteInput = high }
+    func annunciatorEnabled(_ index: Int) -> Bool {
+        annunciators.indices.contains(index) && annunciators[index]
+    }
+
     func mountDSK(_ data: Data, drive: Int = 0) throws { try diskController.mountDSK(data, drive: drive) }
     func mountThirteenSectorDisk(_ data: Data, drive: Int = 0) throws { try diskController.mountThirteenSectorImage(data, drive: drive) }
     func mountDiskImage(at url: URL, drive: Int = 0) throws { try diskController.mountImage(Data(contentsOf: url), fileExtension: url.pathExtension, drive: drive) }
@@ -818,6 +1424,30 @@ final class AppleIIMemory: AppleIIBus {
     var diskNibbleWrites: Int { diskController.nibbleWrites }
     var diskTrack: Int { diskController.currentTrack() }
 
+    func mountHardDiskImage(at url: URL, drive: Int = 0) throws {
+        try smartPortController.mountImage(Data(contentsOf: url), fileExtension: url.pathExtension, drive: drive)
+    }
+    func mountHardDiskImageData(_ data: Data, fileExtension: String, drive: Int = 0) throws {
+        try smartPortController.mountImage(data, fileExtension: fileExtension, drive: drive)
+    }
+    func ejectHardDisk(drive: Int = 0) { smartPortController.eject(drive: drive) }
+    func hasHardDisk(in drive: Int) -> Bool { smartPortController.hasDisk(in: drive) }
+    func hardDiskBlockCount(in drive: Int) -> Int { smartPortController.blockCount(in: drive) }
+    func hardDiskImage(drive: Int = 0) -> Data? { smartPortController.imageData(drive: drive) }
+
+    /// Host adapters can feed and drain this boundary without touching the
+    /// 6502 bus. It also keeps serial tests focused on the real ACIA registers.
+    func receiveSerialByte(_ byte: UInt8, port: Int) {
+        if port == 1 { serialPort1.receive(byte) }
+        else if port == 2 { serialPort2.receive(byte) }
+    }
+
+    func drainTransmittedSerialBytes(port: Int) -> [UInt8] {
+        if port == 1 { return serialPort1.drainTransmittedBytes() }
+        if port == 2 { return serialPort2.drainTransmittedBytes() }
+        return []
+    }
+
     /// The IIc's integrated IWM occupies slot-zero I/O ($C080-$C08F). This
     /// models its control latch and data path; the sector stream is attached
     /// to this same state machine by the disk-image layer.
@@ -825,12 +1455,24 @@ final class AppleIIMemory: AppleIIBus {
         diskController.access(address, write: value)
     }
 
+    private func toggleCassetteOutput() {
+        cassetteOutput.toggle()
+        cassetteOutputDidToggleAtCycle?(speakerCycle, cassetteOutput)
+    }
+
+    private func setAnnunciator(index: Int, enabled: Bool) {
+        guard annunciators.indices.contains(index) else { return }
+        annunciators[index] = enabled
+    }
+
     func installDiagnosticProgram() {
         model = .appleIIPlus
         iicROM = []
         iicROMBank = 0
+        iieROM = []
         bytes = [UInt8](repeating: 0, count: 65_536)
         auxiliaryBytes = [UInt8](repeating: 0, count: 65_536)
+        clearLanguageCard()
         // A tiny non-Apple ROM used solely to prove that CPU, RAM and video
         // wiring work before the user supplies their own legally obtained ROM.
         let program: [UInt8] = [

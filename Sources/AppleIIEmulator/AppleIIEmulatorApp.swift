@@ -13,9 +13,11 @@ struct AppleIIEmulatorApp: App {
         .windowResizability(.contentMinSize)
         .commands {
             CommandMenu("ROM") {
-                ForEach(AppleIIMachine.BootROM.allCases) { rom in
+                ForEach(AppleIIMachine.BootROM.menuChoices) { rom in
                     Button(rom.title) { machine.selectROM(rom) }
                 }
+                Divider()
+                Button("打开外部 ROM…") { machine.chooseExternalROM() }
             }
             CommandMenu("磁盘") {
                 Button("插入驱动器 1 映像…") { machine.chooseDiskImage(drive: 0) }
@@ -50,6 +52,11 @@ struct AppleIIEmulatorApp: App {
                 Divider()
                 ForEach(AppleIIMachine.BundledGame.allCases) { game in
                     Button(game.title) { machine.loadBundledGame(game) }
+                }
+            }
+            CommandMenu("软件") {
+                ForEach(AppleIIMachine.BundledSoftware.allCases) { software in
+                    Button(software.title) { machine.loadBundledSoftware(software) }
                 }
             }
             CommandGroup(after: .newItem) {
