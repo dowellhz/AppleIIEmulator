@@ -33,7 +33,8 @@ enum DiskImagePayload {
     case nib(Data, writeProtected: Bool)
     case woz(
         tracks: [DiskBitTrack], quarterTrackMap: [Int], thirteenSector: Bool,
-        emulatesWeakBits: Bool, writeProtected: Bool
+        fluxTracks: [DiskFluxTrack?], fluxQuarterTrackMap: [Int],
+        emulatesWeakBits: Bool, writeProtected: Bool, container: WOZContainerMetadata
     )
 }
 
@@ -49,23 +50,28 @@ enum DiskImageCodec {
         }
     }
 
-    /// Writes a self-contained WOZ 2 bitstream container.  Export always
-    /// emits the canonical INFO/TMAP/TRKS core and recalculates its CRC; it
-    /// deliberately does not copy opaque source chunks, whose semantics can
-    /// depend on a capture device rather than on the emulated disk surface.
+    /// Writes a self-contained WOZ 2 bitstream container.
     static func encodeWOZ2(
         tracks: [DiskBitTrack],
         quarterTrackMap: [Int],
         thirteenSector: Bool,
-        writeProtected: Bool
+        writeProtected: Bool,
+        container: WOZContainerMetadata? = nil,
+        fluxTracks: [DiskFluxTrack?] = [],
+        fluxQuarterTrackMap: [Int] = [],
+        preserveWriteHints: Bool = true
     ) throws -> Data {
         guard quarterTrackMap.count == 160,
               tracks.count <= 160,
-              quarterTrackMap.allSatisfy({ $0 == -1 || tracks.indices.contains($0) }) else {
+              quarterTrackMap.allSatisfy({ $0 == -1 || tracks.indices.contains($0) }),
+              (fluxQuarterTrackMap.isEmpty || fluxQuarterTrackMap.count == 160),
+              fluxQuarterTrackMap.allSatisfy({ $0 == -1 || tracks.indices.contains($0) }) else {
             throw CocoaError(.fileWriteInapplicableStringEncoding)
         }
 
-        var info = [UInt8](repeating: 0, count: 60)
+        var info = container?.info ?? [UInt8](repeating: 0, count: 60)
+        if info.count < 60 { info += repeatElement(0, count: 60 - info.count) }
+        if info.count > 60 { info = Array(info.prefix(60)) }
         info[0] = 3 // WOZ INFO v3 carries the 5.25-inch timing fields below.
         info[1] = 1 // 5.25-inch disk
         info[2] = writeProtected ? 1 : 0
@@ -73,17 +79,32 @@ enum DiskImageCodec {
         info[38] = thirteenSector ? 2 : 1
         info[39] = 32 // 4 µs nominal bit cell in 125 ns units
 
+        let hasFlux = !fluxQuarterTrackMap.isEmpty && fluxQuarterTrackMap.contains(where: { $0 >= 0 })
         var trackChunk = [UInt8](repeating: 0, count: 160 * 8)
         var bitData = [UInt8]()
         var nextBlock = 3
         var largestTrackBlocks = 0
+        var largestFluxTrackBlocks = 0
         for (index, track) in tracks.enumerated() {
-            guard track.bitCount >= 0, track.bitCount <= track.bytes.count * 8 else {
+            // A TRKS entry becomes flux data only when FLUX maps at least one
+            // physical quarter track to it.  Keeping this decision in the
+            // map avoids accidentally serialising cached flux data as BITS.
+            let isFluxTrack = !fluxQuarterTrackMap.isEmpty && fluxQuarterTrackMap.contains(index)
+            let fluxTrack = isFluxTrack && fluxTracks.indices.contains(index) ? fluxTracks[index] : nil
+            let storedByteCount: Int
+            if let fluxTrack {
+                storedByteCount = fluxTrack.bytes.count
+            } else {
+                guard track.bitCount >= 0, track.bitCount <= track.bytes.count * 8 else {
+                    throw CocoaError(.fileWriteUnknown)
+                }
+                storedByteCount = (track.bitCount + 7) / 8
+            }
+            guard storedByteCount >= 0 else {
                 throw CocoaError(.fileWriteUnknown)
             }
-            guard track.bitCount > 0 else { continue }
-            let byteCount = (track.bitCount + 7) / 8
-            let blockCount = (byteCount + 511) / 512
+            guard storedByteCount > 0 else { continue }
+            let blockCount = (storedByteCount + 511) / 512
             guard nextBlock + blockCount <= Int(UInt16.max) else {
                 throw CocoaError(.fileWriteOutOfSpace)
             }
@@ -92,16 +113,35 @@ enum DiskImageCodec {
             trackChunk[entry + 1] = UInt8((nextBlock >> 8) & 0xFF)
             trackChunk[entry + 2] = UInt8(blockCount & 0xFF)
             trackChunk[entry + 3] = UInt8((blockCount >> 8) & 0xFF)
+            let countField = fluxTrack == nil ? track.bitCount : storedByteCount
             for byte in 0..<4 {
-                trackChunk[entry + 4 + byte] = UInt8((track.bitCount >> (byte * 8)) & 0xFF)
+                trackChunk[entry + 4 + byte] = UInt8((countField >> (byte * 8)) & 0xFF)
             }
-            bitData += track.bytes.prefix(byteCount)
-            bitData += repeatElement(0, count: blockCount * 512 - byteCount)
+            bitData += fluxTrack?.bytes.prefix(storedByteCount) ?? track.bytes.prefix(storedByteCount)
+            bitData += repeatElement(0, count: blockCount * 512 - storedByteCount)
             nextBlock += blockCount
-            largestTrackBlocks = max(largestTrackBlocks, blockCount)
+            if fluxTrack != nil {
+                largestFluxTrackBlocks = max(largestFluxTrackBlocks, blockCount)
+            } else {
+                largestTrackBlocks = max(largestTrackBlocks, blockCount)
+            }
         }
         info[44] = UInt8(min(largestTrackBlocks, 255))
         info[45] = UInt8(min(largestTrackBlocks >> 8, 255))
+        let chunksToPreserve = (container?.preservedChunks ?? []).filter {
+            preserveWriteHints || $0.identifier != "WRIT"
+        }
+        let coreByteCount = 1_536 + bitData.count
+        let preservedByteCount = chunksToPreserve.reduce(0) { $0 + 8 + $1.payload.count }
+        if hasFlux {
+            let fluxBlock = (coreByteCount + preservedByteCount + 511) / 512
+            info[46] = UInt8(fluxBlock & 0xFF)
+            info[47] = UInt8((fluxBlock >> 8) & 0xFF)
+            info[48] = UInt8(min(largestFluxTrackBlocks, 255))
+            info[49] = UInt8(min(largestFluxTrackBlocks >> 8, 255))
+        } else {
+            info[46] = 0; info[47] = 0; info[48] = 0; info[49] = 0
+        }
 
         func chunk(_ identifier: String, _ payload: [UInt8]) -> [UInt8] {
             let length = payload.count
@@ -112,6 +152,13 @@ enum DiskImageCodec {
         bytes += chunk("INFO", info)
         bytes += chunk("TMAP", map)
         bytes += chunk("TRKS", trackChunk + bitData)
+        for preserved in chunksToPreserve {
+            bytes += chunk(preserved.identifier, preserved.payload)
+        }
+        if hasFlux {
+            bytes += repeatElement(0, count: (512 - bytes.count % 512) % 512)
+            bytes += chunk("FLUX", fluxQuarterTrackMap.map { $0 < 0 ? UInt8(0xFF) : UInt8($0) })
+        }
         let checksum = crc32(bytes[12...])
         for byte in 0..<4 { bytes[8 + byte] = UInt8((checksum >> (byte * 8)) & 0xFF) }
         return Data(bytes)
@@ -185,8 +232,10 @@ enum DiskImageCodec {
         }
 
         var chunks = [String: Range<Int>]()
+        var preservedChunks = [WOZPreservedChunk]()
         var offset = 12
         while offset + 8 <= bytes.count {
+            if bytes[offset..<(offset + 4)].allSatisfy({ $0 == 0 }) { break }
             guard let identifier = String(bytes: bytes[offset..<(offset + 4)], encoding: .ascii) else {
                 throw CocoaError(.fileReadCorruptFile)
             }
@@ -194,6 +243,12 @@ enum DiskImageCodec {
             let dataStart = offset + 8
             guard length <= bytes.count - dataStart else { throw CocoaError(.fileReadCorruptFile) }
             chunks[identifier] = dataStart..<(dataStart + length)
+            if !["INFO", "TMAP", "TRKS", "FLUX"].contains(identifier) {
+                preservedChunks.append(WOZPreservedChunk(
+                    identifier: identifier,
+                    payload: Array(bytes[dataStart..<(dataStart + length)])
+                ))
+            }
             offset = dataStart + length
         }
 
@@ -211,6 +266,58 @@ enum DiskImageCodec {
             let value = bytes[mapRange.lowerBound + index]
             return value == 0xFF ? -1 : Int(value)
         }
+        let infoVersion = bytes[infoRange.lowerBound]
+        let fluxBlock = infoRange.count >= 48 ? little16(infoRange.lowerBound + 46) : 0
+        let largestFluxTrack = infoRange.count >= 50 ? little16(infoRange.lowerBound + 48) : 0
+        let usesFlux = infoVersion >= 3 && fluxBlock > 0 && largestFluxTrack > 0
+        let fluxRange: Range<Int>?
+        if usesFlux {
+            let fluxChunkOffset = fluxBlock * 512
+            guard fluxChunkOffset + 8 <= bytes.count,
+                  Array(bytes[fluxChunkOffset..<(fluxChunkOffset + 4)]) == Array("FLUX".utf8) else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            let length = little32(fluxChunkOffset + 4)
+            guard length <= bytes.count - fluxChunkOffset - 8 else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            fluxRange = (fluxChunkOffset + 8)..<(fluxChunkOffset + 8 + length)
+        } else {
+            fluxRange = nil
+        }
+        if usesFlux {
+            guard let fluxRange, fluxRange.count >= 160,
+                  fluxRange.lowerBound - 8 == fluxBlock * 512 else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+        }
+        // FLUX is block-aligned, so a valid WOZ can contain zero fill before
+        // it. The ordinary chunk walk stops at that fill; resume after FLUX
+        // to retain extensions that follow it in a source container.
+        if let fluxRange, offset < fluxRange.upperBound {
+            offset = fluxRange.upperBound
+            while offset + 8 <= bytes.count {
+                if bytes[offset..<(offset + 4)].allSatisfy({ $0 == 0 }) { break }
+                guard let identifier = String(bytes: bytes[offset..<(offset + 4)], encoding: .ascii) else {
+                    throw CocoaError(.fileReadCorruptFile)
+                }
+                let length = little32(offset + 4)
+                let dataStart = offset + 8
+                guard length <= bytes.count - dataStart else { throw CocoaError(.fileReadCorruptFile) }
+                chunks[identifier] = dataStart..<(dataStart + length)
+                if !["INFO", "TMAP", "TRKS", "FLUX"].contains(identifier) {
+                    preservedChunks.append(WOZPreservedChunk(
+                        identifier: identifier,
+                        payload: Array(bytes[dataStart..<(dataStart + length)])
+                    ))
+                }
+                offset = dataStart + length
+            }
+        }
+        let fluxQuarterTrackMap: [Int] = usesFlux ? (0..<160).map { index in
+            let value = bytes[fluxRange!.lowerBound + index]
+            return value == 0xFF ? -1 : Int(value)
+        } : []
         let trackCount: Int
         if isWOZ2 {
             trackCount = 160
@@ -218,12 +325,16 @@ enum DiskImageCodec {
             guard tracksRange.count.isMultiple(of: 6_656) else { throw CocoaError(.fileReadCorruptFile) }
             trackCount = tracksRange.count / 6_656
         }
-        guard trackCount > 0, quarterTrackMap.allSatisfy({ $0 < trackCount }) else {
+        guard trackCount > 0,
+              quarterTrackMap.allSatisfy({ $0 < trackCount }),
+              fluxQuarterTrackMap.allSatisfy({ $0 < trackCount }) else {
             throw CocoaError(.fileReadCorruptFile)
         }
 
         var bitTracks = [DiskBitTrack]()
+        var fluxTracks = [DiskFluxTrack?]()
         bitTracks.reserveCapacity(trackCount)
+        fluxTracks.reserveCapacity(trackCount)
         if isWOZ2 {
             for index in 0..<trackCount {
                 let entry = tracksRange.lowerBound + index * 8
@@ -234,7 +345,8 @@ enum DiskImageCodec {
                     bitTracks.append(DiskBitTrack(bytes: [], bitCount: 0, nibbleBitOffsets: []))
                     continue
                 }
-                let byteCount = (bitCount + 7) / 8
+                let isFluxTrack = fluxQuarterTrackMap.contains(index)
+                let byteCount = isFluxTrack ? bitCount : (bitCount + 7) / 8
                 let dataOffset = startBlock * 512
                 guard startBlock >= 3, blockCount > 0,
                       byteCount <= blockCount * 512,
@@ -243,9 +355,13 @@ enum DiskImageCodec {
                 }
                 bitTracks.append(DiskBitTrack(
                     bytes: Array(bytes[dataOffset..<(dataOffset + byteCount)]),
-                    bitCount: bitCount,
-                    nibbleBitOffsets: Array(repeating: -1, count: bitCount)
+                    bitCount: isFluxTrack ? byteCount * 8 : bitCount,
+                    nibbleBitOffsets: Array(repeating: -1, count: isFluxTrack ? byteCount * 8 : bitCount)
                 ))
+                fluxTracks.append(isFluxTrack ? DiskFluxTrack(
+                    bytes: Array(bytes[dataOffset..<(dataOffset + byteCount)]),
+                    optimalBitTiming: infoRange.count > 39 ? Int(bytes[infoRange.lowerBound + 39]) : 32
+                ) : nil)
             }
         } else {
             for index in 0..<trackCount {
@@ -260,9 +376,17 @@ enum DiskImageCodec {
                     bitCount: bitCount,
                     nibbleBitOffsets: Array(repeating: -1, count: bitCount)
                 ))
+                fluxTracks.append(nil)
             }
         }
-        guard quarterTrackMap.contains(where: { $0 >= 0 && bitTracks[$0].bitCount > 0 }) else {
+        guard fluxQuarterTrackMap.enumerated().allSatisfy({ _, track in
+            track < 0 || (bitTracks.indices.contains(track) && fluxTracks[track] != nil)
+        }),
+        (0..<160).contains(where: { index in
+            let bitTrack = quarterTrackMap[index]
+            let fluxTrack = fluxQuarterTrackMap.isEmpty ? -1 : fluxQuarterTrackMap[index]
+            return (bitTrack >= 0 && bitTracks[bitTrack].bitCount > 0) || fluxTrack >= 0
+        }) else {
             throw CocoaError(.fileReadCorruptFile)
         }
         let thirteenSector = isWOZ2 && infoRange.count > 38 && bytes[infoRange.lowerBound + 38] == 2
@@ -271,8 +395,13 @@ enum DiskImageCodec {
         let emulatesWeakBits = bytes[infoRange.lowerBound + 4] != 0
         return .woz(
             tracks: bitTracks, quarterTrackMap: quarterTrackMap,
-            thirteenSector: thirteenSector, emulatesWeakBits: emulatesWeakBits,
-            writeProtected: bytes[infoRange.lowerBound + 2] != 0
+            thirteenSector: thirteenSector, fluxTracks: fluxTracks,
+            fluxQuarterTrackMap: fluxQuarterTrackMap,
+            emulatesWeakBits: emulatesWeakBits,
+            writeProtected: bytes[infoRange.lowerBound + 2] != 0,
+            container: WOZContainerMetadata(
+                info: Array(bytes[infoRange]), preservedChunks: preservedChunks
+            )
         )
     }
 }

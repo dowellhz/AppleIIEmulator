@@ -86,6 +86,7 @@ final class IWMController {
     private(set) var nibbleReads = 0
     private(set) var nibbleWrites = 0
     private(set) var weakBitsGenerated = 0
+    private(set) var fluxBitReads = 0
     private var readBitsByDrive = [0, 0]
 
     var hasDisk: Bool { drives.contains { $0.hasDisk } }
@@ -98,7 +99,7 @@ final class IWMController {
             drives[index].bitPosition = 0
         }
         q6 = false; q7 = false
-        motorOn = false; motorOffDelay = 0; selectedDrive = 0; dataLatch = 0; busData = 0; sequencerState = 0; writeLevel = 0; nibbleReads = 0; nibbleWrites = 0; weakBitsGenerated = 0; readBitsByDrive = [0, 0]
+        motorOn = false; motorOffDelay = 0; selectedDrive = 0; dataLatch = 0; busData = 0; sequencerState = 0; writeLevel = 0; nibbleReads = 0; nibbleWrites = 0; weakBitsGenerated = 0; fluxBitReads = 0; readBitsByDrive = [0, 0]
     }
 
     func eject(drive: Int = 0) {
@@ -184,12 +185,17 @@ final class IWMController {
                 Self.bitTrack(nibbles: stream, sync: stream.map { $0 == 0xFF }, trailingZeros: 2)
             }
             drives[drive].install(tracks: tracks, bitTracks: bitTracks, thirteenSector: false, writeProtected: writeProtected)
-        case let .woz(bitTracks, quarterTrackMap, thirteenSector, emulatesWeakBits, writeProtected):
+        case let .woz(
+            bitTracks, quarterTrackMap, thirteenSector, fluxTracks,
+            fluxQuarterTrackMap, emulatesWeakBits, writeProtected, container
+        ):
             guard drives.indices.contains(drive), quarterTrackMap.count == 160 else {
                 throw CocoaError(.fileReadCorruptFile)
             }
             drives[drive].install(
                 tracks: [], bitTracks: bitTracks, quarterTrackMap: quarterTrackMap,
+                fluxTracks: fluxTracks, fluxQuarterTrackMap: fluxQuarterTrackMap,
+                wozContainer: container,
                 thirteenSector: thirteenSector, writeProtected: writeProtected,
                 emulatesWeakBits: emulatesWeakBits
             )
@@ -289,7 +295,7 @@ final class IWMController {
     private func readBit() -> UInt8 {
         readBitsByDrive[selectedDrive] &+= 1
         guard hasDisk(in: selectedDrive) else { return 0 }
-        guard let track = selectedBitTrack(in: selectedDrive) else {
+        guard let selection = selectedTrack(in: selectedDrive) else {
             // WOZ's $FF map value is physically blank media, not a stream of
             // reliable zero pulses. Its read amplifier sees the same noise as
             // a weak-bit region.
@@ -298,12 +304,18 @@ final class IWMController {
             weakBitsGenerated &+= 1
             return drives[selectedDrive].nextWeakBit()
         }
-        guard drives[selectedDrive].bitTracks.indices.contains(track) else { return 0 }
-        let stream = drives[selectedDrive].bitTracks[track]
-        guard stream.bitCount > 0 else { return 0 }
-        let position = drives[selectedDrive].bitPosition % stream.bitCount
-        let rawBit = (stream.bytes[position / 8] >> UInt8(7 - (position & 7))) & 1
-        drives[selectedDrive].bitPosition = (position + 1) % stream.bitCount
+        let rawBit: UInt8
+        if selection.isFlux {
+            fluxBitReads &+= 1
+            guard let bit = drives[selectedDrive].nextFluxBit(track: selection.index) else { return 0 }
+            rawBit = bit
+        } else {
+            let stream = drives[selectedDrive].bitTracks[selection.index]
+            guard stream.bitCount > 0 else { return 0 }
+            let position = drives[selectedDrive].bitPosition % stream.bitCount
+            rawBit = (stream.bytes[position / 8] >> UInt8(7 - (position & 7))) & 1
+            drives[selectedDrive].bitPosition = (position + 1) % stream.bitCount
+        }
         nibbleReads &+= 1
         guard drives[selectedDrive].emulatesWeakBits else { return rawBit }
         // WOZ 2.1's MC3470 guidance: delay the raw pulse through a four-bit
@@ -319,7 +331,8 @@ final class IWMController {
 
     private func writeBit(_ bit: UInt8) {
         guard hasDisk(in: selectedDrive), !drives[selectedDrive].isWriteProtected else { return }
-        guard let track = selectedBitTrack(in: selectedDrive) else { return }
+        guard let selection = selectedTrack(in: selectedDrive), !selection.isFlux else { return }
+        let track = selection.index
         guard drives[selectedDrive].bitTracks.indices.contains(track) else { return }
         let count = drives[selectedDrive].bitTracks[track].bitCount
         guard count > 0 else { return }
@@ -328,6 +341,7 @@ final class IWMController {
         let shift = UInt8(7 - (position & 7))
         drives[selectedDrive].bitTracks[track].bytes[byte] &= ~(UInt8(1) << shift)
         drives[selectedDrive].bitTracks[track].bytes[byte] |= (bit & 1) << shift
+        drives[selectedDrive].surfaceModified = true
         // A standard NIB stream has eight source bits per byte, while a
         // physical self-sync byte also has trailing zero cells.  Only source
         // bits can be represented in a NIB export; retain writes to those
@@ -344,16 +358,30 @@ final class IWMController {
         nibbleWrites &+= 1
     }
 
-    private func selectedBitTrack(in drive: Int) -> Int? {
+    private struct SelectedTrack {
+        var index: Int
+        var isFlux: Bool
+    }
+
+    private func selectedTrack(in drive: Int) -> SelectedTrack? {
         guard drives.indices.contains(drive) else { return nil }
         let mechanism = drives[drive]
+        if !mechanism.fluxQuarterTrackMap.isEmpty,
+           mechanism.fluxQuarterTrackMap.indices.contains(mechanism.quarterTrack) {
+            let mappedTrack = mechanism.fluxQuarterTrackMap[mechanism.quarterTrack]
+            if mappedTrack >= 0, mechanism.fluxTracks.indices.contains(mappedTrack), mechanism.fluxTracks[mappedTrack] != nil {
+                return SelectedTrack(index: mappedTrack, isFlux: true)
+            }
+        }
         if !mechanism.quarterTrackMap.isEmpty {
             guard mechanism.quarterTrackMap.indices.contains(mechanism.quarterTrack) else { return nil }
             let mappedTrack = mechanism.quarterTrackMap[mechanism.quarterTrack]
-            return mappedTrack >= 0 && mechanism.bitTracks.indices.contains(mappedTrack) ? mappedTrack : nil
+            return mappedTrack >= 0 && mechanism.bitTracks.indices.contains(mappedTrack)
+                ? SelectedTrack(index: mappedTrack, isFlux: false)
+                : nil
         }
         let track = mechanism.quarterTrack / 4
-        return mechanism.bitTracks.indices.contains(track) ? track : nil
+        return mechanism.bitTracks.indices.contains(track) ? SelectedTrack(index: track, isFlux: false) : nil
     }
 
     private static func nibblizeTrack(_ track: Int, image: [UInt8], sectorOrder: [Int]) -> EncodedDiskTrack {
@@ -601,7 +629,11 @@ final class IWMController {
             tracks: drives[drive].bitTracks,
             quarterTrackMap: drives[drive].quarterTrackMap,
             thirteenSector: drives[drive].isThirteenSector,
-            writeProtected: drives[drive].isWriteProtected
+            writeProtected: drives[drive].isWriteProtected,
+            container: drives[drive].wozContainer,
+            fluxTracks: drives[drive].fluxTracks,
+            fluxQuarterTrackMap: drives[drive].fluxQuarterTrackMap,
+            preserveWriteHints: !drives[drive].surfaceModified
         )
     }
 
