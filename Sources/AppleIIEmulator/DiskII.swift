@@ -1,5 +1,16 @@
 import Foundation
 
+/// Opt-in diagnostic state for the headless compatibility probes.  It exposes
+/// observation only; normal emulation neither logs nor branches on it.
+struct DiskIIDebugSnapshot {
+    let motorOn: Bool
+    let selectedDrive: Int
+    let q6: Bool
+    let q7: Bool
+    let tracks: [Int]
+    let readBits: [Int]
+}
+
 /// Slot 6 / IIc integrated IWM drive. It accepts 140 KB DOS-order
 /// `.dsk/.do`, ProDOS-order `.po`, pre-nibblized 35-track `.nib`, common 2IMG
 /// (`.2mg/.2img`) wrappers, and read-only WOZ 1.x/2.x bitstreams, exposing the
@@ -62,7 +73,6 @@ final class IWMController {
     }()
 
     private var drives = [DiskDrive(), DiskDrive()]
-    private var phaseStates: UInt8 = 0
     private var q6 = false
     private var q7 = false
     private var motorOn = false
@@ -76,14 +86,19 @@ final class IWMController {
     private(set) var nibbleReads = 0
     private(set) var nibbleWrites = 0
     private(set) var weakBitsGenerated = 0
+    private var readBitsByDrive = [0, 0]
 
     var hasDisk: Bool { drives.contains { $0.hasDisk } }
     func hasDisk(in drive: Int) -> Bool { drives.indices.contains(drive) && drives[drive].hasDisk }
 
     func reset() {
-        for index in drives.indices { drives[index].quarterTrack = 0; drives[index].bitPosition = 0 }
-        phaseStates = 0; q6 = false; q7 = false
-        motorOn = false; motorOffDelay = 0; selectedDrive = 0; dataLatch = 0; busData = 0; sequencerState = 0; sequencerPhase = 0; writeLevel = 0; nibbleReads = 0; nibbleWrites = 0; weakBitsGenerated = 0
+        for index in drives.indices {
+            drives[index].phaseStates = 0
+            drives[index].quarterTrack = 0
+            drives[index].bitPosition = 0
+        }
+        q6 = false; q7 = false
+        motorOn = false; motorOffDelay = 0; selectedDrive = 0; dataLatch = 0; busData = 0; sequencerState = 0; writeLevel = 0; nibbleReads = 0; nibbleWrites = 0; weakBitsGenerated = 0; readBitsByDrive = [0, 0]
     }
 
     func eject(drive: Int = 0) {
@@ -236,8 +251,9 @@ final class IWMController {
 
     private func setPhase(_ phase: Int, enabled: Bool) {
         let mask = UInt8(1 << phase)
-        let wasEnabled = phaseStates & mask != 0
-        if enabled { phaseStates |= mask } else { phaseStates &= ~mask }
+        let wasEnabled = drives[selectedDrive].phaseStates & mask != 0
+        if enabled { drives[selectedDrive].phaseStates |= mask }
+        else { drives[selectedDrive].phaseStates &= ~mask }
         // Advance only on a phase's rising edge. Looking at all active coils
         // makes the normal 0→1→2→3 stepping sequence cancel itself once more
         // than one magnet is energized. A newly selected adjacent phase moves
@@ -274,6 +290,7 @@ final class IWMController {
     }
 
     private func readBit() -> UInt8 {
+        readBitsByDrive[selectedDrive] &+= 1
         guard hasDisk(in: selectedDrive) else { return 0 }
         guard let track = selectedBitTrack(in: selectedDrive) else {
             // WOZ's $FF map value is physically blank media, not a stream of
@@ -585,6 +602,18 @@ final class IWMController {
         guard drives.indices.contains(drive) else { return 0 }
         return drives[drive].quarterTrack / 4
     }
+
+    var debugSnapshot: DiskIIDebugSnapshot {
+        DiskIIDebugSnapshot(
+            motorOn: motorOn,
+            selectedDrive: selectedDrive,
+            q6: q6,
+            q7: q7,
+            tracks: drives.map { $0.quarterTrack / 4 },
+            readBits: readBitsByDrive
+        )
+    }
+
 
     func isWriteProtected(in drive: Int = 0) -> Bool {
         drives.indices.contains(drive) && drives[drive].isWriteProtected

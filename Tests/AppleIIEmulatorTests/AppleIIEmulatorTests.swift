@@ -204,6 +204,22 @@ final class AppleIIEmulatorTests: XCTestCase {
         XCTAssertEqual(memory.read(0xC017), 0)
     }
 
+    func testAppleIIeSlotThreeROMDoesNotMirrorMotherboardROMWhenNoCardIsPresent() throws {
+        let memory = AppleIIMemory()
+        try memory.loadBundledAppleIIeROM(.appleIIeEnhanced)
+
+        let internalSlotThreeByte = memory.read(0xC300)
+        XCTAssertNotEqual(internalSlotThreeByte, 0)
+
+        _ = memory.read(0xC00B) // select the physical Slot 3 ROM
+        XCTAssertEqual(memory.read(0xC017), 0x80)
+        XCTAssertEqual(memory.read(0xC300), 0, "an empty Slot 3 must not mirror the IIe ROM")
+
+        _ = memory.read(0xC00A) // restore the internal 80-column ROM
+        XCTAssertEqual(memory.read(0xC017), 0)
+        XCTAssertEqual(memory.read(0xC300), internalSlotThreeByte)
+    }
+
     func testIIcReadOfSetIOUDisableSetsTheLatch() {
         let memory = AppleIIMemory()
         memory.loadROM(Data(repeating: 0, count: 0x8000))
@@ -560,14 +576,209 @@ final class AppleIIEmulatorTests: XCTestCase {
     func testBundledGamesMountWithoutFilePicker() {
         XCTAssertEqual(
             AppleIIMachine.BundledGame.allCases.map(\.title),
-            ["Falcons (4am crack)", "J-Bird", "Ocean Night"]
+            ["Lode Runner (1983)", "Prince of Persia (1989)", "Wizardry (1981)", "Karateka (1984)"]
         )
         let machine = AppleIIMachine()
         for game in AppleIIMachine.BundledGame.allCases {
             machine.loadBundledGame(game)
             XCTAssertEqual(machine.diskDescription, game.title)
+            XCTAssertEqual(machine.selectedBootROM, game.bootROM, game.title)
             XCTAssertTrue(machine.memory.hasDisk(in: 0), game.title)
         }
+    }
+
+    @MainActor
+    func testWizardryBootDiskTransfersControlFromFirmware() {
+        let machine = AppleIIMachine()
+        machine.loadBundledGame(.wizardry)
+
+        XCTAssertTrue(machine.hasDisk(in: 0))
+        XCTAssertTrue(machine.hasDisk(in: 1))
+        machine.runForVerification(cycles: 2_000_000)
+
+        let trace = machine.recentInstructions
+            .map { String(format: "$%04X:%02X", $0.0, $0.1) }
+            .joined(separator: " ")
+        XCTAssertTrue(
+            machine.hasExecutedRAMCode,
+            "Wizardry did not leave the Disk II firmware; pc=$\(String(machine.programCounter, radix: 16)), reads=\(machine.memory.diskNibbleReads), trace=\(trace)"
+        )
+        XCTAssertTrue(
+            machine.encounteredUnsupportedCPUOpcodes.isEmpty,
+            "Wizardry executed unsupported opcodes: \(machine.encounteredUnsupportedCPUOpcodes)"
+        )
+
+        var titleAppeared = false
+        for _ in 0..<60 {
+            machine.runForVerification(cycles: 1_000_000)
+            let video = machine.videoSnapshot
+            if video.hires && video.hgrMain.contains(where: { $0 & 0x7F != 0 }) {
+                titleAppeared = true
+                break
+            }
+        }
+        XCTAssertTrue(
+            titleAppeared,
+            "Wizardry did not reach its visible title screen; pc=$\(String(machine.programCounter, radix: 16)), reads=\(machine.memory.diskNibbleReads)"
+        )
+
+        let cyclesBeforeSwap = machine.executedCPUCycles
+        let pcBeforeSwap = machine.programCounter
+        let scenarioURL = try! XCTUnwrap(AppResources.bundle.url(forResource: "Wizardry (1981) Disk 2", withExtension: "dsk"))
+        try! machine.replaceDiskImageData(
+            Data(contentsOf: scenarioURL),
+            fileExtension: "dsk",
+            description: "Wizardry Scenario 磁盘",
+            drive: 0
+        )
+        XCTAssertEqual(machine.executedCPUCycles, cyclesBeforeSwap, "changing the Scenario disk must not reset the CPU")
+        XCTAssertEqual(machine.programCounter, pcBeforeSwap, "changing the Scenario disk must preserve execution state")
+    }
+
+    @MainActor
+    func testPrinceOfPersiaBootsOnAppleIIeWith128K() {
+        let machine = AppleIIMachine()
+        machine.loadBundledGame(.princeOfPersia)
+
+        XCTAssertEqual(machine.selectedBootROM, .appleIIeGameCompatible)
+        XCTAssertEqual(machine.memory.model, .appleIIe)
+        XCTAssertTrue(machine.hasDisk(in: 0))
+        XCTAssertTrue(machine.hasDisk(in: 1))
+        machine.runForVerification(cycles: 5_000_000)
+        XCTAssertTrue(machine.hasExecutedRAMCode)
+        XCTAssertTrue(machine.encounteredUnsupportedCPUOpcodes.isEmpty)
+        let text = (0..<24).map { row in
+            String((0..<40).map { machine.memory.textByte(column: $0, row: row) & 0x7F }.map(UnicodeScalar.init).map(Character.init))
+        }.joined(separator: "|")
+        let trace = machine.recentInstructions
+            .map { String(format: "$%04X:%02X", $0.0, $0.1) }
+            .joined(separator: " ")
+        XCTAssertFalse(
+            text.contains("REQUIRES A //C OR //E WITH 128K"),
+            "Prince of Persia rejected the IIe 128K configuration; pc=$\(String(machine.programCounter, radix: 16)), FBB3=$\(String(machine.memory.read(0xFBB3), radix: 16)), C017=$\(String(machine.memory.read(0xC017), radix: 16)), slot3ROM=\(machine.memory.slot3ROM), RAMRD=\(machine.memory.ramReadAuxiliary), RAMWRT=\(machine.memory.ramWriteAuxiliary), trace=\(trace), text=\(text)"
+        )
+    }
+
+    @MainActor
+    func testPrinceOfPersiaStartsWithThirdDiskInDriveTwo() throws {
+        let machine = AppleIIMachine()
+        machine.loadBundledGame(.princeOfPersia)
+        XCTAssertTrue(machine.hasDisk(in: 0))
+        XCTAssertTrue(machine.hasDisk(in: 1))
+        XCTAssertEqual(machine.externalDiskDescription, "Prince of Persia 磁盘 3")
+        XCTAssertEqual(
+            AppleIIMachine.BundledGame.princeOfPersia.startupDisks.map(\.description),
+            ["Prince of Persia 磁盘 1", "Prince of Persia 磁盘 3"]
+        )
+    }
+
+    @MainActor
+    func testPrinceOfPersiaContinuesPastItsStartupScreenAfterKeyPress() {
+        let machine = AppleIIMachine()
+        machine.loadBundledGame(.princeOfPersia)
+        machine.runForVerification(cycles: 18_000_000)
+        writeDiagnosticPNG(machine.videoSnapshot, named: "prince-before-button")
+        // The loader accepts any keyboard key as well as a controller button.
+        // Exercise the actual keyboard strobe here, independent of AppKit's
+        // foreground-event delivery.
+        machine.memory.latchKey(0x8D) // Return with the Apple II key-ready bit
+        machine.runForVerification(cycles: 30_000_000)
+
+        let video = machine.videoSnapshot
+        writeDiagnosticPNG(video, named: "prince-after-return")
+        let diagnostic = "text=\(video.textMode) hires=\(video.hires) dhires=\(video.doubleHires) col80=\(video.column80) alt=\(video.alternateCharset) hgrPixels=\((video.hgrMain + video.hgrAuxiliary).filter { $0 & 0x7F != 0 }.count) textCells=\(video.text.filter { $0 & 0x7F != 0 }.count) pc=$\(String(machine.programCounter, radix: 16))"
+        let visibleBytes: [UInt8]
+        if video.textMode {
+            visibleBytes = video.text
+        } else if video.hires {
+            visibleBytes = video.hgrMain + video.hgrAuxiliary
+        } else {
+            visibleBytes = video.lores
+        }
+        XCTAssertTrue(
+            visibleBytes.contains { $0 & 0x7F != 0 },
+            "Prince went blank after button press; \(diagnostic), unsupported=\(machine.encounteredUnsupportedCPUOpcodes), trace=\(machine.recentInstructions)"
+        )
+        let firstUnsupportedTrace = machine.firstUnsupportedInstructionTrace
+            .map { String(format: "$%04X:%02X", $0.0, $0.1) }
+            .joined(separator: " ")
+        XCTAssertTrue(video.hires, "Prince did not enter the high-resolution game path; \(diagnostic), first=\(firstUnsupportedTrace)")
+        XCTAssertTrue(machine.hasExecutedRAMCode)
+        XCTAssertTrue(machine.encounteredUnsupportedCPUOpcodes.isEmpty, "Prince executed unsupported opcodes: \(machine.encounteredUnsupportedCPUOpcodes)")
+    }
+
+    /// This is deliberately independent of macOS screen recording: the test
+    /// process rasterizes the exact video snapshot that the app publishes.
+    /// Set `APPLEII_EMIT_PNG=1` when a visual artifact is wanted; normal test
+    /// runs remain filesystem-free.
+    private func writeDiagnosticPNG(_ video: AppleIIVideoSnapshot, named name: String) {
+        guard ProcessInfo.processInfo.environment["APPLEII_EMIT_PNG"] == "1" else { return }
+        let size = NSSize(width: 800, height: 480)
+        let image = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: Int(size.width),
+            pixelsHigh: Int(size.height),
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        )!
+        guard let context = NSGraphicsContext(bitmapImageRep: image) else { return }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        NSColor(red: 0.01, green: 0.04, blue: 0.02, alpha: 1).setFill()
+        NSBezierPath(rect: NSRect(origin: .zero, size: size)).fill()
+
+        if video.hires {
+            let dotSize = NSSize(width: size.width / 280, height: size.height / 192)
+            let palette: [AppleIIHiResColor: NSColor] = [
+                .black: .black,
+                .green: NSColor(red: 0.20, green: 0.82, blue: 0.26, alpha: 1),
+                .purple: NSColor(red: 0.72, green: 0.20, blue: 0.82, alpha: 1),
+                .orange: NSColor(red: 0.96, green: 0.43, blue: 0.08, alpha: 1),
+                .blue: NSColor(red: 0.10, green: 0.42, blue: 0.96, alpha: 1),
+                .white: .white
+            ]
+            for row in 0..<192 {
+                let dots = appleIIHiResDots(bytes: (0..<40).map { video.hgrByte(column: $0, row: row, auxiliary: false) })
+                for (column, color) in dots.enumerated() where color != .black {
+                    palette[color]?.setFill()
+                    NSBezierPath(rect: NSRect(x: CGFloat(column) * dotSize.width, y: size.height - CGFloat(row + 1) * dotSize.height, width: dotSize.width + 0.1, height: dotSize.height + 0.1)).fill()
+                }
+            }
+        }
+
+        let columns = video.column80 ? 80 : 40
+        let cell = NSSize(width: size.width / CGFloat(columns), height: size.height / 24)
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: min(cell.height * 0.8, cell.width * 1.2), weight: .medium),
+            .foregroundColor: NSColor(red: 0.28, green: 1.0, blue: 0.42, alpha: 1)
+        ]
+        for row in 0..<24 {
+            for column in 0..<columns {
+                let byte = video.textByte(column: column, row: row)
+                guard byte != 0 else { continue }
+                let cellValue = video.column80
+                    ? appleII80ColumnTextCell(byte: byte, alternateCharset: video.alternateCharset, flashOn: true, supportsMouseText: video.supportsMouseText)
+                    : appleIITextCell(byte: byte, alternateCharset: video.alternateCharset, flashOn: true, supportsMouseText: video.supportsMouseText)
+                let glyph: String
+                switch cellValue {
+                case let .normal(value), let .inverse(value):
+                    glyph = String(UnicodeScalar(value < 0x20 ? value + 0x40 : value))
+                case let .alternate(value), let .alternateInverse(value):
+                    glyph = value < 0x20 ? "•" : String(UnicodeScalar(value))
+                case let .ascii(value):
+                    glyph = value >= 0x20 ? String(UnicodeScalar(value)) : " "
+                }
+                (glyph as NSString).draw(at: NSPoint(x: CGFloat(column) * cell.width, y: size.height - CGFloat(row + 1) * cell.height), withAttributes: attributes)
+            }
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        let url = URL(fileURLWithPath: "/private/tmp/AppleIIEmulator-\(name).png")
+        try? image.representation(using: .png, properties: [:])?.write(to: url)
     }
 
     @MainActor
@@ -593,7 +804,8 @@ final class AppleIIEmulatorTests: XCTestCase {
         let machine = AppleIIMachine()
         for game in AppleIIMachine.BundledGame.allCases {
             machine.loadBundledGame(game)
-            XCTAssertEqual(machine.memory.model, .appleIIPlus, game.title)
+            let expectedModel: AppleIIMemory.Model = game.bootROM == .appleIIPlus ? .appleIIPlus : .appleIIe
+            XCTAssertEqual(machine.memory.model, expectedModel, game.title)
             machine.runForVerification(cycles: 5_000_000)
             XCTAssertGreaterThan(machine.executedCPUCycles, 0, game.title)
             XCTAssertTrue(machine.encounteredUnsupportedCPUOpcodes.isEmpty, "\(game.title) executed unsupported opcodes: \(machine.encounteredUnsupportedCPUOpcodes)")

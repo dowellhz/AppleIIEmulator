@@ -2,7 +2,7 @@
 
 一个原生 SwiftUI Apple IIc 模拟器工程，采用硬件总线模型而非“运行 BASIC 的终端”。目前可构建运行，并包含：
 
-![Falcons 在内置 Apple II+ 游戏兼容模式中运行](Documentation/falcons-gameplay.png)
+![Lode Runner 在内置 Apple IIe 游戏兼容模式中运行](Documentation/lode-runner-gameplay.png)
 
 ## About
 

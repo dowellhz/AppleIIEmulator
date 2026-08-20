@@ -34,6 +34,10 @@ struct DiskDrive {
     var emulatesWeakBits = false
     var readHeadWindow: UInt8 = 0
     var weakBitLFSR: UInt32 = 0xA2_5A_5A_01
+    /// The Disk II controller selects one physical mechanism at a time.
+    /// Each mechanism therefore retains its own energized stepper phases;
+    /// selecting Drive 2 must not inherit Drive 1's coil state.
+    var phaseStates: UInt8 = 0
     /// Quarter-track units preserve the Apple stepper's half-track movement.
     var quarterTrack = 0
     var bitPosition = 0
@@ -49,6 +53,7 @@ struct DiskDrive {
         emulatesWeakBits = false
         readHeadWindow = 0
         weakBitLFSR = 0xA2_5A_5A_01
+        phaseStates = 0
         quarterTrack = 0
         bitPosition = 0
     }
@@ -69,6 +74,7 @@ struct DiskDrive {
         self.emulatesWeakBits = emulatesWeakBits
         readHeadWindow = 0
         weakBitLFSR = 0xA2_5A_5A_01
+        phaseStates = 0
         quarterTrack = 0
         bitPosition = 0
     }

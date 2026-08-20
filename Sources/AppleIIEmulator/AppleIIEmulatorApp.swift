@@ -1,8 +1,15 @@
 import SwiftUI
+import Darwin
 
 @main
 struct AppleIIEmulatorApp: App {
     @StateObject private var machine = AppleIIMachine()
+
+    init() {
+        if let status = HeadlessVerification.runIfRequested() {
+            exit(status)
+        }
+    }
 
     var body: some Scene {
         WindowGroup("Apple II Emulator") {
@@ -20,9 +27,14 @@ struct AppleIIEmulatorApp: App {
                 Button("打开外部 ROM…") { machine.chooseExternalROM() }
             }
             CommandMenu("磁盘") {
-                Button("插入驱动器 1 映像…") { machine.chooseDiskImage(drive: 0) }
+                Button("装入磁盘映像…") { machine.chooseDiskImage(drive: 0) }
                     .keyboardShortcut("o", modifiers: .command)
-                Button("插入驱动器 2 映像…") { machine.chooseDiskImage(drive: 1) }
+                Button("仅装入驱动器 2 映像…") { machine.chooseDiskImage(drive: 1) }
+                Divider()
+                Button("运行中更换驱动器 1 磁盘…") { machine.chooseDiskImage(drive: 0, resetsMachine: false) }
+                Button("运行中更换驱动器 2 磁盘…") { machine.chooseDiskImage(drive: 1, resetsMachine: false) }
+                Button("Wizardry：将 Scenario 盘换入驱动器 1") { machine.swapWizardryScenarioIntoDriveOne() }
+                    .disabled(!machine.canSwapWizardryScenarioIntoDriveOne)
                 Button("插入测试启动盘") { machine.insertDiagnosticDisk() }
                 Button("将驱动器 1 另存为 .nib…") { machine.saveDiskAsNIB(drive: 0) }
                     .keyboardShortcut("s", modifiers: [.command, .shift])

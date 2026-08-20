@@ -15,6 +15,9 @@ package-app:
 	cp AppBundle/AppIcon.icns $(APP)/Contents/Resources/AppIcon.icns
 	cp $(BUILD_DIR)/AppleIIEmulator $(APP)/Contents/MacOS/AppleIIEmulator
 	ditto $(BUILD_DIR)/$(RESOURCE_BUNDLE) $(APP)/Contents/Resources/$(RESOURCE_BUNDLE)
+	# User-supplied artwork can arrive with restrictive Finder/temporary-file
+	# permissions. A signed app must contain resources readable by its user.
+	chmod -R a+r $(APP)/Contents/Resources
 	codesign --force --deep --sign "$(CODESIGN_IDENTITY)" $(APP)
 	$(MAKE) verify-app-bundle
 
@@ -23,4 +26,5 @@ verify-app-bundle:
 	test -d $(APP)/Contents/Resources/$(RESOURCE_BUNDLE)
 	test -f $(APP)/Contents/Resources/$(RESOURCE_BUNDLE)/AppleIIPlus-Applesoft-Autostart.rom
 	test -f $(APP)/Contents/Resources/$(RESOURCE_BUNDLE)/VintagePlasticTexture.png
+	test -r $(APP)/Contents/Resources/$(RESOURCE_BUNDLE)/ControlPanelReference.png
 	codesign --verify --deep --strict $(APP)
