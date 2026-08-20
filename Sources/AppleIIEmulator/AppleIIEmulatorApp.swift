@@ -84,10 +84,10 @@ struct AppleIIEmulatorApp: App {
                     .disabled(machine.externalDiskDescription == "未插入")
             }
             CommandMenu("游戏") {
-                if !machine.recentBundledGames.isEmpty {
+                if !machine.recentGames.isEmpty {
                     Menu("最近玩过") {
-                        ForEach(machine.recentBundledGames) { game in
-                            Button(game.title) { machine.loadBundledGame(game) }
+                        ForEach(machine.recentGames) { game in
+                            Button(game.title) { machine.loadRecentGame(game) }
                         }
                     }
                     Divider()
@@ -115,11 +115,35 @@ struct AppleIIEmulatorApp: App {
                     Button(software.title) { machine.loadBundledSoftware(software) }
                 }
             }
+            CommandMenu("串口") {
+                Button("刷新 macOS 串口") { machine.refreshSerialDevices() }
+                Divider()
+                serialPortMenu(title: "端口 1（打印机）", port: 1, connectedDevice: machine.serialPort1Device)
+                serialPortMenu(title: "端口 2（调制解调器）", port: 2, connectedDevice: machine.serialPort2Device)
+            }
             CommandGroup(after: .newItem) {
                 Button("重置") { machine.reset() }
                     .keyboardShortcut("r", modifiers: .command)
             }
         }
+    }
+
+    @ViewBuilder
+    private func serialPortMenu(title: String, port: Int, connectedDevice: String) -> some View {
+        Menu(title) {
+            Text(connectedDevice)
+            Button("断开") { machine.disconnectSerialDevice(port: port) }
+                .disabled(connectedDevice == "未连接")
+            Divider()
+            if machine.serialDevicePaths.isEmpty {
+                Text("未发现 /dev/cu.* 设备")
+            } else {
+                ForEach(machine.serialDevicePaths, id: \.self) { path in
+                    Button(path) { machine.connectSerialDevice(path, port: port) }
+                }
+            }
+        }
+        .disabled(!machine.supportsIIcSerial)
     }
 
 }

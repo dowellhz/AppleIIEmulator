@@ -303,6 +303,55 @@ final class AppleIIMachine: ObservableObject {
         case software
     }
 
+    /// A playable item in the recent-games menu. Disk games retain every
+    /// image selected for their initial boot, so a two-disk game reopens with
+    /// the same drive layout instead of silently losing its second disk.
+    enum RecentGame: Hashable, Identifiable {
+        case bundled(BundledGame)
+        case diskImages([URL])
+
+        var id: String {
+            switch self {
+            case let .bundled(game): return "bundled:\(game.rawValue)"
+            case let .diskImages(urls):
+                return "disks:" + urls.map { $0.standardizedFileURL.path }.joined(separator: "\u{1F}")
+            }
+        }
+
+        var title: String {
+            switch self {
+            case let .bundled(game): return game.title
+            case let .diskImages(urls):
+                guard let first = urls.first else { return "磁盘映像" }
+                let name = first.deletingPathExtension().lastPathComponent
+                return urls.count == 1 ? name : "\(name) 等 \(urls.count) 张盘"
+            }
+        }
+
+        fileprivate var storageRecord: [String] {
+            switch self {
+            case let .bundled(game): return ["bundled", game.rawValue]
+            case let .diskImages(urls): return ["disks"] + urls.map(\.path)
+            }
+        }
+
+        fileprivate init?(storageRecord: [String]) {
+            guard let kind = storageRecord.first else { return nil }
+            switch kind {
+            case "bundled":
+                guard storageRecord.count == 2,
+                      let game = BundledGame(rawValue: storageRecord[1]) else { return nil }
+                self = .bundled(game)
+            case "disks":
+                let urls = storageRecord.dropFirst().map { URL(fileURLWithPath: $0).standardizedFileURL }
+                guard !urls.isEmpty else { return nil }
+                self = .diskImages(urls)
+            default:
+                return nil
+            }
+        }
+    }
+
     @Published private(set) var isRunning = true
     /// Runs the same 6502/bus path at twice the normal 1.0218 MHz rate.  This
     /// is deliberately a clock multiplier rather than a UI shortcut: every
@@ -330,14 +379,16 @@ final class AppleIIMachine: ObservableObject {
     @Published private(set) var diskDescription = "未插入"
     @Published private(set) var externalDiskDescription = "未插入"
     @Published private(set) var hardDiskDescription = "未插入"
+    @Published private(set) var serialDevicePaths = [String]()
+    @Published private(set) var serialPort1Device = "未连接"
+    @Published private(set) var serialPort2Device = "未连接"
     /// Drives the physical GAME/SOFTWARE LEDs in the panel without making a
     /// UI choice alter the emulated hardware state.
     @Published private(set) var activeMediaKind: ActiveMediaKind = .none
-    /// The two most recently launched built-in games are surfaced at the top
-    /// of both GAME menus. Store stable enum values, never absolute resource
-    /// paths, so the shortcuts survive an app update without reaching into a
-    /// workspace-only Downloads directory.
-    @Published private(set) var recentBundledGames: [BundledGame] = []
+    /// The recent menu remembers built-in games and the exact set of images
+    /// selected for a local game. Entries are persisted as identifiers and
+    /// paths, never as cached image bytes.
+    @Published private(set) var recentGames: [RecentGame] = []
 
     private let gameLibrary = GameLibrary()
     /// Grouping keeps the in-app GAME menu navigable even with a large game
@@ -347,6 +398,8 @@ final class AppleIIMachine: ObservableObject {
     let memory = AppleIIMemory()
     private var cpu: MOS6502!
     private let speaker = AppleIISpeaker()
+    private let serialBridge = MacSerialBridge()
+    private let defaults: UserDefaults
     private var timer: Timer?
     private var keyboardMonitor: Any?
     private var keyboardReleaseMonitor: Any?
@@ -377,12 +430,47 @@ final class AppleIIMachine: ObservableObject {
     /// A diskless Apple II+ reaches ROM Applesoft through the Autostart ROM's
     /// warm-reset path after it has shown the power-on banner.
     private var applesoftWarmStartDeadline: TimeInterval?
-    private static let recentBundledGamesDefaultsKey = "AppleIIEmulator.recentBundledGames"
+    private static let recentGamesDefaultsKey = "AppleIIEmulator.recentGames.v2"
+    private static let legacyRecentBundledGamesDefaultsKey = "AppleIIEmulator.recentBundledGames"
+    private static let recentGamesLimit = 8
 
     var currentROMTitle: String { externalROMName ?? selectedBootROM.title }
+    var supportsIIcSerial: Bool {
+        switch selectedBootROM {
+        case .appleIIcROM00, .appleIIcROM03, .appleIIcROM04, .appleIIcROMFF: return true
+        default: return false
+        }
+    }
 
-    init() {
-        recentBundledGames = Self.restoredRecentBundledGames()
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        recentGames = Self.restoredRecentGames(from: defaults)
+        persistRecentGames()
+        serialBridge.didReceiveByte = { [weak self] byte, port in
+            guard let self else { return }
+            self.emulationQueue.async { [weak self] in
+                guard let self else { return }
+                self.emulationLock.lock()
+                self.memory.receiveSerialByte(byte, port: port)
+                self.emulationLock.unlock()
+            }
+        }
+        serialBridge.didListDevices = { [weak self] paths in
+            DispatchQueue.main.async { self?.serialDevicePaths = paths }
+        }
+        serialBridge.didChangeConnection = { [weak self] port, path in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if port == 1 { self.serialPort1Device = path ?? "未连接" }
+                else if port == 2 { self.serialPort2Device = path ?? "未连接" }
+            }
+        }
+        serialBridge.didFail = { [weak self] port, error in
+            DispatchQueue.main.async {
+                self?.status = "串口 \(port) 错误：\(error.localizedDescription)"
+            }
+        }
+        refreshSerialDevices()
         memory.speakerDidToggleAtCycle = { [weak speaker] cycle in
             speaker?.toggle(atEmulatedCycle: cycle)
         }
@@ -477,17 +565,26 @@ final class AppleIIMachine: ObservableObject {
         let cpu = cpu!
         let memory = memory
         let speaker = speaker
+        let serialBridge = serialBridge
         let lock = emulationLock
         emulationQueue.async { [weak self] in
             lock.lock()
             cpu.run(cycles: cycles)
             if warmStart { cpu.reset() }
             speaker.advance(toEmulatedCycle: cpu.totalCycles)
+            let serialPort1Bytes = memory.drainTransmittedSerialBytes(port: 1)
+            let serialPort2Bytes = memory.drainTransmittedSerialBytes(port: 2)
+            let serialPort1Baud = memory.serialBaudRate(port: 1)
+            let serialPort2Baud = memory.serialBaudRate(port: 2)
             let totalCycles = cpu.totalCycles
             let programCounter = cpu.pc
             let diskState = memory.diskDebugSnapshot
             let snapshot = memory.makeVideoSnapshot()
             lock.unlock()
+            serialBridge.setBaudRate(serialPort1Baud, port: 1)
+            serialBridge.setBaudRate(serialPort2Baud, port: 2)
+            serialBridge.send(serialPort1Bytes, port: 1)
+            serialBridge.send(serialPort2Bytes, port: 2)
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.cpuSliceQueued = false
@@ -615,6 +712,20 @@ final class AppleIIMachine: ObservableObject {
         isRunning.toggle()
         lastEmulationTick = ProcessInfo.processInfo.systemUptime
     }
+
+    func refreshSerialDevices() { serialBridge.refreshDevices() }
+
+    func connectSerialDevice(_ path: String, port: Int) {
+        guard supportsIIcSerial else {
+            status = "串口仅适用于 Apple IIc ROM"
+            return
+        }
+        // The next CPU slice applies the ACIA's current control-register
+        // rate. Start at the reset-default 9600 to avoid waiting on the UI.
+        serialBridge.connect(path: path, port: port, baudRate: 9_600)
+    }
+
+    func disconnectSerialDevice(port: Int) { serialBridge.disconnect(port: port) }
 
     func keyDown(_ event: NSEvent) {
         updateJoystick(for: event.keyCode, pressed: true)
@@ -850,22 +961,52 @@ final class AppleIIMachine: ObservableObject {
             let extraDiskNotice = startupMedia.count > 2 ? " · 已装入前两张盘" : ""
             status = "\(game.bootROM.title) · \(game.diskFirmware.title) · \(game.title)\(extraDiskNotice)"
             reset()
-            recordRecentBundledGame(game)
+            recordRecentGame(.bundled(game))
         } catch {
             status = "无法装入内置游戏：\(game.title)"
         }
     }
 
-    private static func restoredRecentBundledGames() -> [BundledGame] {
-        let rawValues = UserDefaults.standard.stringArray(forKey: recentBundledGamesDefaultsKey) ?? []
-        return Array(rawValues.compactMap(BundledGame.init(rawValue:)).prefix(2))
+    private static func restoredRecentGames(from defaults: UserDefaults) -> [RecentGame] {
+        let games: [RecentGame]
+        if let storedRecords = defaults.array(forKey: recentGamesDefaultsKey) as? [[String]] {
+            games = storedRecords.compactMap(RecentGame.init(storageRecord:))
+        } else {
+            // v0.1.4 only stored built-in game enum values. Preserve those
+            // shortcuts once while moving to the mixed, versioned format.
+            games = (defaults.stringArray(forKey: legacyRecentBundledGamesDefaultsKey) ?? [])
+                .compactMap(BundledGame.init(rawValue:))
+                .map(RecentGame.bundled)
+        }
+        return normalizedRecentGames(games)
     }
 
-    private func recordRecentBundledGame(_ game: BundledGame) {
-        recentBundledGames.removeAll { $0 == game }
-        recentBundledGames.insert(game, at: 0)
-        recentBundledGames = Array(recentBundledGames.prefix(2))
-        UserDefaults.standard.set(recentBundledGames.map(\.rawValue), forKey: Self.recentBundledGamesDefaultsKey)
+    private static func normalizedRecentGames(_ games: [RecentGame]) -> [RecentGame] {
+        var seen = Set<String>()
+        return games.filter { seen.insert($0.id).inserted }.prefix(recentGamesLimit).map { $0 }
+    }
+
+    private func recordRecentGame(_ game: RecentGame) {
+        recentGames = Self.normalizedRecentGames([game] + recentGames)
+        persistRecentGames()
+    }
+
+    private func removeRecentGame(_ game: RecentGame) {
+        recentGames.removeAll { $0.id == game.id }
+        persistRecentGames()
+    }
+
+    private func persistRecentGames() {
+        defaults.set(recentGames.map(\.storageRecord), forKey: Self.recentGamesDefaultsKey)
+    }
+
+    func loadRecentGame(_ game: RecentGame) {
+        switch game {
+        case let .bundled(bundledGame):
+            loadBundledGame(bundledGame)
+        case let .diskImages(urls):
+            loadDownloadedGame(at: urls, recentGame: game, preservesDriveOrder: true)
+        }
     }
 
     var canSwapWizardryScenarioIntoDriveOne: Bool {
@@ -964,8 +1105,12 @@ final class AppleIIMachine: ObservableObject {
         loadDownloadedGame(at: urls)
     }
 
-    private func loadDownloadedGame(at urls: [URL]) {
-        let orderedURLs = Self.sortedDiskURLs(urls)
+    private func loadDownloadedGame(
+        at urls: [URL],
+        recentGame: RecentGame? = nil,
+        preservesDriveOrder: Bool = false
+    ) {
+        let orderedURLs = preservesDriveOrder ? urls : Self.sortedDiskURLs(urls)
         guard !orderedURLs.isEmpty else { return }
         let mountedURLs = Array(orderedURLs.prefix(2))
         let queuedDiskCount = orderedURLs.count - mountedURLs.count
@@ -1006,11 +1151,17 @@ final class AppleIIMachine: ObservableObject {
                             : "Apple IIe（游戏兼容） · 已按路径顺序装入驱动器 1 和 2"
                     }
                     self.reset()
+                    self.recordRecentGame(.diskImages(images.map(\.0)))
                 } catch {
                     self.status = "无法装入所选磁盘：仅支持 .dsk/.do/.d13/.po/.nib/.2mg/.2img"
                 }
             case .failure:
-                self.status = "无法读取所选游戏磁盘"
+                if let recentGame {
+                    self.removeRecentGame(recentGame)
+                    self.status = "最近游戏文件已不可用，已从记录中移除"
+                } else {
+                    self.status = "无法读取所选游戏磁盘"
+                }
             }
         }
     }
@@ -1089,6 +1240,9 @@ final class AppleIIMachine: ObservableObject {
                             ? "\(self.currentROMTitle) · 驱动器 \(drive + 1)：\(images[0].0.lastPathComponent)"
                             : "\(self.currentROMTitle) · 已装入驱动器 1 和 2"
                         self.reset()
+                        if drive == 0 {
+                            self.recordRecentGame(.diskImages(images.map(\.0)))
+                        }
                     } else {
                         for (offset, image) in images.enumerated() {
                             try self.replaceDiskImageData(
@@ -1946,6 +2100,12 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
         if port == 1 { return serialPort1.drainTransmittedBytes() }
         if port == 2 { return serialPort2.drainTransmittedBytes() }
         return []
+    }
+
+    func serialBaudRate(port: Int) -> Int {
+        if port == 1 { return serialPort1.baudRate }
+        if port == 2 { return serialPort2.baudRate }
+        return 9_600
     }
 
     /// The IIc's integrated IWM occupies slot-zero I/O ($C080-$C08F). This

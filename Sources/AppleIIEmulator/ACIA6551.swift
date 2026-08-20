@@ -19,6 +19,7 @@ struct ACIA6551 {
     private var receiverInterruptEnabled: Bool { command & 0x02 != 0 }
     private var transmitterEnabled: Bool { (command >> 2) & 0x03 != 0 }
     var irqPending: Bool { receiveData != nil && receiverInterruptEnabled }
+    var baudRate: Int { selectedBaudRate }
 
     mutating func reset() {
         command = 0
@@ -95,24 +96,27 @@ struct ACIA6551 {
         // frame is modelled as start + 8 data + stop bits, which is the common
         // IIc 8-N-1 configuration. External-clock mode falls back to 9600 so
         // an unconfigured virtual port never stalls CPU-driven firmware.
-        let baud: Int
-        switch control & 0x0F {
-        case 0x01: baud = 50
-        case 0x02: baud = 75
-        case 0x03: baud = 110
-        case 0x04: baud = 134
-        case 0x05: baud = 150
-        case 0x06: baud = 300
-        case 0x07: baud = 600
-        case 0x08: baud = 1_200
-        case 0x09: baud = 1_800
-        case 0x0A: baud = 2_400
-        case 0x0B: baud = 3_600
-        case 0x0C: baud = 4_800
-        case 0x0D: baud = 7_200
-        case 0x0F: baud = 19_200
-        default: baud = 9_600
-        }
+        let baud = selectedBaudRate
         return max(1, (1_021_800 * 10 + baud - 1) / baud)
+    }
+
+    private var selectedBaudRate: Int {
+        switch control & 0x0F {
+        case 0x01: return 50
+        case 0x02: return 75
+        case 0x03: return 110
+        case 0x04: return 134
+        case 0x05: return 150
+        case 0x06: return 300
+        case 0x07: return 600
+        case 0x08: return 1_200
+        case 0x09: return 1_800
+        case 0x0A: return 2_400
+        case 0x0B: return 3_600
+        case 0x0C: return 4_800
+        case 0x0D: return 7_200
+        case 0x0F: return 19_200
+        default: return 9_600
+        }
     }
 }

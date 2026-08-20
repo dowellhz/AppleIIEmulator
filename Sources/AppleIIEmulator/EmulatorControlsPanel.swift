@@ -293,12 +293,12 @@ struct EmulatorControlsPanel: View {
 
     private var gameMenu: some View {
         Group {
-            if !machine.recentBundledGames.isEmpty {
+            if !machine.recentGames.isEmpty {
                 Text("最近玩过")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                ForEach(machine.recentBundledGames) { game in
-                    Button(game.title) { machine.loadBundledGame(game) }
+                ForEach(machine.recentGames) { game in
+                    Button(game.title) { machine.loadRecentGame(game) }
                 }
                 Divider()
             }

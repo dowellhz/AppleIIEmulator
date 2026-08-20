@@ -3,6 +3,7 @@ BUILD_DIR := .build/arm64-apple-macosx/debug
 RESOURCE_BUNDLE := AppleIIEmulator_AppleIIEmulator.bundle
 CODESIGN_IDENTITY ?= -
 CODESIGN_OPTIONS ?=
+SWIFT_BUILD_ARGS ?=
 
 .PHONY: package-app verify-app-bundle
 
@@ -10,7 +11,7 @@ CODESIGN_OPTIONS ?=
 ## Contents/Resources.  The verification target is deliberately separate so
 ## release automation can assert the distributable layout before notarizing.
 package-app:
-	swift build
+	swift build $(SWIFT_BUILD_ARGS)
 	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
 	cp AppBundle/Info.plist $(APP)/Contents/Info.plist
 	cp AppBundle/AppIcon.icns $(APP)/Contents/Resources/AppIcon.icns

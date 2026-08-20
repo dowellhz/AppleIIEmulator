@@ -25,6 +25,17 @@ final class ACIA6551Tests: XCTestCase {
         XCTAssertEqual(memory.read(0xC0A9) & 0x08, 0)
     }
 
+    func testIIcSerialPortReportsConfiguredHostBaudRate() {
+        let memory = AppleIIMemory()
+        memory.loadROM(Data(repeating: 0, count: 0x8000))
+
+        XCTAssertEqual(memory.serialBaudRate(port: 1), 9_600)
+        memory.write(0xC09B, 0x0D)
+        XCTAssertEqual(memory.serialBaudRate(port: 1), 7_200)
+        memory.write(0xC0AB, 0x0F)
+        XCTAssertEqual(memory.serialBaudRate(port: 2), 19_200)
+    }
+
     func testAppleIIPlusDoesNotExposeIIcACIARegisters() {
         let memory = AppleIIMemory()
         memory.loadROM(Data(repeating: 0, count: 0x3000))
