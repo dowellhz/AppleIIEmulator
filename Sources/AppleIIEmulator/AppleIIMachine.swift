@@ -1414,8 +1414,8 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
 
         var title: String { self == .thirteenSector ? "Disk II 13 扇区" : "Disk II 16 扇区" }
     }
-    private(set) var bytes = [UInt8](repeating: 0, count: 65_536)
-    private var auxiliaryBytes = [UInt8](repeating: 0, count: 65_536)
+    var bytes = [UInt8](repeating: 0, count: 65_536)
+    var auxiliaryBytes = [UInt8](repeating: 0, count: 65_536)
     // A 16 KB Language Card turns a 48 KB Apple II+ into the conventional
     // 64 KB configuration required by ProDOS and tools such as Copy II Plus.
     // $D000-$DFFF has two selectable 4 KB banks; $E000-$FFFF is the shared
@@ -1433,13 +1433,13 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
     private var languageCardBank2Selected = true
     private var languageCardWriteArmed = false
     private var languageCardWriteEnabled = false
-    private var iicROM = [UInt8]()
-    private var iicROMBank = 0
-    private var iieROM = [UInt8]()
-    private var plusSlot6ROM = [UInt8]()
-    private var plusDiskFirmware: DiskIIFirmware?
-    private(set) var model: Model = .appleIIPlus
-    private(set) var supportsMouseText = false
+    var iicROM = [UInt8]()
+    var iicROMBank = 0
+    var iieROM = [UInt8]()
+    var plusSlot6ROM = [UInt8]()
+    var plusDiskFirmware: DiskIIFirmware?
+    var model: Model = .appleIIPlus
+    var supportsMouseText = false
     var modelName: String {
         switch model {
         case .appleIIPlus: return "Apple II+"
@@ -1754,49 +1754,6 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
         }
     }
 
-    func installIIcROM(_ data: Data) throws {
-        guard data.count == 0x4000 || data.count == 0x8000 else { throw CocoaError(.fileReadCorruptFile) }
-        model = .appleIIc
-        supportsMouseText = true
-        let bank = Array(data)
-        iicROM = data.count == 0x4000 ? bank + bank : bank
-        iicROMBank = 0
-        iieROM = []
-    }
-
-    func installIIPlusROM(systemROM: Data, diskROM: Data, diskFirmware: DiskIIFirmware) throws {
-        guard systemROM.count == 0x3000, diskROM.count == 0x100 else { throw CocoaError(.fileReadCorruptFile) }
-        model = .appleIIPlus
-        supportsMouseText = false
-        iicROM = []
-        iicROMBank = 0
-        iieROM = []
-        plusSlot6ROM = Array(diskROM)
-        plusDiskFirmware = diskFirmware
-        bytes = [UInt8](repeating: 0, count: 65_536)
-        auxiliaryBytes = [UInt8](repeating: 0, count: 65_536)
-        clearLanguageCard()
-        bytes.replaceSubrange(0xD000..<0x10000, with: systemROM)
-    }
-
-    /// The IIe keeps a 16 KB motherboard ROM at $C000-$FFFF, with I/O
-    /// overlays in the $C0xx page and the Disk II controller ROM in slot 6.
-    /// Paired 2764 dumps are stored in address order: CD ($C000-$DFFF), then
-    /// EF ($E000-$FFFF). The CF 27128 dump contains that same 16 KB image.
-    func installIIeROM(_ motherboardROM: Data, diskROM: Data, choice: AppleIIMachine.BootROM) throws {
-        guard motherboardROM.count == 0x4000, diskROM.count == 0x100 else { throw CocoaError(.fileReadCorruptFile) }
-        model = .appleIIe
-        supportsMouseText = choice == .appleIIeEnhanced
-        iicROM = []
-        iicROMBank = 0
-        iieROM = Array(motherboardROM)
-        plusSlot6ROM = Array(diskROM)
-        plusDiskFirmware = .sixteenSector
-        bytes = [UInt8](repeating: 0, count: 65_536)
-        auxiliaryBytes = [UInt8](repeating: 0, count: 65_536)
-        clearLanguageCard()
-    }
-
     func resetROMBank() { iicROMBank = 0 }
 
     func resetHardwareState() {
@@ -1910,7 +1867,7 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
         }
     }
 
-    private func clearLanguageCard() {
+    func clearLanguageCard() {
         languageCardBank1 = [UInt8](repeating: 0, count: 0x1000)
         languageCardBank2 = [UInt8](repeating: 0, count: 0x1000)
         languageCardHigh = [UInt8](repeating: 0, count: 0x2000)
