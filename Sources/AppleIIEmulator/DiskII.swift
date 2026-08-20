@@ -331,6 +331,10 @@ final class IWMController {
 
     private func writeBit(_ bit: UInt8) {
         guard hasDisk(in: selectedDrive), !drives[selectedDrive].isWriteProtected else { return }
+        guard let initialSelection = selectedTrack(in: selectedDrive) else { return }
+        if initialSelection.isFlux {
+            guard drives[selectedDrive].materializeFluxTrack(initialSelection.index) else { return }
+        }
         guard let selection = selectedTrack(in: selectedDrive), !selection.isFlux else { return }
         let track = selection.index
         guard drives[selectedDrive].bitTracks.indices.contains(track) else { return }

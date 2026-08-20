@@ -9,7 +9,9 @@ final class ACIA6551Tests: XCTestCase {
         memory.write(0xC09B, 0x0E) // 9600 baud
         memory.write(0xC09A, 0x04) // transmitter enabled
         memory.write(0xC098, 0x41)
-        XCTAssertEqual(memory.read(0xC099) & 0x10, 0)
+        // TDRE reflects the holding register, not the byte currently in the
+        // serial shift register, so a second byte may be queued immediately.
+        XCTAssertEqual(memory.read(0xC099) & 0x10, 0x10)
 
         memory.advanceVideoClock(by: 1_065)
         XCTAssertEqual(memory.read(0xC099) & 0x10, 0x10)
@@ -24,6 +26,39 @@ final class ACIA6551Tests: XCTestCase {
         XCTAssertEqual(memory.read(0xC0A9) & 0x88, 0x88)
         XCTAssertEqual(memory.read(0xC0A8), 0x5A)
         XCTAssertEqual(memory.read(0xC0A9) & 0x08, 0)
+    }
+
+    func testIIcSerialReceiveOverrunIsLatchedUntilDataRead() {
+        let memory = AppleIIMemory()
+        memory.loadROM(Data(repeating: 0, count: 0x8000))
+        memory.receiveSerialByte(0x41, port: 1)
+        memory.receiveSerialByte(0x42, port: 1)
+        XCTAssertEqual(memory.read(0xC099) & 0x0C, 0x0C)
+        XCTAssertEqual(memory.read(0xC098), 0x41)
+        XCTAssertEqual(memory.read(0xC099) & 0x0C, 0)
+    }
+
+    func testIIcSerialQueuesOneFollowingByteBehindTheShiftRegister() {
+        let memory = AppleIIMemory()
+        memory.loadROM(Data(repeating: 0, count: 0x8000))
+        memory.write(0xC09A, 0x04)
+        memory.write(0xC098, 0x41)
+        memory.write(0xC098, 0x42)
+        XCTAssertEqual(memory.read(0xC099) & 0x10, 0)
+        memory.advanceVideoClock(by: 1_065)
+        XCTAssertEqual(memory.drainTransmittedSerialBytes(port: 1), [0x41])
+        XCTAssertEqual(memory.read(0xC099) & 0x10, 0x10)
+        memory.advanceVideoClock(by: 1_065)
+        XCTAssertEqual(memory.drainTransmittedSerialBytes(port: 1), [0x42])
+    }
+
+    func testIIcSerialReceiveFramingAndParityErrorsClearWithDataRead() {
+        let memory = AppleIIMemory()
+        memory.loadROM(Data(repeating: 0, count: 0x8000))
+        memory.receiveSerialByte(0x41, port: 1, framingError: true, parityError: true)
+        XCTAssertEqual(memory.read(0xC099) & 0x03, 0x03)
+        XCTAssertEqual(memory.read(0xC098), 0x41)
+        XCTAssertEqual(memory.read(0xC099) & 0x03, 0)
     }
 
     func testIIcSerialPortReportsConfiguredHostBaudRate() {

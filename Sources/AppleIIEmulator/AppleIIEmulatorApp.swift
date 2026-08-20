@@ -87,6 +87,10 @@ struct AppleIIEmulatorApp: App {
                 Button("推出驱动器 2") { machine.ejectDisk(drive: 1) }
                     .disabled(machine.externalDiskDescription == "未插入")
                 Divider()
+                Button("装入磁带 WAV…") { machine.chooseCassetteImage() }
+                Button("将磁带输出另存为 WAV…") { machine.saveCassetteAsWAV() }
+                Button("弹出磁带") { machine.ejectCassette() }
+                Divider()
                 Button("装入 SmartPort 硬盘映像…") { machine.chooseHardDiskImage() }
                 Button("推出 SmartPort 硬盘") { machine.ejectHardDisk() }
                     .disabled(machine.hardDiskDescription == "未插入")

@@ -519,7 +519,10 @@ final class AppleIIMachine: ObservableObject {
             lock.lock()
             cpu.run(cycles: cycles)
             if warmStart { cpu.reset() }
-            speaker.advance(toEmulatedCycle: cpu.totalCycles)
+            speaker.advance(
+                toEmulatedCycle: cpu.totalCycles,
+                auxiliarySamples: memory.renderMockingboardAudio(toEmulatedCycle: cpu.totalCycles)
+            )
             let serialPort1Bytes = memory.drainTransmittedSerialBytes(port: 1)
             let serialPort2Bytes = memory.drainTransmittedSerialBytes(port: 2)
             let serialPort1Baud = memory.serialBaudRate(port: 1)
@@ -582,7 +585,10 @@ final class AppleIIMachine: ObservableObject {
     func runForVerification(cycles: Int) {
         let snapshot = withEmulationLock {
             cpu.run(cycles: cycles)
-            speaker.advance(toEmulatedCycle: cpu.totalCycles)
+            speaker.advance(
+                toEmulatedCycle: cpu.totalCycles,
+                auxiliarySamples: memory.renderMockingboardAudio(toEmulatedCycle: cpu.totalCycles)
+            )
             return memory.makeVideoSnapshot()
         }
         videoSnapshot = snapshot
@@ -1302,6 +1308,55 @@ final class AppleIIMachine: ObservableObject {
         }
     }
 
+    func chooseCassetteImage() {
+        let panel = NSOpenPanel()
+        panel.title = "装入 Apple II 磁带"
+        panel.message = "支持 PCM WAV 磁带录音；读取后会按 Apple II 的 6502 周期驱动磁带输入"
+        panel.allowedContentTypes = [UTType(filenameExtension: "wav")!]
+        panel.canChooseDirectories = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        status = "正在读取磁带…"
+        Task { [weak self] in
+            let result = await Task.detached(priority: .userInitiated) {
+                Result { (url, try Data(contentsOf: url)) }
+            }.value
+            guard let self else { return }
+            do {
+                let (source, data) = try result.get()
+                try self.withEmulationLock {
+                    try self.memory.mountCassetteImageData(data, fileExtension: source.pathExtension)
+                }
+                self.status = "已装入磁带 · \(source.lastPathComponent)"
+            } catch {
+                self.status = "无法装入磁带：仅支持 PCM WAV"
+            }
+        }
+    }
+
+    func ejectCassette() {
+        withEmulationLock { memory.ejectCassette() }
+        status = "磁带已弹出"
+    }
+
+    func saveCassetteAsWAV() {
+        let pulses = withEmulationLock { memory.drainCassetteOutputPulseDurations() }
+        guard !pulses.isEmpty else {
+            status = "尚无可导出的磁带输出"
+            return
+        }
+        let panel = NSSavePanel()
+        panel.title = "将磁带输出另存为 WAV"
+        panel.nameFieldStringValue = "AppleII-Cassette.wav"
+        panel.allowedContentTypes = [UTType(filenameExtension: "wav")!]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try AppleIICassetteCodec.encodeWAV(pulseDurations: pulses).write(to: url, options: .atomic)
+            status = "已导出磁带 WAV · \(url.lastPathComponent)"
+        } catch {
+            status = "无法导出磁带 WAV"
+        }
+    }
+
     /// Inserts a replacement disk without disturbing the emulated CPU. This
     /// is the programmatic half of the live media controls, and keeps disk
     /// swaps testable without an AppKit file picker.
@@ -1521,6 +1576,7 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
     // Slot 7 is a separate block device. It must never share the Disk II
     // controller, whose GCR timing and 140 KB media geometry are unrelated.
     private let smartPortController = SmartPortController()
+    private let mockingboardController = MockingboardController()
     private var serialPort1 = ACIA6551()
     private var serialPort2 = ACIA6551()
     private var mouseController = AppleIIMouseInterface()
@@ -1529,7 +1585,9 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
     var speakerDidToggleAtCycle: ((Int) -> Void)?
     private var speakerCycle = 0
     private var cassetteInput = false
+    private var cassetteTransport = AppleIICassetteInput()
     private var cassetteOutput = false
+    private var cassetteOutputEdges = [Int]()
     private var annunciators = [false, false, false, false]
     var cassetteOutputDidToggleAtCycle: ((Int, Bool) -> Void)?
     // NTSC Apple II timing: 65 CPU cycles × 262 scan lines per frame.  The
@@ -1573,7 +1631,9 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
     }
     private static let cyclesPerLine = 65
     private static let linesPerFrame = 262
-    var irqPending: Bool { serialPort1.irqPending || serialPort2.irqPending || mouseController.irqPending }
+    var irqPending: Bool {
+        serialPort1.irqPending || serialPort2.irqPending || mouseController.irqPending || mockingboardController.irqPending
+    }
 
     func read(_ address: UInt16) -> UInt8 {
         let a = Int(address)
@@ -1607,7 +1667,7 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
         case 0xC018: return status(store80)
         case 0xC019: return model == .appleIIc ? status(iiCVBLFlag) : status(!verticalBlank)
         case 0xC020: toggleCassetteOutput(); return 0
-        case 0xC060: return status(cassetteInput)
+        case 0xC060: return status(cassetteTransport.isMounted ? cassetteTransport.level : cassetteInput)
         case 0xC061: return status(openAppleDown)
         case 0xC062: return status(closedAppleDown)
         case 0xC063: return 0
@@ -1635,6 +1695,8 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
             return serialPort2.read(register: a - 0xC0A8)
         case 0xC0C0...0xC0C3 where model == .appleIIc:
             return mouseController.read(register: a - 0xC0C0)
+        case 0xC0C0...0xC0DF where model != .appleIIc:
+            return mockingboardController.access(a, write: nil, atCycle: speakerCycle)
         case 0xC0E0...0xC0EF:
             return accessIWM(a, write: nil)
         case 0xC0F0...0xC0FF:
@@ -1720,6 +1782,8 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
         case 0xC098...0xC09B where model == .appleIIc: serialPort1.write(value, register: a - 0xC098)
         case 0xC0A8...0xC0AB where model == .appleIIc: serialPort2.write(value, register: a - 0xC0A8)
         case 0xC0C0...0xC0C3 where model == .appleIIc: mouseController.write(value, register: a - 0xC0C0)
+        case 0xC0C0...0xC0DF where model != .appleIIc:
+            _ = mockingboardController.access(a, write: value, atCycle: speakerCycle)
         case 0xC0E0...0xC0EF: _ = accessIWM(a, write: value)
         case 0xC0F0...0xC0FF: _ = smartPortController.access(a, write: value, bus: self)
         case 0xC030: toggleSpeaker()
@@ -1834,11 +1898,14 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
         languageCardWriteEnabled = false
         diskController.reset()
         smartPortController.reset()
+        mockingboardController.reset()
         serialPort1.reset()
         serialPort2.reset()
         mouseController.reset()
         cassetteInput = false
+        cassetteTransport.eject()
         cassetteOutput = false
+        cassetteOutputEdges.removeAll(keepingCapacity: true)
         annunciators = [false, false, false, false]
         videoClock = 0
         iiCVBLFlag = false
@@ -1980,8 +2047,10 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
         // paddles preserves the timing expected by boot loaders.
         diskController.advance(by: cycles)
         smartPortController.advance(by: cycles)
+        mockingboardController.advance(by: cycles)
         serialPort1.advance(by: cycles)
         serialPort2.advance(by: cycles)
+        cassetteTransport.advance(by: cycles)
         if model == .appleIIc, iicVBLEnabled, oldLine < 192, (newLine >= 192 || newLine < oldLine) {
             iiCVBLFlag = true
         }
@@ -2012,6 +2081,18 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
     }
 
     func setCassetteInput(_ high: Bool) { cassetteInput = high }
+    func mountCassettePulseDurations(_ durations: [Int], initialLevel: Bool = false) {
+        cassetteTransport.mount(pulseDurations: durations, initialLevel: initialLevel)
+    }
+    func mountCassetteImageData(_ data: Data, fileExtension: String) throws {
+        guard fileExtension.lowercased() == "wav" else { throw CocoaError(.fileReadUnsupportedScheme) }
+        mountCassettePulseDurations(try AppleIICassetteCodec.decodeWAV(data))
+    }
+    func ejectCassette() { cassetteTransport.eject() }
+    func drainCassetteOutputPulseDurations() -> [Int] {
+        defer { cassetteOutputEdges.removeAll(keepingCapacity: true) }
+        return zip(cassetteOutputEdges.dropFirst(), cassetteOutputEdges).map { later, earlier in later - earlier }.filter { $0 > 0 }
+    }
     func annunciatorEnabled(_ index: Int) -> Bool {
         annunciators.indices.contains(index) && annunciators[index]
     }
@@ -2062,9 +2143,9 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
 
     /// Host adapters can feed and drain this boundary without touching the
     /// 6502 bus. It also keeps serial tests focused on the real ACIA registers.
-    func receiveSerialByte(_ byte: UInt8, port: Int) {
-        if port == 1 { serialPort1.receive(byte) }
-        else if port == 2 { serialPort2.receive(byte) }
+    func receiveSerialByte(_ byte: UInt8, port: Int, framingError: Bool = false, parityError: Bool = false) {
+        if port == 1 { serialPort1.receive(byte, framingError: framingError, parityError: parityError) }
+        else if port == 2 { serialPort2.receive(byte, framingError: framingError, parityError: parityError) }
     }
 
     func drainTransmittedSerialBytes(port: Int) -> [UInt8] {
@@ -2079,6 +2160,14 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
         return 9_600
     }
 
+    func renderMockingboardAudio(toEmulatedCycle cycle: Int) -> [Float] {
+        mockingboardController.renderAudio(toEmulatedCycle: cycle)
+    }
+
+    func mockingboardRegisterValue(chip: Int, register: Int) -> UInt8? {
+        mockingboardController.registerValue(chip: chip, register: register)
+    }
+
     /// The IIc's integrated IWM occupies slot-zero I/O ($C080-$C08F). This
     /// models its control latch and data path; the sector stream is attached
     /// to this same state machine by the disk-image layer.
@@ -2088,6 +2177,7 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
 
     private func toggleCassetteOutput() {
         cassetteOutput.toggle()
+        cassetteOutputEdges.append(speakerCycle)
         cassetteOutputDidToggleAtCycle?(speakerCycle, cassetteOutput)
     }
 

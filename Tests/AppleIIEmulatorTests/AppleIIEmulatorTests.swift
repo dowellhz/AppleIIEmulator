@@ -146,6 +146,30 @@ final class AppleIIEmulatorTests: XCTestCase {
         XCTAssertEqual(memory.read(0xC060), 0x80)
     }
 
+    func testCassettePulseStreamUsesEmulatedCycles() {
+        let memory = AppleIIMemory()
+        memory.mountCassettePulseDurations([3, 5])
+        XCTAssertEqual(memory.read(0xC060), 0)
+        memory.advanceVideoClock(by: 2)
+        XCTAssertEqual(memory.read(0xC060), 0)
+        memory.advanceVideoClock(by: 1)
+        XCTAssertEqual(memory.read(0xC060), 0x80)
+        memory.advanceVideoClock(by: 5)
+        XCTAssertEqual(memory.read(0xC060), 0)
+        memory.ejectCassette()
+        memory.setCassetteInput(true)
+        XCTAssertEqual(memory.read(0xC060), 0x80)
+    }
+
+    func testCassetteWAVDecoderProducesCyclePulses() throws {
+        var wav = [UInt8]("RIFF".utf8) + [0, 0, 0, 0] + Array("WAVE".utf8)
+        wav += Array("fmt ".utf8) + [16, 0, 0, 0, 1, 0, 1, 0, 0x40, 0x1F, 0, 0, 0x40, 0x1F, 0, 0, 1, 0, 8, 0]
+        wav += Array("data".utf8) + [6, 0, 0, 0] + [0, 0, 255, 255, 0, 0]
+        let size = wav.count - 8
+        for byte in 0..<4 { wav[4 + byte] = UInt8((size >> (byte * 8)) & 0xFF) }
+        XCTAssertEqual(try AppleIICassetteCodec.decodeWAV(Data(wav)), [255])
+    }
+
     func testAppleIIPlusAnnunciatorsUseStandardSoftSwitchPairs() {
         let memory = AppleIIMemory()
         _ = memory.read(0xC059) // ANN0 on

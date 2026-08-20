@@ -26,10 +26,10 @@ struct AppleIISpeakerWaveform {
     /// Convert every whole output sample ending at or before `cycle`.
     mutating func render(toEmulatedCycle cycle: Int) -> [Float] {
         guard cycle > 0 else { return [] }
-        if renderCycle == nil {
-            guard let first = edgeCycles.first else { return [] }
-            renderCycle = Double(first)
-        }
+        // Keep a continuous emulated sample clock even while the one-bit
+        // speaker is idle: expansion cards such as Mockingboard share this
+        // producer path and must not depend on an unrelated C030 edge.
+        if renderCycle == nil { renderCycle = 0 }
         guard var start = renderCycle else { return [] }
         let target = Double(cycle)
         var produced = [Float]()
@@ -141,8 +141,16 @@ final class AppleIISpeaker: @unchecked Sendable {
     }
 
     /// Convert all fully elapsed Apple II cycles to PCM after each CPU slice.
-    func advance(toEmulatedCycle cycle: Int) {
-        enqueue(waveform.render(toEmulatedCycle: cycle))
+    func advance(toEmulatedCycle cycle: Int, auxiliarySamples: [Float] = []) {
+        var samples = waveform.render(toEmulatedCycle: cycle)
+        guard !samples.isEmpty else { return }
+        // Expansion-card samples have already been synthesized against the
+        // same 6502-cycle clock on the emulation thread. Mixing here keeps
+        // Core Audio's real-time callback free of emulator state and locks.
+        for index in 0..<min(samples.count, auxiliarySamples.count) {
+            samples[index] += auxiliarySamples[index]
+        }
+        enqueue(samples)
     }
 
     private func enqueue(_ produced: [Float]) {

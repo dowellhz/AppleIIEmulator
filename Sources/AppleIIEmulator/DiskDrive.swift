@@ -157,6 +157,56 @@ struct DiskDrive {
         return 1
     }
 
+    /// A flux capture has no intrinsic writable bit cells.  Before the IWM
+    /// changes one, recover a complete revolution into a BITS track and move
+    /// each FLUX-mapped quarter track onto that new surface.  This is a
+    /// deliberate one-way conversion: a later WOZ export retains untouched
+    /// FLUX tracks but writes the altered track as conventional BITS data.
+    mutating func materializeFluxTrack(_ track: Int) -> Bool {
+        guard fluxTracks.indices.contains(track), let stream = fluxTracks[track], !stream.bytes.isEmpty else {
+            return false
+        }
+        let cellTicks = max(16, stream.optimalBitTiming)
+        var sourcePosition = 0
+        var cells = [UInt8]()
+        repeat {
+            var ticks = 0
+            repeat {
+                let byte = stream.bytes[sourcePosition]
+                sourcePosition = (sourcePosition + 1) % stream.bytes.count
+                ticks += Int(byte)
+                if byte != 0xFF { break }
+            } while true
+            let cellCount = max(1, Int((Double(ticks) / Double(cellTicks)).rounded()))
+            cells.append(contentsOf: repeatElement(0, count: cellCount - 1))
+            cells.append(1)
+        } while sourcePosition != 0
+        guard !cells.isEmpty else { return false }
+
+        var bytes = [UInt8](repeating: 0, count: (cells.count + 7) / 8)
+        for (position, bit) in cells.enumerated() where bit != 0 {
+            bytes[position / 8] |= UInt8(1) << UInt8(7 - (position & 7))
+        }
+        bitTracks[track] = DiskBitTrack(
+            bytes: bytes,
+            bitCount: cells.count,
+            nibbleBitOffsets: Array(repeating: -1, count: cells.count)
+        )
+        fluxTracks[track] = nil
+        for quarterTrack in fluxQuarterTrackMap.indices where fluxQuarterTrackMap[quarterTrack] == track {
+            fluxQuarterTrackMap[quarterTrack] = -1
+            if quarterTrackMap.indices.contains(quarterTrack), quarterTrackMap[quarterTrack] < 0 {
+                quarterTrackMap[quarterTrack] = track
+            }
+        }
+        fluxBytePosition = 0
+        fluxTicksUntilTransition = 0
+        fluxCellTicks = cellTicks
+        bitPosition = 0
+        surfaceModified = true
+        return true
+    }
+
     private mutating func nextFluxInterval(from stream: DiskFluxTrack) -> Int {
         var ticks = 0
         repeat {
