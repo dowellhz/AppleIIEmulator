@@ -1,4 +1,5 @@
 import XCTest
+import Darwin
 @testable import AppleIIEmulator
 
 final class ACIA6551Tests: XCTestCase {
@@ -59,5 +60,54 @@ final class ACIA6551Tests: XCTestCase {
         memory.receiveSerialByte(0x42, port: 2)
         cpu.run(cycles: 2)
         XCTAssertEqual(cpu.pc, 0x0900)
+    }
+
+    func testMacSerialBridgeTransfersBytesThroughAPseudoTerminal() throws {
+        var master: Int32 = -1
+        var slave: Int32 = -1
+        XCTAssertEqual(openpty(&master, &slave, nil, nil, nil), 0)
+        defer {
+            if master >= 0 { Darwin.close(master) }
+            if slave >= 0 { Darwin.close(slave) }
+        }
+        guard let deviceName = ttyname(slave) else {
+            return XCTFail("openpty did not provide a slave device name")
+        }
+        let path = String(cString: deviceName)
+        let bridge = MacSerialBridge()
+        let connected = expectation(description: "bridge connected")
+        let inbound = expectation(description: "host bytes reached bridge")
+        inbound.expectedFulfillmentCount = 2
+        let outbound = expectation(description: "bridge bytes reached host")
+
+        bridge.didChangeConnection = { port, connectedPath in
+            if port == 1, connectedPath == path { connected.fulfill() }
+        }
+        bridge.didReceiveByte = { byte, port in
+            if port == 1, [0x41, 0x42].contains(byte) { inbound.fulfill() }
+        }
+
+        let hostRead = DispatchSource.makeReadSource(fileDescriptor: master, queue: .global())
+        hostRead.setEventHandler {
+            var bytes = [UInt8](repeating: 0, count: 16)
+            let count = bytes.withUnsafeMutableBytes { Darwin.read(master, $0.baseAddress, $0.count) }
+            if count > 0, Array(bytes.prefix(Int(count))).contains(0x5A) {
+                outbound.fulfill()
+            }
+        }
+        hostRead.resume()
+        defer { hostRead.cancel() }
+
+        bridge.connect(path: path, port: 1, baudRate: 9_600)
+        wait(for: [connected], timeout: 2)
+
+        let hostBytes: [UInt8] = [0x41, 0x42]
+        let written = hostBytes.withUnsafeBytes { Darwin.write(master, $0.baseAddress, $0.count) }
+        XCTAssertEqual(written, hostBytes.count)
+        wait(for: [inbound], timeout: 2)
+
+        bridge.send([0x5A], port: 1)
+        wait(for: [outbound], timeout: 2)
+        bridge.disconnect(port: 1)
     }
 }

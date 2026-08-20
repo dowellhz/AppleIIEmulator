@@ -13,7 +13,7 @@ struct DiskIIDebugSnapshot {
 
 /// Slot 6 / IIc integrated IWM drive. It accepts 140 KB DOS-order
 /// `.dsk/.do`, ProDOS-order `.po`, pre-nibblized 35-track `.nib`, common 2IMG
-/// (`.2mg/.2img`) wrappers, and read-only WOZ 1.x/2.x bitstreams, exposing the
+/// (`.2mg/.2img`) wrappers, and WOZ 1.x/2.x bitstreams, exposing the
 /// same GCR byte stream that the original controller delivers to firmware.
 /// IWM/P6 soft-switch state machine. Media container decoding is delegated to
 /// `DiskImageCodec`; callers may keep using the historical `DiskII` alias.
@@ -184,16 +184,13 @@ final class IWMController {
                 Self.bitTrack(nibbles: stream, sync: stream.map { $0 == 0xFF }, trailingZeros: 2)
             }
             drives[drive].install(tracks: tracks, bitTracks: bitTracks, thirteenSector: false, writeProtected: writeProtected)
-        case let .woz(bitTracks, quarterTrackMap, thirteenSector, emulatesWeakBits):
+        case let .woz(bitTracks, quarterTrackMap, thirteenSector, emulatesWeakBits, writeProtected):
             guard drives.indices.contains(drive), quarterTrackMap.count == 160 else {
                 throw CocoaError(.fileReadCorruptFile)
             }
-            // Do not claim write persistence when no WOZ writer exists.  The
-            // sense line therefore reports protected even for source images
-            // whose INFO chunk did not set the archival write-protect flag.
             drives[drive].install(
                 tracks: [], bitTracks: bitTracks, quarterTrackMap: quarterTrackMap,
-                thirteenSector: thirteenSector, writeProtected: true,
+                thirteenSector: thirteenSector, writeProtected: writeProtected,
                 emulatesWeakBits: emulatesWeakBits
             )
         }
@@ -593,6 +590,19 @@ final class IWMController {
     func nibImage(drive: Int = 0) -> Data? {
         guard drives.indices.contains(drive), drives[drive].tracks.count == 35, drives[drive].tracks.allSatisfy({ $0.count == 6_656 }) else { return nil }
         return Data(drives[drive].tracks.flatMap { $0 })
+    }
+
+    /// Exports the magnetic surface, including quarter-track aliases, as a
+    /// checksummed WOZ 2 container.  The UI always performs an explicit
+    /// Save As action; mounting a disk never changes its original file.
+    func wozImage(drive: Int = 0) -> Data? {
+        guard drives.indices.contains(drive), drives[drive].quarterTrackMap.count == 160 else { return nil }
+        return try? DiskImageCodec.encodeWOZ2(
+            tracks: drives[drive].bitTracks,
+            quarterTrackMap: drives[drive].quarterTrackMap,
+            thirteenSector: drives[drive].isThirteenSector,
+            writeProtected: drives[drive].isWriteProtected
+        )
     }
 
 

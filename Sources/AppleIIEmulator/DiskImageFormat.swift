@@ -31,7 +31,10 @@ enum DiskImagePayload {
     case thirteenSector(Data, writeProtected: Bool)
     case prodos(Data, writeProtected: Bool)
     case nib(Data, writeProtected: Bool)
-    case woz(tracks: [DiskBitTrack], quarterTrackMap: [Int], thirteenSector: Bool, emulatesWeakBits: Bool)
+    case woz(
+        tracks: [DiskBitTrack], quarterTrackMap: [Int], thirteenSector: Bool,
+        emulatesWeakBits: Bool, writeProtected: Bool
+    )
 }
 
 enum DiskImageCodec {
@@ -44,6 +47,85 @@ enum DiskImageCodec {
         case .twoIMG: return try decodeTwoIMG(data)
         case .woz: return try decodeWOZ(data)
         }
+    }
+
+    /// Writes a self-contained WOZ 2 bitstream container.  Export always
+    /// emits the canonical INFO/TMAP/TRKS core and recalculates its CRC; it
+    /// deliberately does not copy opaque source chunks, whose semantics can
+    /// depend on a capture device rather than on the emulated disk surface.
+    static func encodeWOZ2(
+        tracks: [DiskBitTrack],
+        quarterTrackMap: [Int],
+        thirteenSector: Bool,
+        writeProtected: Bool
+    ) throws -> Data {
+        guard quarterTrackMap.count == 160,
+              tracks.count <= 160,
+              quarterTrackMap.allSatisfy({ $0 == -1 || tracks.indices.contains($0) }) else {
+            throw CocoaError(.fileWriteInapplicableStringEncoding)
+        }
+
+        var info = [UInt8](repeating: 0, count: 60)
+        info[0] = 3 // WOZ INFO v3 carries the 5.25-inch timing fields below.
+        info[1] = 1 // 5.25-inch disk
+        info[2] = writeProtected ? 1 : 0
+        info[3] = 1 // bitstream was synchronized by the controller
+        info[38] = thirteenSector ? 2 : 1
+        info[39] = 32 // 4 µs nominal bit cell in 125 ns units
+
+        var trackChunk = [UInt8](repeating: 0, count: 160 * 8)
+        var bitData = [UInt8]()
+        var nextBlock = 3
+        var largestTrackBlocks = 0
+        for (index, track) in tracks.enumerated() {
+            guard track.bitCount >= 0, track.bitCount <= track.bytes.count * 8 else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+            guard track.bitCount > 0 else { continue }
+            let byteCount = (track.bitCount + 7) / 8
+            let blockCount = (byteCount + 511) / 512
+            guard nextBlock + blockCount <= Int(UInt16.max) else {
+                throw CocoaError(.fileWriteOutOfSpace)
+            }
+            let entry = index * 8
+            trackChunk[entry] = UInt8(nextBlock & 0xFF)
+            trackChunk[entry + 1] = UInt8((nextBlock >> 8) & 0xFF)
+            trackChunk[entry + 2] = UInt8(blockCount & 0xFF)
+            trackChunk[entry + 3] = UInt8((blockCount >> 8) & 0xFF)
+            for byte in 0..<4 {
+                trackChunk[entry + 4 + byte] = UInt8((track.bitCount >> (byte * 8)) & 0xFF)
+            }
+            bitData += track.bytes.prefix(byteCount)
+            bitData += repeatElement(0, count: blockCount * 512 - byteCount)
+            nextBlock += blockCount
+            largestTrackBlocks = max(largestTrackBlocks, blockCount)
+        }
+        info[44] = UInt8(min(largestTrackBlocks, 255))
+        info[45] = UInt8(min(largestTrackBlocks >> 8, 255))
+
+        func chunk(_ identifier: String, _ payload: [UInt8]) -> [UInt8] {
+            let length = payload.count
+            return Array(identifier.utf8) + (0..<4).map { UInt8((length >> ($0 * 8)) & 0xFF) } + payload
+        }
+        let map = quarterTrackMap.map { $0 < 0 ? UInt8(0xFF) : UInt8($0) }
+        var bytes = Array("WOZ2".utf8) + [0xFF, 0x0A, 0x0D, 0x0A] + [0, 0, 0, 0]
+        bytes += chunk("INFO", info)
+        bytes += chunk("TMAP", map)
+        bytes += chunk("TRKS", trackChunk + bitData)
+        let checksum = crc32(bytes[12...])
+        for byte in 0..<4 { bytes[8 + byte] = UInt8((checksum >> (byte * 8)) & 0xFF) }
+        return Data(bytes)
+    }
+
+    private static func crc32(_ bytes: ArraySlice<UInt8>) -> UInt32 {
+        var value: UInt32 = 0xFFFF_FFFF
+        for byte in bytes {
+            value ^= UInt32(byte)
+            for _ in 0..<8 {
+                value = value & 1 == 0 ? value >> 1 : (value >> 1) ^ 0xEDB8_8320
+            }
+        }
+        return ~value
     }
 
     private static func decodeTwoIMG(_ data: Data) throws -> DiskImagePayload {
@@ -75,10 +157,7 @@ enum DiskImageCodec {
         }
     }
 
-    /// Decodes WOZ 1.x and 2.x 5¼-inch bitstream layouts.  The controller can read
-    /// arbitrary-length tracks, but this loader deliberately mounts WOZ
-    /// media read-only: preserving a WOZ container requires its WRIT/CRC
-    /// metadata, which is not yet an export format in this app.
+    /// Decodes WOZ 1.x and 2.x 5¼-inch bitstream layouts.
     private static func decodeWOZ(_ data: Data) throws -> DiskImagePayload {
         let bytes = Array(data)
         let signature = bytes.count >= 4 ? Array(bytes[0..<4]) : []
@@ -94,7 +173,15 @@ enum DiskImageCodec {
         }
         func little32(_ offset: Int) -> Int {
             Int(bytes[offset]) | Int(bytes[offset + 1]) << 8 |
-                Int(bytes[offset + 2]) << 16 | Int(bytes[offset + 3]) << 24
+            Int(bytes[offset + 2]) << 16 | Int(bytes[offset + 3]) << 24
+        }
+
+        // Older hand-built test fixtures sometimes leave this field zero;
+        // accept those as an explicitly unchecked legacy image, but reject a
+        // present checksum that does not describe the complete container.
+        let declaredCRC = UInt32(little32(8))
+        guard declaredCRC == 0 || declaredCRC == crc32(bytes[12...]) else {
+            throw CocoaError(.fileReadCorruptFile)
         }
 
         var chunks = [String: Range<Int>]()
@@ -184,7 +271,8 @@ enum DiskImageCodec {
         let emulatesWeakBits = bytes[infoRange.lowerBound + 4] != 0
         return .woz(
             tracks: bitTracks, quarterTrackMap: quarterTrackMap,
-            thirteenSector: thirteenSector, emulatesWeakBits: emulatesWeakBits
+            thirteenSector: thirteenSector, emulatesWeakBits: emulatesWeakBits,
+            writeProtected: bytes[infoRange.lowerBound + 2] != 0
         )
     }
 }

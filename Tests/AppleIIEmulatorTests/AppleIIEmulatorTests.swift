@@ -826,7 +826,7 @@ final class AppleIIEmulatorTests: XCTestCase {
     @MainActor
     func testEveryVisibleROMChoiceChangesTheRunningMachine() {
         let machine = AppleIIMachine()
-        for rom in AppleIIMachine.BootROM.allCases {
+        for rom in AppleIIMachine.BootROM.menuChoices {
             machine.selectROM(rom)
             XCTAssertEqual(machine.selectedBootROM, rom)
             XCTAssertTrue(machine.isRunning)

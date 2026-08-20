@@ -388,7 +388,7 @@ final class AppleIIMachine: ObservableObject {
         }
     }
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard, startsRuntimeTimer: Bool? = nil) {
         recentGameStore = RecentGameStore(defaults: defaults)
         recentGames = recentGameStore.restore()
         recentGameStore.save(recentGames)
@@ -470,8 +470,10 @@ final class AppleIIMachine: ObservableObject {
                 application.activate(ignoringOtherApps: true)
             }
         }
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.tick() }
+        if startsRuntimeTimer ?? !Self.isAutomatedRun {
+            timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.tick() }
+            }
         }
     }
 
@@ -760,6 +762,19 @@ final class AppleIIMachine: ObservableObject {
         }
     }
 
+    /// The app must never wait for resource I/O on its main actor.  The
+    /// headless verifier is different: it needs a completed machine state at
+    /// each assertion boundary, and it has no run-loop turn in which an
+    /// asynchronous load can publish itself.  Keep that deterministic seam
+    /// here instead of making production media loading synchronous again.
+    private func submitEmulationTask(_ operation: @escaping @Sendable () -> Void) {
+        if Self.isAutomatedRun {
+            emulationQueue.sync(execute: operation)
+        } else {
+            emulationQueue.async(execute: operation)
+        }
+    }
+
     func selectROM(_ choice: BootROM) {
         guard choice != .external else { return }
         selectedBootROM = choice
@@ -774,11 +789,10 @@ final class AppleIIMachine: ObservableObject {
         }
         status = "正在装入 \(choice.title) ROM…"
 
-        let queue = emulationQueue
         let lock = emulationLock
         let memory = memory
         let cpu = cpu!
-        queue.async { [weak self] in
+        submitEmulationTask { [weak self] in
             var lockHeld = false
             do {
                 // Bundle reads happen on the execution queue, before the
@@ -883,12 +897,23 @@ final class AppleIIMachine: ObservableObject {
     func loadBundledGame(_ game: BundledGame) {
         wizardryScenarioDiskData = nil
         wizardryScenarioPromptHandled = false
+        if Self.isAutomatedRun {
+            // These are requested-media facts, not results inferred from the
+            // disk bus.  Publish them before the synchronous verifier task so
+            // test callers retain the historical immediate API contract.
+            selectedBootROM = game.bootROM
+            hasExternalROM = true
+            activeMediaKind = .game
+            diskDescription = game.title
+            externalDiskDescription = game.startupDisks.count > 1
+                ? game.startupDisks[1].description
+                : "未插入"
+        }
         status = "正在读取内置游戏：\(game.title)…"
-        let queue = emulationQueue
         let lock = emulationLock
         let memory = memory
         let cpu = cpu!
-        queue.async { [weak self] in
+        submitEmulationTask { [weak self] in
             var lockHeld = false
             do {
                 let startupMedia = try game.startupDisks.enumerated().map { index, disk in
@@ -1008,12 +1033,20 @@ final class AppleIIMachine: ObservableObject {
 
     func loadBundledSoftware(_ software: BundledSoftware) {
         wordPerfectWorkDiskURL = nil
+        if Self.isAutomatedRun {
+            selectedBootROM = software.bootROM
+            hasExternalROM = true
+            activeMediaKind = .software
+            diskDescription = software.startupDisks[0].description
+            externalDiskDescription = software.startupDisks.count > 1
+                ? software.startupDisks[1].description
+                : "未插入"
+        }
         status = "正在读取内置软件：\(software.title)…"
-        let queue = emulationQueue
         let lock = emulationLock
         let memory = memory
         let cpu = cpu!
-        queue.async { [weak self] in
+        submitEmulationTask { [weak self] in
             var lockHeld = false
             do {
                 let startupMedia = try software.startupDisks.enumerated().map { drive, disk in
@@ -1356,6 +1389,25 @@ final class AppleIIMachine: ObservableObject {
         }
     }
 
+    func saveDiskAsWOZ(drive: Int = 0) {
+        guard let data = withEmulationLock({ memory.wozImage(drive: drive) }) else {
+            status = "驱动器 \(drive + 1) 的磁盘无法导出为 .woz"
+            return
+        }
+        let panel = NSSavePanel()
+        panel.title = "保存 Apple II WOZ 磁盘映像"
+        panel.nameFieldStringValue = "AppleII-Drive\(drive + 1).woz"
+        panel.allowedContentTypes = [.init(filenameExtension: "woz")!]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try data.write(to: url, options: .atomic)
+            setDiskDescription(url.lastPathComponent, drive: drive)
+            status = "已保存驱动器 \(drive + 1)：\(url.lastPathComponent)"
+        } catch {
+            status = "无法保存 \(url.lastPathComponent)"
+        }
+    }
+
     private func setDiskDescription(_ description: String, drive: Int) {
         if drive == 0 { diskDescription = description }
         else { externalDiskDescription = description }
@@ -1369,12 +1421,16 @@ final class AppleIIMachine: ObservableObject {
         }
     }
 
-    nonisolated private static func wordPerfectWorkDiskStorageURL() throws -> URL {
-        let isRunningTests = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+    nonisolated private static var isAutomatedRun: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
             || Bundle.allBundles.contains { $0.bundleURL.pathExtension == "xctest" }
             || CommandLine.arguments.contains { argument in
                 argument.hasPrefix("--verify-") || argument.hasPrefix("--trace-")
             }
+    }
+
+    nonisolated private static func wordPerfectWorkDiskStorageURL() throws -> URL {
+        let isRunningTests = isAutomatedRun
         let base: URL
         if isRunningTests {
             base = FileManager.default.temporaryDirectory
@@ -1984,6 +2040,7 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
         }
     }
     func nibImage(drive: Int = 0) -> Data? { diskController.nibImage(drive: drive) }
+    func wozImage(drive: Int = 0) -> Data? { diskController.wozImage(drive: drive) }
     func ejectDisk(drive: Int = 0) { diskController.eject(drive: drive) }
     var hasDisk: Bool { diskController.hasDisk }
     func hasDisk(in drive: Int) -> Bool { diskController.hasDisk(in: drive) }
