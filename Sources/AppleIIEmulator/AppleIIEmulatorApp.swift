@@ -82,6 +82,10 @@ struct AppleIIEmulatorApp: App {
                     .disabled(machine.diskDescription == "未插入")
                 Button("推出驱动器 2") { machine.ejectDisk(drive: 1) }
                     .disabled(machine.externalDiskDescription == "未插入")
+                Divider()
+                Button("装入 SmartPort 硬盘映像…") { machine.chooseHardDiskImage() }
+                Button("推出 SmartPort 硬盘") { machine.ejectHardDisk() }
+                    .disabled(machine.hardDiskDescription == "未插入")
             }
             CommandMenu("游戏") {
                 if !machine.recentGames.isEmpty {
