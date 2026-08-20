@@ -221,6 +221,44 @@ final class IWMControllerTests: XCTestCase {
         XCTAssertGreaterThan(restored.nibbleReads, 0)
     }
 
+    func testWOZ21FluxMapDrivesIWMAndRoundTrips() throws {
+        let disk = IWMController()
+        try disk.mountImage(woz21FluxImage(), fileExtension: "woz")
+        XCTAssertTrue(disk.hasDisk)
+
+        _ = disk.access(0x09, write: nil) // motor on
+        _ = disk.access(0x0C, write: nil) // Q6L: read data
+        disk.advance(by: 128)
+        XCTAssertGreaterThan(disk.fluxBitReads, 0)
+        XCTAssertGreaterThan(disk.nibbleReads, 0)
+
+        let saved = try XCTUnwrap(disk.wozImage())
+        let restored = IWMController()
+        try restored.mountImage(saved, fileExtension: "woz")
+        _ = restored.access(0x09, write: nil)
+        _ = restored.access(0x0C, write: nil)
+        restored.advance(by: 128)
+        XCTAssertGreaterThan(restored.fluxBitReads, 0)
+    }
+
+    func testWOZSaveAsRetainsExtensionsUntilSurfaceChanges() throws {
+        let disk = IWMController()
+        try disk.mountImage(woz2Image(writeProtected: false, includeExtensions: true), fileExtension: "woz")
+        let untouched = try XCTUnwrap(disk.wozImage())
+        XCTAssertNotNil(untouched.range(of: Data("META".utf8)))
+        XCTAssertNotNil(untouched.range(of: Data("WRIT".utf8)))
+
+        _ = disk.access(0x09, write: nil) // motor on
+        _ = disk.access(0x0F, write: nil) // Q7H: write mode
+        _ = disk.access(0x0D, write: 0xA5)
+        disk.advance(by: 64)
+        XCTAssertGreaterThan(disk.nibbleWrites, 0)
+
+        let modified = try XCTUnwrap(disk.wozImage())
+        XCTAssertNotNil(modified.range(of: Data("META".utf8)))
+        XCTAssertNil(modified.range(of: Data("WRIT".utf8)), "WRIT checksums describe the old BITS surface")
+    }
+
     func testCleanedWOZGeneratesWeakBits() throws {
         let disk = IWMController()
         try disk.mountImage(woz2Image(cleaned: true, blankTrack: true), fileExtension: "woz")
@@ -233,7 +271,8 @@ final class IWMControllerTests: XCTestCase {
     private func woz2Image(
         cleaned: Bool = false,
         blankTrack: Bool = false,
-        writeProtected: Bool = true
+        writeProtected: Bool = true,
+        includeExtensions: Bool = false
     ) -> Data {
         var image = [UInt8]("WOZ2".utf8) + [0xFF, 0x0A, 0x0D, 0x0A] + [0, 0, 0, 0]
         func appendChunk(_ identifier: String, _ payload: [UInt8]) {
@@ -261,6 +300,39 @@ final class IWMControllerTests: XCTestCase {
         tracks[1_280] = blankTrack ? 0x00 : 0xAA
         tracks[1_281] = blankTrack ? 0x00 : 0x55
         appendChunk("TRKS", tracks)
+        if includeExtensions {
+            appendChunk("META", Array("title\tFixture\n".utf8))
+            appendChunk("WRIT", [0x01, 0x00, 0x00, 0x00])
+        }
+        return Data(image)
+    }
+
+    private func woz21FluxImage() -> Data {
+        var image = [UInt8]("WOZ2".utf8) + [0xFF, 0x0A, 0x0D, 0x0A] + [0, 0, 0, 0]
+        func appendChunk(_ identifier: String, _ payload: [UInt8]) {
+            image += Array(identifier.utf8)
+            image += (0..<4).map { UInt8((payload.count >> ($0 * 8)) & 0xFF) }
+            image += payload
+        }
+        var info = [UInt8](repeating: 0, count: 60)
+        info[0] = 3 // WOZ 2.1
+        info[1] = 1 // 5.25-inch
+        info[39] = 32 // 4 µs nominal bit cell
+        info[46] = 4 // FLUX chunk begins at byte 4 * 512
+        info[48] = 1 // largest flux track is one block
+        appendChunk("INFO", info)
+
+        appendChunk("TMAP", [UInt8](repeating: 0xFF, count: 160))
+        var tracks = [UInt8](repeating: 0, count: 160 * 8 + 512)
+        tracks[0] = 3 // first TRKS payload block
+        tracks[2] = 1
+        tracks[4] = 4 // flux byte count (not a BITS bit count)
+        tracks[1_280..<1_284] = [32, 64, 32, 96]
+        appendChunk("TRKS", tracks)
+
+        var fluxMap = [UInt8](repeating: 0xFF, count: 160)
+        fluxMap[0] = 0
+        appendChunk("FLUX", fluxMap)
         return Data(image)
     }
 

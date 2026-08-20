@@ -79,12 +79,18 @@ final class ACIA6551Tests: XCTestCase {
         let inbound = expectation(description: "host bytes reached bridge")
         inbound.expectedFulfillmentCount = 2
         let outbound = expectation(description: "bridge bytes reached host")
+        let disconnected = expectation(description: "bridge drops disconnected device")
+        let failure = expectation(description: "bridge reports disconnected device")
 
         bridge.didChangeConnection = { port, connectedPath in
             if port == 1, connectedPath == path { connected.fulfill() }
+            if port == 1, connectedPath == nil { disconnected.fulfill() }
         }
         bridge.didReceiveByte = { byte, port in
             if port == 1, [0x41, 0x42].contains(byte) { inbound.fulfill() }
+        }
+        bridge.didFail = { port, _ in
+            if port == 1 { failure.fulfill() }
         }
 
         let hostRead = DispatchSource.makeReadSource(fileDescriptor: master, queue: .global())
@@ -108,6 +114,9 @@ final class ACIA6551Tests: XCTestCase {
 
         bridge.send([0x5A], port: 1)
         wait(for: [outbound], timeout: 2)
-        bridge.disconnect(port: 1)
+
+        Darwin.close(master)
+        master = -1
+        wait(for: [disconnected, failure], timeout: 2)
     }
 }

@@ -14,8 +14,8 @@ Apple II Emulator 是一个为 macOS 打造的原生 Apple II 系列模拟器。
 - IIc 主/辅助 RAM、80STORE、ALTZP、80 列、双高分辨率和 ROM 银行切换；
 - 键盘锁存器、扬声器软开关、40/80 列文字、Lo-Res、Hi-Res、Double Hi-Res 画面；
 - 应用内置 Apple IIc ROM 00、03、04、FF，以及仅用于输入排查的诊断 ROM；
-- 集成双驱动器 IWM/Disk II，支持 DOS 顺序 `.dsk/.do`、13 扇区 `.d13`、ProDOS 顺序 `.po`、`.nib` 与 5¼ 英寸 `.2mg/.2img` 映像；`.2mg/.2img` 与 WOZ `INFO` 的写保护标记会传递到 IWM 写保护感测；WOZ 1.x/2.x 保留 quarter-track 映射并提供弱位近似，且可显式另存为带 CRC 的 WOZ 2 映像；
-- IIc 内置双 6551 ACIA：端口 1（打印机，`$C098-$C09B`）和端口 2（调制解调器，`$C0A8-$C0AB`）具备寄存器、收发状态与 CPU 周期发送时序，并可从“串口”菜单连接到用户选择的 macOS `/dev/cu.*` 设备；
+- 集成双驱动器 IWM/Disk II，支持 DOS 顺序 `.dsk/.do`、13 扇区 `.d13`、ProDOS 顺序 `.po`、`.nib` 与 5¼ 英寸 `.2mg/.2img` 映像；`.2mg/.2img` 与 WOZ `INFO` 的写保护标记会传递到 IWM 写保护感测；WOZ 1.x/2.1 保留 quarter-track 映射，支持 BITS 与 FLUX 轨道读取、弱位近似和带 CRC 的 WOZ 2 导出；
+- IIc 内置双 6551 ACIA：端口 1（打印机，`$C098-$C09B`）和端口 2（调制解调器，`$C0A8-$C0AB`）具备寄存器、收发状态与 CPU 周期发送时序，并可从“串口”菜单连接到用户选择的 macOS `/dev/cu.*` 设备；设备拔出或主机 I/O 失败时会关闭失效连接，供随后重新连接；
 - IIc 内置鼠标接口：slot 4 的 6821 PIA（`$C0C0-$C0C3`）握手协议、位置/按键、夹紧范围与移动/VBL 中断；显示区域的鼠标移动会馈入该硬件；
 - 主板磁带输入/输出（`$C060` / `$C020`）与 Apple II+ 四路 annunciator（`$C058-$C05F`）软开关；
 - 内置游戏库按标题首字母分组，并提供 Apple Writer、WordPerfect、VisiCalc、Copy II Plus 与 Apple Pascal 等独立“软件”启动项；
@@ -32,7 +32,7 @@ swift run
 
 若要构建带图标的本地 App，请运行 `make package-app`，然后打开 `build/AppleIIEmulator.app`。首次启动默认使用内置 Apple II+ Autostart ROM，显示经典 `APPLE ][` 开机画面；默认不插入磁盘。通过“游戏”菜单选择游戏会自动装入驱动器 1 并重新启动。测试启动盘仅保留在“磁盘”菜单中，用于验证 ROM、IWM、GCR 解码和 `$0801` 引导链。点一下屏幕即可输入；若要验证键盘回显，可在“ROM”菜单选择“内置诊断 ROM”。
 
-第三方 `.dsk` / `.do`（DOS 顺序）、`.d13`（13 扇区）、`.po`（ProDOS 顺序）、`.nib`、5¼ 英寸 `.2mg/.2img` 或 WOZ 1.x/2.x 位流映像可通过“磁盘”菜单独立装入驱动器 1 或 2；之后按 Command-R 重置即可由该 ROM 启动。SmartPort 硬盘是独立的 slot 7 设备，可从“磁盘”菜单装入 512 字节块的 `.po/.hdv/.img/.2mg/.2img` 映像。WOZ 会遵从其 `INFO` 写保护位；对可写映像，IWM 写入保留在当前磁表面中。“磁盘 → 将驱动器 N 另存为 .woz…”会导出带 CRC、保留有效 bit track 与 quarter-track 映射的 WOZ 2 文件，且始终要求选择新路径，不会改写原始镜像；`.nib` 导出仍适用于标准 35 磁道 NIB 流。请只使用你有权使用的磁盘映像。
+第三方 `.dsk` / `.do`（DOS 顺序）、`.d13`（13 扇区）、`.po`（ProDOS 顺序）、`.nib`、5¼ 英寸 `.2mg/.2img` 或 WOZ 1.x/2.1 位流映像可通过“磁盘”菜单独立装入驱动器 1 或 2；之后按 Command-R 重置即可由该 ROM 启动。SmartPort 硬盘是独立的 slot 7 设备，可从“磁盘”菜单装入 512 字节块的 `.po/.hdv/.img/.2mg/.2img` 映像。WOZ 会遵从其 `INFO` 写保护位；对可写 BITS 映像，IWM 写入保留在当前磁表面中。WOZ 2.1 的 FLUX 间隔以 125 ns tick 读取，并由驱动器上的数字锁相环恢复为控制器位单元；FLUX 源映像目前按只读磁表面处理。“磁盘 → 将驱动器 N 另存为 .woz…”会导出带 CRC、保留有效 BITS/FLUX 轨道与 quarter-track 映射的 WOZ 2 文件，且始终要求选择新路径，不会改写原始镜像；未修改磁表面时会保留 `META`、`WRIT` 和兼容的非磁表面扩展块，修改后会丢弃描述旧 BITS 校验的 `WRIT`。`.nib` 导出仍适用于标准 35 磁道 NIB 流。请只使用你有权使用的磁盘映像。
 
 随 App 发布的游戏映像位于 `Sources/AppleIIEmulator/Resources/Games/`，构建时会打包进应用资源。可在窗口的 `GAME` 菜单或菜单栏“游戏”中选择“已下载游戏”，再按首字母选择游戏；它会装入驱动器 1，并以 Apple IIe 游戏兼容模式启动。发布后的 App 只枚举自身资源包，不依赖工作区的 `Downloads` 目录；“从已下载游戏库打开…”仍保留，供选择后来新增但尚未打包的本地映像。“最近玩过”会同时记录内置游戏和用户装入的一到两张启动磁盘，按最近顺序保留 8 项并去重；若磁盘文件后来移动或删除，重新打开该项时会自动移除失效记录。
 
@@ -40,4 +40,4 @@ swift run
 
 ## 下一阶段
 
-当前版本以启动和执行为目标。Apple IIc 的两个 6551 ACIA 可从“串口”菜单连接到用户选择的 macOS `/dev/cu.*` 设备；主机 I/O 在独立队列上运行，收发字节仍经 ACIA 寄存器和 6502 周期时序进入模拟器，并以 macOS PTY 端到端回归覆盖主机收发。标准 macOS termios 未提供 3600-baud 档，选择该 ACIA 档位时会明确报错，不会以错误速率通信。WOZ 的 BITS 轨道可读写并导出为新的 WOZ 2 容器；原始 `META`/`WRIT` 等非磁表面扩展块不会被复制到导出文件，`FLUX` 轨道以及更完整的 MC3470 读放大/锁相模拟仍待实现。因此它不是逐周期、全外设覆盖的 Apple IIc 保真模拟器。
+当前版本以启动和执行为目标。Apple IIc 的两个 6551 ACIA 可从“串口”菜单连接到用户选择的 macOS `/dev/cu.*` 设备；主机 I/O 在独立队列上运行，收发字节仍经 ACIA 寄存器和 6502 周期时序进入模拟器，并以 macOS PTY 端到端回归覆盖主机收发、设备 EOF/错误断开与重连安全。标准 macOS termios 未提供 3600-baud 档，选择该 ACIA 档位时会明确报错，不会以错误速率通信。清理过的 WOZ 弱区按 MC3470 的四位延迟窗口处理，并在连续零单元后生成确定性的假脉冲；FLUX 使用以磁道为单位的数字锁相恢复。仍未覆盖逐元件模拟的模拟读放大器、FLUX 写入/重新量化，以及接入真实外置串口硬件的人工兼容性验证。因此它不是逐周期、全外设覆盖的 Apple IIc 保真模拟器。

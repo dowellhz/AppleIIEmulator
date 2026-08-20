@@ -103,7 +103,7 @@ final class MacSerialBridge: @unchecked Sendable {
                     } else if written < 0, errno == EINTR {
                         continue
                     } else {
-                        self.didFail?(port, self.posixError())
+                        self.connectionFailed(port: port, error: self.posixError())
                         return
                     }
                 }
@@ -118,7 +118,19 @@ final class MacSerialBridge: @unchecked Sendable {
         if notify { didChangeConnection?(port, nil) }
     }
 
+    /// An unplugged USB adapter commonly appears as EOF or EIO.  Drop the
+    /// stale descriptor before reporting it so a later menu selection can
+    /// reconnect cleanly instead of writing into a dead connection.
+    private func connectionFailed(port: Int, error: Error) {
+        disconnectLocked(port: port, notify: true)
+        didFail?(port, error)
+    }
+
     private func readAvailable(from descriptor: Int32, port: Int) {
+        // A cancelled source may already have an event queued when a user
+        // reconnects the same ACIA port. Never let that old descriptor tear
+        // down the replacement connection.
+        guard connections[port]?.descriptor == descriptor else { return }
         var buffer = [UInt8](repeating: 0, count: 1_024)
         while true {
             let count = buffer.withUnsafeMutableBytes { rawBuffer in
@@ -127,13 +139,17 @@ final class MacSerialBridge: @unchecked Sendable {
             if count > 0 {
                 for byte in buffer.prefix(Int(count)) { didReceiveByte?(byte, port) }
             } else if count == 0 {
+                connectionFailed(
+                    port: port,
+                    error: NSError(domain: NSPOSIXErrorDomain, code: Int(ENXIO))
+                )
                 return
             } else if errno == EINTR {
                 continue
             } else if errno == EAGAIN || errno == EWOULDBLOCK {
                 return
             } else {
-                didFail?(port, posixError())
+                connectionFailed(port: port, error: posixError())
                 return
             }
         }
