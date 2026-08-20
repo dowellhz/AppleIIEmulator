@@ -19,7 +19,21 @@ enum AppleIITextCell: Equatable {
     case ascii(UInt8)
 }
 
-func appleIITextCell(byte: UInt8, alternateCharset: Bool, flashOn: Bool, supportsMouseText: Bool = true) -> AppleIITextCell {
+func appleIITextCell(
+    byte: UInt8,
+    alternateCharset: Bool,
+    flashOn: Bool,
+    supportsMouseText: Bool = true,
+    usesSevenBitASCII: Bool = false
+) -> AppleIITextCell {
+    // The IIe and IIc firmware use normal high-bit 7-bit ASCII even in
+    // 40-column mode (for example, the IIe power-on banner stores `p` as
+    // $F0). The original II/II+ instead treats the low six bits as its glyph
+    // number, so retain that path for its software and character ROM.
+    if usesSevenBitASCII, byte & 0x80 != 0 {
+        let ascii = byte & 0x7F
+        if ascii >= 0x20, ascii <= 0x7E { return .ascii(ascii) }
+    }
     let glyph = byte & 0x3F
     switch byte & 0xC0 {
     case 0x00:
@@ -95,6 +109,8 @@ final class AppleIIMachine: ObservableObject {
         case princeOfPersia
         case wizardry
         case karateka
+        case falcons
+        case jBird
 
         var id: Self { self }
 
@@ -102,6 +118,22 @@ final class AppleIIMachine: ObservableObject {
             let resourceName: String
             let resourceExtension: String
             let description: String
+            /// The physical write-protect notch is part of the disk's
+            /// observable hardware state. Some original games verify it
+            /// before continuing past their title sequence.
+            let writeProtected: Bool
+
+            init(
+                resourceName: String,
+                resourceExtension: String,
+                description: String,
+                writeProtected: Bool = false
+            ) {
+                self.resourceName = resourceName
+                self.resourceExtension = resourceExtension
+                self.description = description
+                self.writeProtected = writeProtected
+            }
         }
 
         var title: String {
@@ -110,7 +142,26 @@ final class AppleIIMachine: ObservableObject {
             case .princeOfPersia: return "Prince of Persia (1989)"
             case .wizardry: return "Wizardry (1981)"
             case .karateka: return "Karateka (1984)"
+            case .falcons: return "Falcons"
+            case .jBird: return "J-Bird"
             }
+        }
+
+        /// The default GAME menu is deliberately limited to games that boot
+        /// and play from one disk. Multi-disk titles remain loadable by code
+        /// and from their files, but do not make a fresh installation stop at
+        /// a media-change prompt.
+        var appearsInDefaultGameMenu: Bool {
+            switch self {
+            case .princeOfPersia, .wizardry: return false
+            case .lodeRunner, .karateka, .falcons, .jBird: return true
+            }
+        }
+
+        static var defaultGameMenu: [Self] {
+            allCases
+                .filter(\.appearsInDefaultGameMenu)
+                .sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
         }
 
         /// The two Disk II drives are real physical drives. Multi-disk games
@@ -132,17 +183,26 @@ final class AppleIIMachine: ObservableObject {
                 ]
             case .wizardry:
                 return [
+                    // The bundled v2.1 image is a sector-level release that
+                    // starts with its companion disk in Drive 2. The original
+                    // Scenario Master is the later, explicit Drive 1 change.
+                    // All three images are writable DSK media.
                     .init(resourceName: "Wizardry (1981) Disk 1", resourceExtension: "dsk", description: "Wizardry 磁盘 1"),
-                    .init(resourceName: "Wizardry (1981) Disk 2", resourceExtension: "dsk", description: "Wizardry 磁盘 2")
+                    .init(resourceName: "Wizardry (1981) Disk 2", resourceExtension: "dsk", description: "Wizardry 磁盘 2"),
+                    .init(resourceName: "Wizardry (1981) Original Scenario", resourceExtension: "dsk", description: "Wizardry 原始 Scenario 盘")
                 ]
             case .karateka:
                 return [.init(resourceName: "Karateka (1984)", resourceExtension: "dsk", description: title)]
+            case .falcons:
+                return [.init(resourceName: "Falcons (4am crack)", resourceExtension: "dsk", description: title)]
+            case .jBird:
+                return [.init(resourceName: "j-bird", resourceExtension: "dsk", description: title)]
             }
         }
 
         var diskFirmware: AppleIIMemory.DiskIIFirmware {
             switch self {
-            case .lodeRunner, .princeOfPersia, .wizardry, .karateka: return .sixteenSector
+            case .lodeRunner, .princeOfPersia, .wizardry, .karateka, .falcons, .jBird: return .sixteenSector
             }
         }
 
@@ -153,10 +213,10 @@ final class AppleIIMachine: ObservableObject {
             switch self {
             case .wizardry:
                 // The original Wizardry 1.1 boot chain is an Apple II+
-                // Pascal loader.  Use the machine it was authored for: the
-                // second disk remains mounted in Drive 2 and is not a ROM.
+                // Pascal loader. Use the machine it was authored for; its
+                // Scenario disk is a later physical replacement, not a ROM.
                 return .appleIIPlus
-            case .lodeRunner, .princeOfPersia, .karateka:
+            case .lodeRunner, .princeOfPersia, .karateka, .falcons, .jBird:
                 return .appleIIeGameCompatible
             }
         }
@@ -251,6 +311,19 @@ final class AppleIIMachine: ObservableObject {
     @Published private(set) var hasExternalROM = false
     @Published private(set) var status = "Apple II+（内置） · 未插入磁盘"
     @Published private(set) var refreshToken = 0
+    /// The most recently presented CPU position. This is published alongside
+    /// the video frame, so runtime integration probes can observe progress
+    /// without synchronously querying the emulation queue from the UI.
+    @Published private(set) var presentedCPUCycles = 0
+    @Published private(set) var presentedProgramCounter: UInt16 = 0
+    @Published private(set) var presentedDiskState = DiskIIDebugSnapshot(
+        motorOn: false,
+        selectedDrive: 0,
+        q6: false,
+        q7: false,
+        tracks: [0, 0],
+        readBits: [0, 0]
+    )
     @Published private(set) var videoSnapshot = AppleIIVideoSnapshot.blank
     @Published private(set) var selectedBootROM: BootROM = .appleIIPlus
     @Published private(set) var externalROMName: String?
@@ -260,6 +333,11 @@ final class AppleIIMachine: ObservableObject {
     /// Drives the physical GAME/SOFTWARE LEDs in the panel without making a
     /// UI choice alter the emulated hardware state.
     @Published private(set) var activeMediaKind: ActiveMediaKind = .none
+    /// The two most recently launched built-in games are surfaced at the top
+    /// of both GAME menus. Store stable enum values, never absolute resource
+    /// paths, so the shortcuts survive an app update without reaching into a
+    /// workspace-only Downloads directory.
+    @Published private(set) var recentBundledGames: [BundledGame] = []
 
     private let gameLibrary = GameLibrary()
     /// Grouping keeps the in-app GAME menu navigable even with a large game
@@ -290,17 +368,21 @@ final class AppleIIMachine: ObservableObject {
     private var lastEmulationTick = ProcessInfo.processInfo.systemUptime
     private var fractionalCPUCycles = 0.0
     private var inputState = AppleIIInputState()
-    /// Wizardry boots from one disk and later needs a physical replacement
-    /// in Drive 1. Its bundled launch workflow performs that same live media
-    /// change only when the original game asks for the Scenario disk.
-    private var wizardryScenarioSwapPending = false
+    /// Wizardry's boot disk finishes by explicitly asking for its Scenario
+    /// Master in Drive 1.  Keep the already-loaded image here so responding
+    /// to that *game-visible* prompt never performs host file I/O on the UI
+    /// thread.
+    private var wizardryScenarioDiskData: Data?
+    private var wizardryScenarioPromptHandled = false
     /// A diskless Apple II+ reaches ROM Applesoft through the Autostart ROM's
     /// warm-reset path after it has shown the power-on banner.
     private var applesoftWarmStartDeadline: TimeInterval?
+    private static let recentBundledGamesDefaultsKey = "AppleIIEmulator.recentBundledGames"
 
     var currentROMTitle: String { externalROMName ?? selectedBootROM.title }
 
     init() {
+        recentBundledGames = Self.restoredRecentBundledGames()
         memory.speakerDidToggleAtCycle = { [weak speaker] cycle in
             speaker?.toggle(atEmulatedCycle: cycle)
         }
@@ -401,6 +483,9 @@ final class AppleIIMachine: ObservableObject {
             cpu.run(cycles: cycles)
             if warmStart { cpu.reset() }
             speaker.advance(toEmulatedCycle: cpu.totalCycles)
+            let totalCycles = cpu.totalCycles
+            let programCounter = cpu.pc
+            let diskState = memory.diskDebugSnapshot
             let snapshot = memory.makeVideoSnapshot()
             lock.unlock()
             DispatchQueue.main.async { [weak self] in
@@ -412,30 +497,13 @@ final class AppleIIMachine: ObservableObject {
                     self.status = "Apple II+（内置） · Applesoft BASIC"
                 }
                 self.videoSnapshot = snapshot
+                self.presentedCPUCycles = totalCycles
+                self.presentedProgramCounter = programCounter
+                self.presentedDiskState = diskState
+                self.advanceWizardryScenarioPromptIfNeeded(snapshot)
                 self.refreshToken &+= 1
-                self.swapWizardryScenarioWhenPrompted(snapshot)
             }
         }
-    }
-
-    private func swapWizardryScenarioWhenPrompted(_ snapshot: AppleIIVideoSnapshot) {
-        guard wizardryScenarioSwapPending,
-              snapshot.textMode,
-              wizardryScenarioPromptIsVisible(in: snapshot) else { return }
-        wizardryScenarioSwapPending = false
-        // Hold the CPU only while the host reads and inserts the replacement.
-        // The media action itself remains a normal Disk II swap and does not
-        // reset the Apple II or alter any emulated RAM.
-        isRunning = false
-        swapWizardryScenarioIntoDriveOne()
-    }
-
-    private func wizardryScenarioPromptIsVisible(in snapshot: AppleIIVideoSnapshot) -> Bool {
-        let screen = String(snapshot.text.map { byte in
-            let code = byte & 0x7F
-            return code >= 0x20 && code < 0x7F ? Character(UnicodeScalar(code)) : " "
-        })
-        return screen.contains("SCENARIO MASTER IN DRV 1")
     }
 
     private func withEmulationLock<T>(_ body: () throws -> T) rethrows -> T {
@@ -455,7 +523,52 @@ final class AppleIIMachine: ObservableObject {
             return memory.makeVideoSnapshot()
         }
         videoSnapshot = snapshot
+        advanceWizardryScenarioPromptIfNeeded(snapshot)
         refreshToken &+= 1
+    }
+
+    /// This is intentionally driven by Wizardry's actual text-mode media
+    /// request, rather than an elapsed-time guess.  The action below is still
+    /// a normal Disk II media change and a keyboard strobe; no CPU or disk
+    /// controller state is skipped.
+    private func advanceWizardryScenarioPromptIfNeeded(_ snapshot: AppleIIVideoSnapshot) {
+        guard !wizardryScenarioPromptHandled,
+              case .game = activeMediaKind,
+              diskDescription == BundledGame.wizardry.title,
+              let scenarioData = wizardryScenarioDiskData,
+              wizardryScenarioPromptIsVisible(in: snapshot) else {
+            return
+        }
+
+        wizardryScenarioPromptHandled = true
+        do {
+            try installWizardryScenarioDisk(scenarioData, pressReturn: true)
+            status = "Wizardry · 已将 Scenario 盘移入驱动器 1 并按 Return"
+        } catch {
+            wizardryScenarioPromptHandled = false
+            status = "无法换入 Wizardry Scenario 磁盘"
+        }
+    }
+
+    private func wizardryScenarioPromptIsVisible(in snapshot: AppleIIVideoSnapshot) -> Bool {
+        let visibleText = String(snapshot.text.map { byte in
+            let ascii = byte & 0x7F
+            return ascii >= 0x20 && ascii < 0x7F ? Character(UnicodeScalar(ascii)) : " "
+        })
+        return visibleText.contains("SCENARIO MASTER IN DRV 1")
+    }
+
+    /// Move the physical Scenario Master from Drive 2 to Drive 1.  Leaving
+    /// Drive 2 empty mirrors the instruction shown by the original game,
+    /// rather than silently keeping two copies mounted.
+    private func installWizardryScenarioDisk(_ data: Data, pressReturn: Bool) throws {
+        try withEmulationLock {
+            try memory.mountDSK(data, drive: 0)
+            memory.ejectDisk(drive: 1)
+            if pressReturn { memory.latchKey(0x8D) }
+        }
+        setDiskDescription("Wizardry Scenario 磁盘", drive: 0)
+        setDiskDescription("未插入", drive: 1)
     }
 
     var encounteredUnsupportedCPUOpcodes: Set<UInt8> { withEmulationLock { cpu.unsupportedOpcodes } }
@@ -478,15 +591,23 @@ final class AppleIIMachine: ObservableObject {
     func reset() {
         applesoftWarmStartDeadline = nil
         executionGeneration &+= 1
-        let snapshot = withEmulationLock {
-            memory.resetHardwareState()
+        // The front-panel RESET is a system restart, not a pause/resume or a
+        // UI-level program jump. Disk II keeps its media inserted, while RAM
+        // is returned to its cold-start state so the Apple II+ ROM cannot
+        // interpret a reset as an Applesoft warm start and skip Drive 1.
+        let (snapshot, bootsDriveOne) = withEmulationLock {
+            let bootsDriveOne = memory.hasDisk(in: 0)
+            memory.coldBootSystemState()
             cpu.reset()
-            return memory.makeVideoSnapshot()
+            return (memory.makeVideoSnapshot(), bootsDriveOne)
         }
         isRunning = true
         fractionalCPUCycles = 0
         lastEmulationTick = ProcessInfo.processInfo.systemUptime
         videoSnapshot = snapshot
+        if bootsDriveOne {
+            status = "\(currentROMTitle) · 正在从驱动器 1 启动：\(diskDescription)"
+        }
         refreshToken &+= 1
     }
 
@@ -555,11 +676,25 @@ final class AppleIIMachine: ObservableObject {
         applyInput { $0.setButtons(openApple: openApple, closedApple: closedApple) }
     }
 
-    /// Host input is queued at the next CPU boundary synchronously, so a
-    /// physical key cannot be overtaken by another timer slice. The critical
-    /// section is limited to one already-bounded emulation slice.
-    private func applyInput(_ operation: (AppleIIMemory) -> Void) {
-        withEmulationLock { operation(memory) }
+    /// Host input is immediate while no CPU slice is in flight, which keeps
+    /// paused machines and input tests responsive. During a CPU slice it is
+    /// queued after that slice instead: the main actor must never wait behind
+    /// a disk-heavy loader merely to update a paddle or keyboard latch.
+    private func applyInput(_ operation: @escaping @Sendable (AppleIIMemory) -> Void) {
+        if !cpuSliceQueued, emulationLock.try() {
+            operation(memory)
+            emulationLock.unlock()
+            return
+        }
+
+        let queue = emulationQueue
+        let lock = emulationLock
+        let memory = memory
+        queue.async {
+            lock.lock()
+            operation(memory)
+            lock.unlock()
+        }
     }
 
     func selectROM(_ choice: BootROM) {
@@ -660,8 +795,9 @@ final class AppleIIMachine: ObservableObject {
     }
 
     func loadBundledGame(_ game: BundledGame) {
+        wizardryScenarioDiskData = nil
+        wizardryScenarioPromptHandled = false
         do {
-            wizardryScenarioSwapPending = game == .wizardry
             let startupMedia = try game.startupDisks.enumerated().map { index, disk in
                 guard let url = AppResources.bundle.url(
                     forResource: disk.resourceName,
@@ -688,11 +824,16 @@ final class AppleIIMachine: ObservableObject {
                 memory.ejectDisk(drive: 1)
                 for (drive, disk, data) in startupMedia.prefix(2) {
                     if game.diskFirmware == .thirteenSector {
-                        try memory.mountThirteenSectorDisk(data, drive: drive)
+                        try memory.mountThirteenSectorDisk(data, drive: drive, writeProtected: disk.writeProtected)
                     } else if ["dsk", "do"].contains(disk.resourceExtension.lowercased()) {
-                        try memory.mountDSK(data, drive: drive)
+                        try memory.mountDSK(data, drive: drive, writeProtected: disk.writeProtected)
                     } else {
-                        try memory.mountDiskImageData(data, fileExtension: disk.resourceExtension, drive: drive)
+                        try memory.mountDiskImageData(
+                            data,
+                            fileExtension: disk.resourceExtension,
+                            drive: drive,
+                            writeProtected: disk.writeProtected
+                        )
                     }
                 }
             }
@@ -700,15 +841,31 @@ final class AppleIIMachine: ObservableObject {
             activeMediaKind = .game
             diskDescription = game.title
             externalDiskDescription = startupMedia.count > 1 ? startupMedia[1].disk.description : "未插入"
+            if game == .wizardry {
+                // Only the first two physical drives exist at startup. Keep
+                // the third, original Scenario Master ready for the game's
+                // explicit "SCENARIO MASTER IN DRV 1" request.
+                wizardryScenarioDiskData = startupMedia.dropFirst(2).first?.data
+            }
             let extraDiskNotice = startupMedia.count > 2 ? " · 已装入前两张盘" : ""
-            let wizardrySwapNotice = game == .wizardry
-                ? " · 出现换盘提示时将自动换入 Scenario 盘"
-                : ""
-            status = "\(game.bootROM.title) · \(game.diskFirmware.title) · \(game.title)\(extraDiskNotice)\(wizardrySwapNotice)"
+            status = "\(game.bootROM.title) · \(game.diskFirmware.title) · \(game.title)\(extraDiskNotice)"
             reset()
+            recordRecentBundledGame(game)
         } catch {
             status = "无法装入内置游戏：\(game.title)"
         }
+    }
+
+    private static func restoredRecentBundledGames() -> [BundledGame] {
+        let rawValues = UserDefaults.standard.stringArray(forKey: recentBundledGamesDefaultsKey) ?? []
+        return Array(rawValues.compactMap(BundledGame.init(rawValue:)).prefix(2))
+    }
+
+    private func recordRecentBundledGame(_ game: BundledGame) {
+        recentBundledGames.removeAll { $0 == game }
+        recentBundledGames.insert(game, at: 0)
+        recentBundledGames = Array(recentBundledGames.prefix(2))
+        UserDefaults.standard.set(recentBundledGames.map(\.rawValue), forKey: Self.recentBundledGamesDefaultsKey)
     }
 
     var canSwapWizardryScenarioIntoDriveOne: Bool {
@@ -721,31 +878,15 @@ final class AppleIIMachine: ObservableObject {
     /// action—no reset and no CPU shortcut—using the bundled Scenario image.
     func swapWizardryScenarioIntoDriveOne() {
         guard canSwapWizardryScenarioIntoDriveOne,
-              let url = AppResources.bundle.url(forResource: "Wizardry (1981) Disk 2", withExtension: "dsk") else {
+              let scenarioData = wizardryScenarioDiskData else {
             return
         }
-        status = "Wizardry · 正在将 Scenario 盘换入驱动器 1…"
-        Task { [weak self] in
-            let result = await Task.detached { Result { try Data(contentsOf: url) } }.value
-            guard let self else { return }
-            switch result {
-            case let .success(data):
-                do {
-                    try self.replaceDiskImageData(
-                        data,
-                        fileExtension: "dsk",
-                        description: "Wizardry Scenario 磁盘",
-                        drive: 0
-                    )
-                    self.isRunning = true
-                    self.fractionalCPUCycles = 0
-                    self.lastEmulationTick = ProcessInfo.processInfo.systemUptime
-                } catch {
-                    self.status = "无法换入 Wizardry Scenario 磁盘"
-                }
-            case .failure:
-                self.status = "无法读取 Wizardry Scenario 磁盘"
-            }
+        do {
+            try installWizardryScenarioDisk(scenarioData, pressReturn: false)
+            wizardryScenarioPromptHandled = true
+            status = "Wizardry · 已将 Scenario 盘移入驱动器 1"
+        } catch {
+            status = "无法换入 Wizardry Scenario 磁盘"
         }
     }
 
@@ -1087,6 +1228,9 @@ final class AppleIIMachine: ObservableObject {
     private static func wordPerfectWorkDiskStorageURL() throws -> URL {
         let isRunningTests = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
             || Bundle.allBundles.contains { $0.bundleURL.pathExtension == "xctest" }
+            || CommandLine.arguments.contains { argument in
+                argument.hasPrefix("--verify-") || argument.hasPrefix("--trace-")
+            }
         let base: URL
         if isRunningTests {
             base = FileManager.default.temporaryDirectory
@@ -1204,6 +1348,7 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
             textMode: textMode, mixedMode: mixedMode, hires: hires,
             doubleHires: doubleHires, column80: column80,
             alternateCharset: alternateCharset, supportsMouseText: supportsMouseText,
+            usesSevenBitASCII: model != .appleIIPlus,
             textByte: { [weak self] column, row in self?.textByte(column: column, row: row) ?? 0 },
             loresByte: { [weak self] column, row in self?.loresByte(column: column, row: row) ?? 0 },
             hgrByte: { [weak self] column, row, auxiliary in self?.hgrByte(column: column, row: row, auxiliary: auxiliary) ?? 0 }
@@ -1219,6 +1364,7 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
             column80: column80,
             alternateCharset: alternateCharset,
             supportsMouseText: supportsMouseText,
+            usesSevenBitASCII: model != .appleIIPlus,
             text: (0..<24).flatMap { row in (0..<80).map { textByte(column: $0, row: row) } },
             lores: (0..<24).flatMap { row in (0..<40).map { loresByte(column: $0, row: row) } },
             hgrMain: (0..<192).flatMap { row in (0..<40).map { hgrByte(column: $0, row: row) } },
@@ -1577,6 +1723,17 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
         paddleElapsedCycles = 0
     }
 
+    /// Reset the volatile machine state for a user-requested system restart
+    /// while preserving removable media. This differs from a 6502-only RESET:
+    /// the Apple II+ ROM checks RAM to decide whether to enter Applesoft on a
+    /// warm reset, so clearing RAM is necessary to restart the boot disk.
+    func coldBootSystemState() {
+        bytes.replaceSubrange(0..<0xC000, with: repeatElement(0, count: 0xC000))
+        auxiliaryBytes.replaceSubrange(0..<0xC000, with: repeatElement(0, count: 0xC000))
+        clearLanguageCard()
+        resetHardwareState()
+    }
+
     private func useAuxiliaryRead(for address: Int) -> Bool {
         guard (model == .appleIIc || model == .appleIIe), address < 0xC000 else { return false }
         // RAMRD/RAMWRT cover $0200-$BFFF only.  The zero page and stack
@@ -1735,10 +1892,29 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
         annunciators.indices.contains(index) && annunciators[index]
     }
 
-    func mountDSK(_ data: Data, drive: Int = 0) throws { try diskController.mountDSK(data, drive: drive) }
-    func mountThirteenSectorDisk(_ data: Data, drive: Int = 0) throws { try diskController.mountThirteenSectorImage(data, drive: drive) }
+    func mountDSK(_ data: Data, drive: Int = 0, writeProtected: Bool = false) throws {
+        try diskController.mountDSK(data, drive: drive, writeProtected: writeProtected)
+    }
+    func mountThirteenSectorDisk(_ data: Data, drive: Int = 0, writeProtected: Bool = false) throws {
+        try diskController.mountThirteenSectorImage(data, drive: drive, writeProtected: writeProtected)
+    }
     func mountDiskImage(at url: URL, drive: Int = 0) throws { try diskController.mountImage(Data(contentsOf: url), fileExtension: url.pathExtension, drive: drive) }
-    func mountDiskImageData(_ data: Data, fileExtension: String, drive: Int = 0) throws { try diskController.mountImage(data, fileExtension: fileExtension, drive: drive) }
+    func mountDiskImageData(_ data: Data, fileExtension: String, drive: Int = 0, writeProtected: Bool? = nil) throws {
+        if let writeProtected {
+            switch DiskImageFormat(fileExtension: fileExtension) {
+            case .dosOrder:
+                try diskController.mountDSK(data, drive: drive, writeProtected: writeProtected)
+            case .thirteenSector:
+                try diskController.mountThirteenSectorImage(data, drive: drive, writeProtected: writeProtected)
+            case .prodosOrder:
+                try diskController.mountProDOS(data, drive: drive, writeProtected: writeProtected)
+            default:
+                try diskController.mountImage(data, fileExtension: fileExtension, drive: drive)
+            }
+        } else {
+            try diskController.mountImage(data, fileExtension: fileExtension, drive: drive)
+        }
+    }
     func nibImage(drive: Int = 0) -> Data? { diskController.nibImage(drive: drive) }
     func ejectDisk(drive: Int = 0) { diskController.eject(drive: drive) }
     var hasDisk: Bool { diskController.hasDisk }

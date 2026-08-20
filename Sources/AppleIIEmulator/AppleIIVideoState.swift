@@ -10,6 +10,7 @@ struct AppleIIVideoState {
     let column80: Bool
     let alternateCharset: Bool
     let supportsMouseText: Bool
+    let usesSevenBitASCII: Bool
     let textByte: (Int, Int) -> UInt8
     let loresByte: (Int, Int) -> UInt8
     let hgrByte: (Int, Int, Bool) -> UInt8
@@ -26,6 +27,7 @@ struct AppleIIVideoSnapshot: Equatable {
     let column80: Bool
     let alternateCharset: Bool
     let supportsMouseText: Bool
+    let usesSevenBitASCII: Bool
     let text: [UInt8]
     let lores: [UInt8]
     let hgrMain: [UInt8]
@@ -33,7 +35,7 @@ struct AppleIIVideoSnapshot: Equatable {
 
     static let blank = AppleIIVideoSnapshot(
         textMode: true, mixedMode: false, hires: false, doubleHires: false,
-        column80: false, alternateCharset: false, supportsMouseText: false,
+        column80: false, alternateCharset: false, supportsMouseText: false, usesSevenBitASCII: false,
         text: [UInt8](repeating: 0, count: 80 * 24),
         lores: [UInt8](repeating: 0, count: 40 * 24),
         hgrMain: [UInt8](repeating: 0, count: 40 * 192),

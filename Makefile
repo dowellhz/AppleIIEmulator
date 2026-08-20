@@ -2,6 +2,7 @@ APP := build/AppleIIEmulator.app
 BUILD_DIR := .build/arm64-apple-macosx/debug
 RESOURCE_BUNDLE := AppleIIEmulator_AppleIIEmulator.bundle
 CODESIGN_IDENTITY ?= -
+CODESIGN_OPTIONS ?=
 
 .PHONY: package-app verify-app-bundle
 
@@ -18,7 +19,7 @@ package-app:
 	# User-supplied artwork can arrive with restrictive Finder/temporary-file
 	# permissions. A signed app must contain resources readable by its user.
 	chmod -R a+r $(APP)/Contents/Resources
-	codesign --force --deep --sign "$(CODESIGN_IDENTITY)" $(APP)
+	codesign --force --deep $(CODESIGN_OPTIONS) --sign "$(CODESIGN_IDENTITY)" $(APP)
 	$(MAKE) verify-app-bundle
 
 verify-app-bundle:

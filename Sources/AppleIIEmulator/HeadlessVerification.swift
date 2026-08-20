@@ -38,7 +38,78 @@ enum HeadlessVerification {
         if CommandLine.arguments.contains("--trace-wizardry-start-keys") {
             return traceWizardryStartKeys()
         }
+        if CommandLine.arguments.contains("--trace-iie-startup") {
+            return traceAppleIIeStartup()
+        }
+        if let argument = CommandLine.arguments.first(where: { $0.hasPrefix("--verify-software=") }) {
+            let rawValue = String(argument.dropFirst("--verify-software=".count))
+            guard let software = AppleIIMachine.BundledSoftware(rawValue: rawValue) else {
+                fputs("Unknown bundled software: \(rawValue)\\n", stderr)
+                return 2
+            }
+            return verifyBundledSoftware(software)
+        }
         return nil
+    }
+
+    /// Captures the ordinary IIe power-on path without a mounted disk.  This
+    /// uses the same ROM selection, reset vector and video snapshot that the
+    /// visible application uses, so character-set regressions cannot hide
+    /// behind a unit test that only reads ROM bytes.
+    private static func traceAppleIIeStartup() -> Int32 {
+        let machine = AppleIIMachine()
+        machine.selectROM(.appleIIeEnhanced)
+        machine.runForVerification(cycles: 2_000_000)
+        let video = machine.videoSnapshot
+        let rows = (0..<24).map { row in
+            (0..<40).map { column -> String in
+                let byte = video.textByte(column: column, row: row)
+                let cell = appleIITextCell(
+                    byte: byte,
+                    alternateCharset: video.alternateCharset,
+                    flashOn: true,
+                    supportsMouseText: video.supportsMouseText,
+                    usesSevenBitASCII: video.usesSevenBitASCII
+                )
+                switch cell {
+                case let .normal(value), let .inverse(value):
+                    return String(UnicodeScalar(value < 0x20 ? value + 0x40 : value))
+                case let .alternate(value), let .alternateInverse(value):
+                    return value < 0x20 ? "•" : String(UnicodeScalar(value))
+                case let .ascii(value):
+                    return value >= 0x20 ? String(UnicodeScalar(value)) : " "
+                }
+            }.joined()
+        }.joined(separator: "|")
+        let firstRowBytes = (0..<40).map { String(format: "%02X", video.textByte(column: $0, row: 0)) }.joined(separator: " ")
+        fputs("pc=$\(String(machine.programCounter, radix: 16)) text=$\(video.textMode) col80=$\(video.column80) alt=$\(video.alternateCharset) raw=$\(firstRowBytes) rows=\(rows)\n", stderr)
+        return 0
+    }
+
+    /// Exercises the same `AppleIIMachine` launcher used by the SOFTWARE
+    /// panel, instead of mounting a disk directly in a unit-test memory bus.
+    private static func verifyBundledSoftware(_ software: AppleIIMachine.BundledSoftware) -> Int32 {
+        let machine = AppleIIMachine()
+        machine.loadBundledSoftware(software)
+        guard !machine.status.hasPrefix("无法装入") else {
+            fputs("\(software.title) did not mount through the application launcher: \(machine.status)\\n", stderr)
+            return 1
+        }
+
+        machine.runForVerification(cycles: 25_000_000)
+        let video = machine.videoSnapshot
+        let visibleCells = video.text.filter { byte in
+            let glyph = byte & 0x7F
+            return glyph != 0 && glyph != 0x20
+        }.count
+        guard machine.hasExecutedRAMCode,
+              machine.encounteredUnsupportedCPUOpcodes.isEmpty,
+              machine.memory.diskNibbleReads > 0,
+              visibleCells > 0 else {
+            fputs("\(software.title) did not reach a visible software screen. pc=$\(String(machine.programCounter, radix: 16)) reads=\(machine.memory.diskNibbleReads) visible=\(visibleCells) unsupported=\(machine.encounteredUnsupportedCPUOpcodes)\\n", stderr)
+            return 1
+        }
+        return 0
     }
 
     private static func verifyPrince(writeTo filename: String, swapThirdDisk: Bool) -> Int32 {
@@ -288,8 +359,23 @@ enum HeadlessVerification {
         machine.loadBundledGame(.wizardry)
         machine.runForVerification(cycles: 50_000_000)
         machine.memory.latchKey(0xA0) // Space ends the splash screen.
-        machine.runForVerification(cycles: 2_000_000)
-        machine.memory.latchKey(0xD3) // S starts the game.
+        var reachedStartMenu = false
+        for _ in 0..<150 {
+            machine.runForVerification(cycles: 100_000)
+            let screen = String(machine.videoSnapshot.text.map { byte in
+                let code = byte & 0x7F
+                return code >= 0x20 && code < 0x7F ? Character(UnicodeScalar(code)) : " "
+            })
+            if screen.contains("S)TART GAME") {
+                reachedStartMenu = true
+                break
+            }
+        }
+        guard reachedStartMenu else {
+            fputs("Wizardry did not reach its start menu after splash input.\\n", stderr)
+            return 1
+        }
+        machine.memory.latchKey(0xD3) // S starts the game after the menu is visible.
         machine.runForVerification(cycles: 10_000_000)
         do {
             try writePNG(machine.videoSnapshot, to: URL(fileURLWithPath: "/private/tmp/AppleIIEmulator-wizardry-start-prompt.png"))

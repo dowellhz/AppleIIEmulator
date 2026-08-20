@@ -80,12 +80,12 @@ struct EmulatorControlsPanel: View {
 
     @ViewBuilder
     private func driveDescriptions(width: CGFloat, height: CGFloat) -> some View {
-        driveRow(description: machine.diskDescription, active: machine.diskDescription != "未插入", anchor: .drive1LED, width: width, height: height)
-        driveRow(description: machine.externalDiskDescription, active: machine.externalDiskDescription != "未插入", anchor: .drive2LED, width: width, height: height)
+        driveRow(description: machine.diskDescription, active: machine.diskDescription != "未插入", drive: 0, anchor: .drive1LED, width: width, height: height)
+        driveRow(description: machine.externalDiskDescription, active: machine.externalDiskDescription != "未插入", drive: 1, anchor: .drive2LED, width: width, height: height)
     }
 
     @ViewBuilder
-    private func driveRow(description: String, active: Bool, anchor: PanelAnchor, width: CGFloat, height: CGFloat) -> some View {
+    private func driveRow(description: String, active: Bool, drive: Int, anchor: PanelAnchor, width: CGFloat, height: CGFloat) -> some View {
         let ledPosition = position(for: anchor, width: width, height: height)
 
         if active {
@@ -93,17 +93,28 @@ struct EmulatorControlsPanel: View {
                 .frame(width: width * 0.011, height: width * 0.011)
                 .position(ledPosition)
         }
-        Text(description)
-            // These are recessed black display windows in the artwork, so
-            // live disk names need a light engraved-label colour rather than
-            // the dark ink used elsewhere on the metal panel.
-            .font(.system(size: width * 0.0105, weight: .medium, design: .monospaced))
-            .foregroundStyle(Color(red: 0.76, green: 0.68, blue: 0.51))
-            .shadow(color: .black.opacity(0.96), radius: 1, x: 1, y: 1)
-            .lineLimit(1)
-            .truncationMode(.middle)
-            .frame(width: width * 0.132, alignment: .leading)
-            .position(x: width * 0.202, y: ledPosition.y)
+        Button {
+            // A live drive change preserves the CPU, controller and video
+            // state; it is the on-panel equivalent of physically replacing a
+            // Disk II disk while the program is waiting for it.
+            machine.chooseDiskImage(drive: drive, resetsMachine: false)
+        } label: {
+            Text(description)
+                // These are recessed black display windows in the artwork,
+                // so live disk names need a light engraved-label colour.
+                .font(.system(size: width * 0.0105, weight: .medium, design: .monospaced))
+                .foregroundStyle(Color(red: 0.76, green: 0.68, blue: 0.51))
+                .shadow(color: .black.opacity(0.96), radius: 1, x: 1, y: 1)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(width: width * 0.132, alignment: .leading)
+        }
+        .buttonStyle(.plain)
+        .contentShape(Rectangle())
+        .position(x: width * 0.202, y: ledPosition.y)
+        .accessibilityLabel("驱动器 \(drive + 1)：\(description)")
+        .accessibilityHint("点击以在运行中更换磁盘，不重置 Apple II")
+        .help("点击以更换驱动器 \(drive + 1) 磁盘")
     }
 
     /// Text is placed only in the intentionally clear regions of the supplied
@@ -282,6 +293,15 @@ struct EmulatorControlsPanel: View {
 
     private var gameMenu: some View {
         Group {
+            if !machine.recentBundledGames.isEmpty {
+                Text("最近玩过")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                ForEach(machine.recentBundledGames) { game in
+                    Button(game.title) { machine.loadBundledGame(game) }
+                }
+                Divider()
+            }
             if !machine.downloadedGames.isEmpty {
                 Menu("已下载游戏（\(machine.downloadedGames.count)）") {
                     ForEach(machine.downloadedGameInitials, id: \.self) { initial in
@@ -296,7 +316,7 @@ struct EmulatorControlsPanel: View {
             }
             Button("从已下载游戏库打开…") { machine.chooseDownloadedGame() }
             Divider()
-            ForEach(AppleIIMachine.BundledGame.allCases) { game in
+            ForEach(AppleIIMachine.BundledGame.defaultGameMenu) { game in
                 Button(game.title) { machine.loadBundledGame(game) }
             }
         }

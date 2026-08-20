@@ -140,7 +140,7 @@ final class IWMController {
         drives[drive].install(tracks: tracks.map(\.nibbles), bitTracks: tracks.map { Self.bitTrack(nibbles: $0.nibbles, sync: $0.sync, trailingZeros: $0.syncTrailingZeros) }, thirteenSector: true, writeProtected: writeProtected)
     }
 
-    private func mountProDOS(_ data: Data, drive: Int, writeProtected: Bool) throws {
+    func mountProDOS(_ data: Data, drive: Int, writeProtected: Bool) throws {
         try mountSectorImage(data, sectorOrder: Self.prodosSectorOrder, drive: drive, writeProtected: writeProtected)
     }
 

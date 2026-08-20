@@ -105,6 +105,16 @@ final class AppleIISpeaker: @unchecked Sendable {
             fatalError("Unable to allocate Apple II audio FIFO")
         }
         self.fifo = fifo
+
+        // The opt-in verification commands exercise the same machine, ROM,
+        // disk and video paths as the app, but have no need for a host audio
+        // endpoint.  CI/headless macOS sessions may not expose a Core Audio
+        // component at all; constructing AVAudioSourceNode then raises an
+        // Objective-C exception before Swift can handle it.  Keep generating
+        // the cycle-timed waveform into the FIFO so this is only an endpoint
+        // bypass, never a different speaker model.
+        guard !Self.isHeadlessVerificationProcess else { return }
+
         let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1)!
         let node = AVAudioSourceNode { [weak self] _, _, frameCount, audioBufferList in
             guard let self else {
@@ -118,6 +128,12 @@ final class AppleIISpeaker: @unchecked Sendable {
         engine.attach(node)
         engine.connect(node, to: engine.mainMixerNode, format: format)
         try? engine.start()
+    }
+
+    private static var isHeadlessVerificationProcess: Bool {
+        CommandLine.arguments.contains { argument in
+            argument.hasPrefix("--verify-") || argument.hasPrefix("--trace-")
+        }
     }
 
     func toggle(atEmulatedCycle cycle: Int) {

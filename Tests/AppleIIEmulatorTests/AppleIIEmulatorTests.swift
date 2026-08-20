@@ -41,6 +41,18 @@ final class AppleIIEmulatorTests: XCTestCase {
         XCTAssertNil(AppleIIMachine.appleKeyboardByte(forASCII: 0x1B, control: false))
     }
 
+    func testWizardryBootMediaIncludesItsDeferredOriginalScenarioDisk() {
+        let disks = AppleIIMachine.BundledGame.wizardry.startupDisks
+
+        XCTAssertEqual(disks.count, 3)
+        XCTAssertEqual(disks[0].description, "Wizardry 磁盘 1")
+        XCTAssertFalse(disks[0].writeProtected)
+        XCTAssertEqual(disks[1].description, "Wizardry 磁盘 2")
+        XCTAssertFalse(disks[1].writeProtected)
+        XCTAssertEqual(disks[2].description, "Wizardry 原始 Scenario 盘")
+        XCTAssertFalse(disks[2].writeProtected)
+    }
+
     @MainActor
     func testArrowKeysDriveAndReleaseBothAppleIIGamePorts() throws {
         let machine = AppleIIMachine()
@@ -70,16 +82,20 @@ final class AppleIIEmulatorTests: XCTestCase {
         ))
 
         machine.keyDown(rightArrow)
+        // Input may be queued behind an in-flight CPU slice; drain that
+        // serial queue before observing the hardware latch directly.
+        machine.runForVerification(cycles: 0)
         _ = machine.memory.read(0xC070)
         machine.memory.advanceVideoClock(by: 1_408)
         XCTAssertEqual(machine.memory.read(0xC064), 0x80) // PDL0: right
         XCTAssertEqual(machine.memory.read(0xC066), 0x80) // PDL2: second port
 
         machine.keyUp(release)
+        machine.runForVerification(cycles: 0)
         _ = machine.memory.read(0xC070)
         machine.memory.advanceVideoClock(by: 1_408)
-        XCTAssertEqual(machine.memory.read(0xC064), 0) // released: centre
-        XCTAssertEqual(machine.memory.read(0xC066), 0)
+        XCTAssertEqual(machine.memory.read(0xC064), 0x80) // released: retains right
+        XCTAssertEqual(machine.memory.read(0xC066), 0x80)
     }
 
     func testIIcTextAttributesHonorInverseFlashAndAlternateCharset() {
@@ -576,7 +592,11 @@ final class AppleIIEmulatorTests: XCTestCase {
     func testBundledGamesMountWithoutFilePicker() {
         XCTAssertEqual(
             AppleIIMachine.BundledGame.allCases.map(\.title),
-            ["Lode Runner (1983)", "Prince of Persia (1989)", "Wizardry (1981)", "Karateka (1984)"]
+            ["Lode Runner (1983)", "Prince of Persia (1989)", "Wizardry (1981)", "Karateka (1984)", "Falcons", "J-Bird"]
+        )
+        XCTAssertEqual(
+            AppleIIMachine.BundledGame.defaultGameMenu.map(\.title),
+            ["Falcons", "J-Bird", "Karateka (1984)", "Lode Runner (1983)"]
         )
         let machine = AppleIIMachine()
         for game in AppleIIMachine.BundledGame.allCases {
@@ -588,12 +608,32 @@ final class AppleIIEmulatorTests: XCTestCase {
     }
 
     @MainActor
+    func testFrontPanelResetKeepsDriveOneAndRebootsThroughROM() {
+        let machine = AppleIIMachine()
+        machine.insertDiagnosticDisk()
+        machine.runForVerification(cycles: 5_000_000)
+        XCTAssertTrue(machine.memory.diskNibbleReads > 0)
+
+        machine.reset()
+
+        XCTAssertTrue(machine.hasDisk(in: 0), "Front-panel reset must not eject Drive 1")
+        XCTAssertTrue(machine.status.contains("正在从驱动器 1 启动"))
+        machine.runForVerification(cycles: 5_000_000)
+        let text = (0..<24).map { row in
+            String((0..<40).map { machine.memory.textByte(column: $0, row: row) & 0x7F }.map(UnicodeScalar.init).map(Character.init))
+        }.joined(separator: "|")
+        XCTAssertGreaterThan(machine.memory.diskNibbleReads, 0)
+        XCTAssertTrue(text.contains("DISK BOOT OK"), text)
+    }
+
+    @MainActor
     func testWizardryBootDiskTransfersControlFromFirmware() {
         let machine = AppleIIMachine()
         machine.loadBundledGame(.wizardry)
 
         XCTAssertTrue(machine.hasDisk(in: 0))
         XCTAssertTrue(machine.hasDisk(in: 1))
+        XCTAssertEqual(machine.externalDiskDescription, "Wizardry 磁盘 2")
         machine.runForVerification(cycles: 2_000_000)
 
         let trace = machine.recentInstructions
@@ -622,17 +662,11 @@ final class AppleIIEmulatorTests: XCTestCase {
             "Wizardry did not reach its visible title screen; pc=$\(String(machine.programCounter, radix: 16)), reads=\(machine.memory.diskNibbleReads)"
         )
 
-        let cyclesBeforeSwap = machine.executedCPUCycles
-        let pcBeforeSwap = machine.programCounter
-        let scenarioURL = try! XCTUnwrap(AppResources.bundle.url(forResource: "Wizardry (1981) Disk 2", withExtension: "dsk"))
-        try! machine.replaceDiskImageData(
-            Data(contentsOf: scenarioURL),
-            fileExtension: "dsk",
-            description: "Wizardry Scenario 磁盘",
-            drive: 0
-        )
-        XCTAssertEqual(machine.executedCPUCycles, cyclesBeforeSwap, "changing the Scenario disk must not reset the CPU")
-        XCTAssertEqual(machine.programCounter, pcBeforeSwap, "changing the Scenario disk must preserve execution state")
+        // Disk 2 stays in the second physical drive. Wizardry itself selects
+        // Drive 2 through the Disk II soft switch; the launcher must not
+        // replace Drive 1 merely because a screen happens to mention a disk.
+        XCTAssertTrue(machine.hasDisk(in: 0))
+        XCTAssertTrue(machine.hasDisk(in: 1))
     }
 
     @MainActor
@@ -800,9 +834,9 @@ final class AppleIIEmulatorTests: XCTestCase {
     }
 
     @MainActor
-    func testBundledGamesExecuteThroughAppleIIPlusBootPath() {
+    func testDefaultBundledGamesExecuteThroughTheirBootPaths() {
         let machine = AppleIIMachine()
-        for game in AppleIIMachine.BundledGame.allCases {
+        for game in AppleIIMachine.BundledGame.defaultGameMenu {
             machine.loadBundledGame(game)
             let expectedModel: AppleIIMemory.Model = game.bootROM == .appleIIPlus ? .appleIIPlus : .appleIIe
             XCTAssertEqual(machine.memory.model, expectedModel, game.title)

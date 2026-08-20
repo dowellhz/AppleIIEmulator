@@ -99,6 +99,35 @@ final class ROMLoadingTests: XCTestCase {
         XCTAssertTrue(text.contains("DISK BOOT OK"), text)
     }
 
+    func testEnhancedAppleIIePowerOnBannerUsesSevenBitText() throws {
+        let memory = AppleIIMemory()
+        try memory.loadBundledAppleIIeROM(.appleIIeEnhanced)
+        let cpu = MOS6502(bus: memory)
+        cpu.reset()
+        cpu.run(cycles: 2_000_000)
+
+        let video = memory.makeVideoSnapshot()
+        XCTAssertTrue(video.usesSevenBitASCII)
+        let row = (0..<40).map { column -> String in
+            let cell = appleIITextCell(
+                byte: video.textByte(column: column, row: 0),
+                alternateCharset: video.alternateCharset,
+                flashOn: true,
+                supportsMouseText: video.supportsMouseText,
+                usesSevenBitASCII: video.usesSevenBitASCII
+            )
+            switch cell {
+            case let .normal(value), let .inverse(value):
+                return String(UnicodeScalar(value < 0x20 ? value + 0x40 : value))
+            case let .alternate(value), let .alternateInverse(value):
+                return value < 0x20 ? "•" : String(UnicodeScalar(value))
+            case let .ascii(value):
+                return value >= 0x20 ? String(UnicodeScalar(value)) : " "
+            }
+        }.joined()
+        XCTAssertTrue(row.contains("Apple //e"), row)
+    }
+
     func testAppleIIeAuxiliaryMemorySoftSwitches() throws {
         let memory = AppleIIMemory()
         try memory.loadBundledAppleIIeROM(.appleIIeEnhanced)

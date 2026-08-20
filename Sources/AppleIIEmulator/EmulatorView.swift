@@ -300,7 +300,7 @@ private struct AppleIIScreen: View {
                 guard byte != 0 else { continue }
                 let presentation = video.column80
                     ? appleII80ColumnTextCell(byte: byte, alternateCharset: video.alternateCharset, flashOn: flashOn, supportsMouseText: video.supportsMouseText)
-                    : appleIITextCell(byte: byte, alternateCharset: video.alternateCharset, flashOn: flashOn, supportsMouseText: video.supportsMouseText)
+                    : appleIITextCell(byte: byte, alternateCharset: video.alternateCharset, flashOn: flashOn, supportsMouseText: video.supportsMouseText, usesSevenBitASCII: video.usesSevenBitASCII)
                 let (character, inverse) = appleCharacter(presentation)
                 let rect = CGRect(x: CGFloat(col) * cell.width, y: CGFloat(row) * cell.height, width: cell.width, height: cell.height)
                 if inverse { context.fill(Path(rect.insetBy(dx: 1, dy: 1)), with: .color(green)) }

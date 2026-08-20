@@ -3,11 +3,42 @@ import Darwin
 
 @main
 struct AppleIIEmulatorApp: App {
-    @StateObject private var machine = AppleIIMachine()
+    @StateObject private var machine: AppleIIMachine
 
     init() {
+        let machine = AppleIIMachine()
+        _machine = StateObject(wrappedValue: machine)
         if let status = HeadlessVerification.runIfRequested() {
             exit(status)
+        }
+        // Integration probe: unlike the headless CPU checks, this starts the
+        // normal SwiftUI window and its Timer-driven execution path. It is
+        // intentionally opt-in and leaves ordinary launches unchanged.
+        if CommandLine.arguments.contains("--launch-wizardry") {
+            DispatchQueue.main.async {
+                machine.loadBundledGame(.wizardry)
+            }
+        }
+        if CommandLine.arguments.contains("--trace-runtime-cycles") {
+            Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
+                Task { @MainActor in
+                    print("AppleII runtime cycles=\(machine.presentedCPUCycles)")
+                    fflush(stdout)
+                }
+            }
+        }
+        if CommandLine.arguments.contains("--trace-runtime-state") {
+            Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
+                Task { @MainActor in
+                    let video = machine.videoSnapshot
+                    let visible = video.hires
+                        ? video.hgrMain.filter { $0 & 0x7F != 0 }.count
+                        : video.text.filter { $0 & 0x7F != 0 && $0 & 0x7F != 0x20 }.count
+                    let disk = machine.presentedDiskState
+                    print("AppleII runtime pc=$\(String(machine.presentedProgramCounter, radix: 16)) visible=\(visible) text=\(video.textMode) hires=\(video.hires) motor=\(disk.motorOn) drive=\(disk.selectedDrive + 1) tracks=\(disk.tracks) readBits=\(disk.readBits)")
+                    fflush(stdout)
+                }
+            }
         }
     }
 
@@ -38,16 +69,29 @@ struct AppleIIEmulatorApp: App {
                 Button("插入测试启动盘") { machine.insertDiagnosticDisk() }
                 Button("将驱动器 1 另存为 .nib…") { machine.saveDiskAsNIB(drive: 0) }
                     .keyboardShortcut("s", modifiers: [.command, .shift])
-                    .disabled(!machine.hasDisk(in: 0))
+                    // Menu construction occurs on the main actor. Asking the
+                    // emulation queue for live controller state here can
+                    // synchronously wait behind a disk-heavy CPU slice and
+                    // freeze the entire window. These descriptions are
+                    // published by every mount/eject operation on this actor.
+                    .disabled(machine.diskDescription == "未插入")
                 Button("将驱动器 2 另存为 .nib…") { machine.saveDiskAsNIB(drive: 1) }
-                    .disabled(!machine.hasDisk(in: 1))
+                    .disabled(machine.externalDiskDescription == "未插入")
                 Divider()
                 Button("推出驱动器 1") { machine.ejectDisk(drive: 0) }
-                    .disabled(!machine.hasDisk(in: 0))
+                    .disabled(machine.diskDescription == "未插入")
                 Button("推出驱动器 2") { machine.ejectDisk(drive: 1) }
-                    .disabled(!machine.hasDisk(in: 1))
+                    .disabled(machine.externalDiskDescription == "未插入")
             }
             CommandMenu("游戏") {
+                if !machine.recentBundledGames.isEmpty {
+                    Menu("最近玩过") {
+                        ForEach(machine.recentBundledGames) { game in
+                            Button(game.title) { machine.loadBundledGame(game) }
+                        }
+                    }
+                    Divider()
+                }
                 if !machine.downloadedGames.isEmpty {
                     Menu("已下载游戏（\(machine.downloadedGames.count)）") {
                         ForEach(machine.downloadedGameInitials, id: \.self) { initial in
@@ -62,7 +106,7 @@ struct AppleIIEmulatorApp: App {
                 }
                 Button("从已下载游戏库打开…") { machine.chooseDownloadedGame() }
                 Divider()
-                ForEach(AppleIIMachine.BundledGame.allCases) { game in
+                ForEach(AppleIIMachine.BundledGame.defaultGameMenu) { game in
                     Button(game.title) { machine.loadBundledGame(game) }
                 }
             }
