@@ -75,13 +75,21 @@ struct AppleIIEmulatorApp: App {
                     // freeze the entire window. These descriptions are
                     // published by every mount/eject operation on this actor.
                     .disabled(machine.diskDescription == "未插入")
+                Button("将驱动器 1 另存为 .woz…") { machine.saveDiskAsWOZ(drive: 0) }
+                    .disabled(machine.diskDescription == "未插入")
                 Button("将驱动器 2 另存为 .nib…") { machine.saveDiskAsNIB(drive: 1) }
+                    .disabled(machine.externalDiskDescription == "未插入")
+                Button("将驱动器 2 另存为 .woz…") { machine.saveDiskAsWOZ(drive: 1) }
                     .disabled(machine.externalDiskDescription == "未插入")
                 Divider()
                 Button("推出驱动器 1") { machine.ejectDisk(drive: 0) }
                     .disabled(machine.diskDescription == "未插入")
                 Button("推出驱动器 2") { machine.ejectDisk(drive: 1) }
                     .disabled(machine.externalDiskDescription == "未插入")
+                Divider()
+                Button("装入 SmartPort 硬盘映像…") { machine.chooseHardDiskImage() }
+                Button("推出 SmartPort 硬盘") { machine.ejectHardDisk() }
+                    .disabled(machine.hardDiskDescription == "未插入")
             }
             CommandMenu("游戏") {
                 if !machine.recentGames.isEmpty {

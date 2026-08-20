@@ -3,57 +3,6 @@ import Combine
 import Foundation
 import UniformTypeIdentifiers
 
-/// The text-video byte encodes its glyph in the low six bits and selects one
-/// of three display attributes with bits 6–7.  Keeping this separate from the
-/// renderer lets the IIc's ALTCHARSET soft switch affect both 40- and 80-column
-/// output consistently.
-enum AppleIITextCell: Equatable {
-    case normal(UInt8)
-    case inverse(UInt8)
-    case alternate(UInt8)
-    /// The original IIe alternate character ROM has inverse lowercase in
-    /// $60-$7F. It is distinct from the enhanced IIe/IIc MouseText bank.
-    case alternateInverse(UInt8)
-    /// The IIe 80-column firmware can store seven-bit ASCII with bit 7 set.
-    /// Applications such as WordPerfect use this for mixed-case text.
-    case ascii(UInt8)
-}
-
-func appleIITextCell(
-    byte: UInt8,
-    alternateCharset: Bool,
-    flashOn: Bool,
-    supportsMouseText: Bool = true,
-    usesSevenBitASCII: Bool = false
-) -> AppleIITextCell {
-    // The IIe and IIc firmware use normal high-bit 7-bit ASCII even in
-    // 40-column mode (for example, the IIe power-on banner stores `p` as
-    // $F0). The original II/II+ instead treats the low six bits as its glyph
-    // number, so retain that path for its software and character ROM.
-    if usesSevenBitASCII, byte & 0x80 != 0 {
-        let ascii = byte & 0x7F
-        if ascii >= 0x20, ascii <= 0x7E { return .ascii(ascii) }
-    }
-    let glyph = byte & 0x3F
-    switch byte & 0xC0 {
-    case 0x00:
-        return .inverse(glyph)
-    case 0x40:
-        if alternateCharset { return supportsMouseText ? .alternate(glyph) : .alternateInverse(glyph) }
-        return flashOn ? .normal(glyph) : .inverse(glyph)
-    default:
-        return .normal(glyph)
-    }
-}
-
-/// Decode a IIe 80-column cell.  The high-bit text bank is ASCII rather than
-/// the 40-column six-bit character encoding; the lower banks retain the
-/// normal/flash/MouseText behavior used for WordPerfect's window borders.
-func appleII80ColumnTextCell(byte: UInt8, alternateCharset: Bool, flashOn: Bool, supportsMouseText: Bool = true) -> AppleIITextCell {
-    if byte & 0x80 != 0 { return .ascii(byte & 0x7F) }
-    return appleIITextCell(byte: byte, alternateCharset: alternateCharset, flashOn: flashOn, supportsMouseText: supportsMouseText)
-}
-
 /// Apple II+ motherboard model. The CPU owns no memory: every bus access goes
 /// through this object, so soft switches remain observable and testable.
 @MainActor
@@ -328,14 +277,14 @@ final class AppleIIMachine: ObservableObject {
             }
         }
 
-        fileprivate var storageRecord: [String] {
+        var storageRecord: [String] {
             switch self {
             case let .bundled(game): return ["bundled", game.rawValue]
             case let .diskImages(urls): return ["disks"] + urls.map(\.path)
             }
         }
 
-        fileprivate init?(storageRecord: [String]) {
+        init?(storageRecord: [String]) {
             guard let kind = storageRecord.first else { return nil }
             switch kind {
             case "bundled":
@@ -399,7 +348,7 @@ final class AppleIIMachine: ObservableObject {
     private var cpu: MOS6502!
     private let speaker = AppleIISpeaker()
     private let serialBridge = MacSerialBridge()
-    private let defaults: UserDefaults
+    private let recentGameStore: RecentGameStore
     private var timer: Timer?
     private var keyboardMonitor: Any?
     private var keyboardReleaseMonitor: Any?
@@ -430,9 +379,6 @@ final class AppleIIMachine: ObservableObject {
     /// A diskless Apple II+ reaches ROM Applesoft through the Autostart ROM's
     /// warm-reset path after it has shown the power-on banner.
     private var applesoftWarmStartDeadline: TimeInterval?
-    private static let recentGamesDefaultsKey = "AppleIIEmulator.recentGames.v2"
-    private static let legacyRecentBundledGamesDefaultsKey = "AppleIIEmulator.recentBundledGames"
-    private static let recentGamesLimit = 8
 
     var currentROMTitle: String { externalROMName ?? selectedBootROM.title }
     var supportsIIcSerial: Bool {
@@ -442,10 +388,10 @@ final class AppleIIMachine: ObservableObject {
         }
     }
 
-    init(defaults: UserDefaults = .standard) {
-        self.defaults = defaults
-        recentGames = Self.restoredRecentGames(from: defaults)
-        persistRecentGames()
+    init(defaults: UserDefaults = .standard, startsRuntimeTimer: Bool? = nil) {
+        recentGameStore = RecentGameStore(defaults: defaults)
+        recentGames = recentGameStore.restore()
+        recentGameStore.save(recentGames)
         serialBridge.didReceiveByte = { [weak self] byte, port in
             guard let self else { return }
             self.emulationQueue.async { [weak self] in
@@ -524,8 +470,10 @@ final class AppleIIMachine: ObservableObject {
                 application.activate(ignoringOtherApps: true)
             }
         }
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.tick() }
+        if startsRuntimeTimer ?? !Self.isAutomatedRun {
+            timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.tick() }
+            }
         }
     }
 
@@ -611,6 +559,24 @@ final class AppleIIMachine: ObservableObject {
         }
     }
 
+    private func coldBootLocked() -> (snapshot: AppleIIVideoSnapshot, bootsDriveOne: Bool) {
+        let bootsDriveOne = memory.hasDisk(in: 0)
+        memory.coldBootSystemState()
+        cpu.reset()
+        return (memory.makeVideoSnapshot(), bootsDriveOne)
+    }
+
+    private func publishColdBoot(_ result: (snapshot: AppleIIVideoSnapshot, bootsDriveOne: Bool), idleStatus: String) {
+        isRunning = true
+        fractionalCPUCycles = 0
+        lastEmulationTick = ProcessInfo.processInfo.systemUptime
+        videoSnapshot = result.snapshot
+        status = result.bootsDriveOne
+            ? "\(currentROMTitle) · 正在从驱动器 1 启动：\(diskDescription)"
+            : idleStatus
+        refreshToken &+= 1
+    }
+
     /// Narrow diagnostic seam for regression tests: it runs the same CPU and
     /// bus path as the display timer without needing an AppKit run loop.
     func runForVerification(cycles: Int) {
@@ -692,20 +658,8 @@ final class AppleIIMachine: ObservableObject {
         // UI-level program jump. Disk II keeps its media inserted, while RAM
         // is returned to its cold-start state so the Apple II+ ROM cannot
         // interpret a reset as an Applesoft warm start and skip Drive 1.
-        let (snapshot, bootsDriveOne) = withEmulationLock {
-            let bootsDriveOne = memory.hasDisk(in: 0)
-            memory.coldBootSystemState()
-            cpu.reset()
-            return (memory.makeVideoSnapshot(), bootsDriveOne)
-        }
-        isRunning = true
-        fractionalCPUCycles = 0
-        lastEmulationTick = ProcessInfo.processInfo.systemUptime
-        videoSnapshot = snapshot
-        if bootsDriveOne {
-            status = "\(currentROMTitle) · 正在从驱动器 1 启动：\(diskDescription)"
-        }
-        refreshToken &+= 1
+        let result = withEmulationLock { coldBootLocked() }
+        publishColdBoot(result, idleStatus: status)
     }
 
     func toggleRunning() {
@@ -808,49 +762,84 @@ final class AppleIIMachine: ObservableObject {
         }
     }
 
+    /// The app must never wait for resource I/O on its main actor.  The
+    /// headless verifier is different: it needs a completed machine state at
+    /// each assertion boundary, and it has no run-loop turn in which an
+    /// asynchronous load can publish itself.  Keep that deterministic seam
+    /// here instead of making production media loading synchronous again.
+    private func submitEmulationTask(_ operation: @escaping @Sendable () -> Void) {
+        if Self.isAutomatedRun {
+            emulationQueue.sync(execute: operation)
+        } else {
+            emulationQueue.async(execute: operation)
+        }
+    }
+
     func selectROM(_ choice: BootROM) {
         guard choice != .external else { return }
         selectedBootROM = choice
         externalROMName = nil
         activeMediaKind = .none
-        switch choice {
-        case .appleIIPlus:
-            do {
-                try withEmulationLock { try memory.loadBundledAppleIIPlusROM(diskFirmware: .sixteenSector) }
-                hasExternalROM = true
-                status = "Apple II+（内置） · \(diskDescription)"
-            } catch {
-                installDiagnosticROM()
-                status = "内置诊断 ROM（Apple II+ ROM 未找到）"
-            }
-        case .appleIIcROM00, .appleIIcROM03, .appleIIcROM04, .appleIIcROMFF:
-            do {
-                try withEmulationLock { try memory.loadBundledAppleIIcROM(named: choice.resourceName!) }
-                hasExternalROM = true
-                status = "\(choice.title)（内置） · \(diskDescription)"
-            } catch {
-                installDiagnosticROM()
-                status = "内置诊断 ROM（\(choice.title) 未找到）"
-            }
-        case .appleIIeGameCompatible, .appleIIeEnhanced, .appleIIeUnenhanced, .appleIIeCF:
-            do {
-                let iiEROM: BootROM = choice == .appleIIeGameCompatible ? .appleIIeEnhanced : choice
-                try withEmulationLock { try memory.loadBundledAppleIIeROM(iiEROM) }
-                hasExternalROM = true
-                status = "\(choice.title)（内置） · \(diskDescription)"
-            } catch {
-                installDiagnosticROM()
-                status = "内置诊断 ROM（\(choice.title) 未找到）"
-            }
-        case .diagnostic:
+        if choice == .diagnostic {
             installDiagnosticROM()
             hasExternalROM = false
             status = "内置诊断 ROM"
-        case .external:
+            reset()
             return
         }
-        reset()
-        scheduleApplesoftWarmStartIfDiskless()
+        status = "正在装入 \(choice.title) ROM…"
+
+        let lock = emulationLock
+        let memory = memory
+        let cpu = cpu!
+        submitEmulationTask { [weak self] in
+            var lockHeld = false
+            do {
+                // Bundle reads happen on the execution queue, before the
+                // hardware lock is held. The UI and CPU bus stay responsive.
+                switch choice {
+                case .appleIIPlus:
+                    let images = try AppleIIROMImages.iiPlus(diskFirmware: .sixteenSector)
+                    lock.lock()
+                    lockHeld = true
+                    try memory.installIIPlusROM(systemROM: images.systemROM, diskROM: images.diskROM, diskFirmware: .sixteenSector)
+                case .appleIIcROM00, .appleIIcROM03, .appleIIcROM04, .appleIIcROMFF:
+                    let image = try AppleIIROMImages.iiC(named: choice.resourceName!)
+                    lock.lock()
+                    lockHeld = true
+                    try memory.installIIcROM(image)
+                case .appleIIeGameCompatible, .appleIIeEnhanced, .appleIIeUnenhanced, .appleIIeCF:
+                    let iiEROM: BootROM = choice == .appleIIeGameCompatible ? .appleIIeEnhanced : choice
+                    let images = try AppleIIROMImages.iiE(iiEROM)
+                    lock.lock()
+                    lockHeld = true
+                    try memory.installIIeROM(images.motherboardROM, diskROM: images.diskROM, choice: iiEROM)
+                case .diagnostic, .external:
+                    return
+                }
+                let bootsDriveOne = memory.hasDisk(in: 0)
+                memory.coldBootSystemState()
+                cpu.reset()
+                let result = (snapshot: memory.makeVideoSnapshot(), bootsDriveOne: bootsDriveOne)
+                lock.unlock()
+                lockHeld = false
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.selectedBootROM == choice else { return }
+                    self.hasExternalROM = true
+                    self.publishColdBoot(result, idleStatus: "\(choice.title)（内置） · \(self.diskDescription)")
+                    self.scheduleApplesoftWarmStartIfDiskless()
+                }
+            } catch {
+                if lockHeld { lock.unlock() }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.selectedBootROM == choice else { return }
+                    self.installDiagnosticROM()
+                    self.hasExternalROM = false
+                    self.status = "内置诊断 ROM（\(choice.title) 未找到）"
+                    self.reset()
+                }
+            }
+        }
     }
 
     /// Opens a ROM supplied by the user. Disk reads happen off the main actor;
@@ -866,13 +855,13 @@ final class AppleIIMachine: ObservableObject {
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        status = "正在读取 (url.lastPathComponent)…"
+        status = "正在读取 \(url.lastPathComponent)…"
         Task { [weak self] in
             let result = await Task.detached { Result { try Data(contentsOf: url) } }.value
             guard let self else { return }
             switch result {
             case let .success(data): self.loadExternalROM(data, name: url.lastPathComponent)
-            case .failure: self.status = "无法读取 (url.lastPathComponent)"
+            case .failure: self.status = "无法读取 \(url.lastPathComponent)"
             }
         }
     }
@@ -908,8 +897,26 @@ final class AppleIIMachine: ObservableObject {
     func loadBundledGame(_ game: BundledGame) {
         wizardryScenarioDiskData = nil
         wizardryScenarioPromptHandled = false
-        do {
-            let startupMedia = try game.startupDisks.enumerated().map { index, disk in
+        if Self.isAutomatedRun {
+            // These are requested-media facts, not results inferred from the
+            // disk bus.  Publish them before the synchronous verifier task so
+            // test callers retain the historical immediate API contract.
+            selectedBootROM = game.bootROM
+            hasExternalROM = true
+            activeMediaKind = .game
+            diskDescription = game.title
+            externalDiskDescription = game.startupDisks.count > 1
+                ? game.startupDisks[1].description
+                : "未插入"
+        }
+        status = "正在读取内置游戏：\(game.title)…"
+        let lock = emulationLock
+        let memory = memory
+        let cpu = cpu!
+        submitEmulationTask { [weak self] in
+            var lockHeld = false
+            do {
+                let startupMedia = try game.startupDisks.enumerated().map { index, disk in
                 guard let url = AppResources.bundle.url(
                     forResource: disk.resourceName,
                     withExtension: disk.resourceExtension
@@ -917,17 +924,30 @@ final class AppleIIMachine: ObservableObject {
                     throw CocoaError(.fileNoSuchFile)
                 }
                 return (drive: index, disk: disk, data: try Data(contentsOf: url))
-            }
-            // Legacy 13-sector archival images are often padded to the
-            // modern 140 KB .dsk length, so their byte count alone cannot
-            // identify the format. The bundled title declares its controller
-            // firmware and mounts through the matching sector codec.
-            try withEmulationLock {
+                }
+                let rom: AppleIIROMImages.IIPlus?
+                let iiEROM: AppleIIROMImages.IIe?
                 switch game.bootROM {
                 case .appleIIPlus:
-                    try memory.loadBundledAppleIIPlusROM(diskFirmware: game.diskFirmware)
+                    rom = try AppleIIROMImages.iiPlus(diskFirmware: game.diskFirmware)
+                    iiEROM = nil
                 case .appleIIeGameCompatible, .appleIIeEnhanced:
-                    try memory.loadBundledAppleIIeROM(.appleIIeEnhanced)
+                    rom = nil
+                    iiEROM = try AppleIIROMImages.iiE(.appleIIeEnhanced)
+                default:
+                    throw CocoaError(.fileReadCorruptFile)
+                }
+                // Legacy 13-sector archival images are often padded to the
+                // modern 140 KB .dsk length, so their byte count alone cannot
+                // identify the format. The bundled title declares its controller
+                // firmware and mounts through the matching sector codec.
+                lock.lock()
+                lockHeld = true
+                switch game.bootROM {
+                case .appleIIPlus:
+                    try memory.installIIPlusROM(systemROM: rom!.systemROM, diskROM: rom!.diskROM, diskFirmware: game.diskFirmware)
+                case .appleIIeGameCompatible, .appleIIeEnhanced:
+                    try memory.installIIeROM(iiEROM!.motherboardROM, diskROM: iiEROM!.diskROM, choice: .appleIIeEnhanced)
                 default:
                     throw CocoaError(.fileReadCorruptFile)
                 }
@@ -947,57 +967,37 @@ final class AppleIIMachine: ObservableObject {
                         )
                     }
                 }
+                let bootsDriveOne = memory.hasDisk(in: 0)
+                memory.coldBootSystemState()
+                cpu.reset()
+                let result = (snapshot: memory.makeVideoSnapshot(), bootsDriveOne: bootsDriveOne)
+                lock.unlock()
+                lockHeld = false
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.selectedBootROM = game.bootROM
+                    self.hasExternalROM = true
+                    self.activeMediaKind = .game
+                    self.diskDescription = game.title
+                    self.externalDiskDescription = startupMedia.count > 1 ? startupMedia[1].disk.description : "未插入"
+                    self.wizardryScenarioDiskData = game == .wizardry ? startupMedia.dropFirst(2).first?.data : nil
+                    let extraDiskNotice = startupMedia.count > 2 ? " · 已装入前两张盘" : ""
+                    self.publishColdBoot(result, idleStatus: "\(game.bootROM.title) · \(game.diskFirmware.title) · \(game.title)\(extraDiskNotice)")
+                    self.recordRecentGame(.bundled(game))
+                }
+            } catch {
+                if lockHeld { lock.unlock() }
+                DispatchQueue.main.async { [weak self] in self?.status = "无法装入内置游戏：\(game.title)" }
             }
-            selectedBootROM = game.bootROM
-            activeMediaKind = .game
-            diskDescription = game.title
-            externalDiskDescription = startupMedia.count > 1 ? startupMedia[1].disk.description : "未插入"
-            if game == .wizardry {
-                // Only the first two physical drives exist at startup. Keep
-                // the third, original Scenario Master ready for the game's
-                // explicit "SCENARIO MASTER IN DRV 1" request.
-                wizardryScenarioDiskData = startupMedia.dropFirst(2).first?.data
-            }
-            let extraDiskNotice = startupMedia.count > 2 ? " · 已装入前两张盘" : ""
-            status = "\(game.bootROM.title) · \(game.diskFirmware.title) · \(game.title)\(extraDiskNotice)"
-            reset()
-            recordRecentGame(.bundled(game))
-        } catch {
-            status = "无法装入内置游戏：\(game.title)"
         }
-    }
-
-    private static func restoredRecentGames(from defaults: UserDefaults) -> [RecentGame] {
-        let games: [RecentGame]
-        if let storedRecords = defaults.array(forKey: recentGamesDefaultsKey) as? [[String]] {
-            games = storedRecords.compactMap(RecentGame.init(storageRecord:))
-        } else {
-            // v0.1.4 only stored built-in game enum values. Preserve those
-            // shortcuts once while moving to the mixed, versioned format.
-            games = (defaults.stringArray(forKey: legacyRecentBundledGamesDefaultsKey) ?? [])
-                .compactMap(BundledGame.init(rawValue:))
-                .map(RecentGame.bundled)
-        }
-        return normalizedRecentGames(games)
-    }
-
-    private static func normalizedRecentGames(_ games: [RecentGame]) -> [RecentGame] {
-        var seen = Set<String>()
-        return games.filter { seen.insert($0.id).inserted }.prefix(recentGamesLimit).map { $0 }
     }
 
     private func recordRecentGame(_ game: RecentGame) {
-        recentGames = Self.normalizedRecentGames([game] + recentGames)
-        persistRecentGames()
+        recentGames = recentGameStore.record(game, after: recentGames)
     }
 
     private func removeRecentGame(_ game: RecentGame) {
-        recentGames.removeAll { $0.id == game.id }
-        persistRecentGames()
-    }
-
-    private func persistRecentGames() {
-        defaults.set(recentGames.map(\.storageRecord), forKey: Self.recentGamesDefaultsKey)
+        recentGames = recentGameStore.remove(game, from: recentGames)
     }
 
     func loadRecentGame(_ game: RecentGame) {
@@ -1032,14 +1032,24 @@ final class AppleIIMachine: ObservableObject {
     }
 
     func loadBundledSoftware(_ software: BundledSoftware) {
-        persistWordPerfectWorkDisk()
         wordPerfectWorkDiskURL = nil
-
-        // Select the machine before mounting so the reset vector and the
-        // controller firmware belong to the software's intended hardware.
-        selectROM(software.bootROM)
-        do {
-            let startupMedia = try software.startupDisks.enumerated().map { drive, disk in
+        if Self.isAutomatedRun {
+            selectedBootROM = software.bootROM
+            hasExternalROM = true
+            activeMediaKind = .software
+            diskDescription = software.startupDisks[0].description
+            externalDiskDescription = software.startupDisks.count > 1
+                ? software.startupDisks[1].description
+                : "未插入"
+        }
+        status = "正在读取内置软件：\(software.title)…"
+        let lock = emulationLock
+        let memory = memory
+        let cpu = cpu!
+        submitEmulationTask { [weak self] in
+            var lockHeld = false
+            do {
+                let startupMedia = try software.startupDisks.enumerated().map { drive, disk in
                 guard let url = AppResources.bundle.url(
                     forResource: disk.resourceName,
                     withExtension: disk.resourceExtension
@@ -1047,8 +1057,25 @@ final class AppleIIMachine: ObservableObject {
                     throw CocoaError(.fileNoSuchFile)
                 }
                 return (drive: drive, disk: disk, data: try Data(contentsOf: url))
-            }
-            try withEmulationLock {
+                }
+                let rom = try AppleIIROMImages.iiE(software.bootROM)
+                let wordPerfectWorkDisk: (url: URL, data: Data)?
+                if software == .wordPerfect11 {
+                    let persistentURL = try Self.wordPerfectWorkDiskStorageURL()
+                    if FileManager.default.fileExists(atPath: persistentURL.path) {
+                        wordPerfectWorkDisk = (persistentURL, try Data(contentsOf: persistentURL))
+                    } else {
+                        guard let bundledURL = AppResources.bundle.url(forResource: "WordPerfect 1.1 Work Disk", withExtension: "dsk") else {
+                            throw CocoaError(.fileNoSuchFile)
+                        }
+                        wordPerfectWorkDisk = (persistentURL, try Data(contentsOf: bundledURL))
+                    }
+                } else {
+                    wordPerfectWorkDisk = nil
+                }
+                lock.lock()
+                lockHeld = true
+                try memory.installIIeROM(rom.motherboardROM, diskROM: rom.diskROM, choice: software.bootROM)
                 memory.ejectDisk(drive: 0)
                 memory.ejectDisk(drive: 1)
                 for (drive, disk, data) in startupMedia {
@@ -1058,18 +1085,32 @@ final class AppleIIMachine: ObservableObject {
                         drive: drive
                     )
                 }
+                if let workDisk = wordPerfectWorkDisk {
+                    try memory.mountDiskImageData(workDisk.data, fileExtension: workDisk.url.pathExtension, drive: 1)
+                }
+                let bootsDriveOne = memory.hasDisk(in: 0)
+                memory.coldBootSystemState()
+                cpu.reset()
+                let result = (snapshot: memory.makeVideoSnapshot(), bootsDriveOne: bootsDriveOne)
+                lock.unlock()
+                lockHeld = false
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.selectedBootROM = software.bootROM
+                    self.hasExternalROM = true
+                    self.diskDescription = startupMedia[0].disk.description
+                    self.activeMediaKind = .software
+                    self.externalDiskDescription = wordPerfectWorkDisk == nil
+                        ? (startupMedia.count > 1 ? startupMedia[1].disk.description : "未插入")
+                        : "WordPerfect 工作盘（/WORK）"
+                    self.wordPerfectWorkDiskURL = wordPerfectWorkDisk?.url
+                    self.publishColdBoot(result, idleStatus: "\(software.bootROM.title) · \(software.title)")
+                    if wordPerfectWorkDisk != nil { self.persistWordPerfectWorkDisk() }
+                }
+            } catch {
+                if lockHeld { lock.unlock() }
+                DispatchQueue.main.async { [weak self] in self?.status = "无法装入内置软件：\(software.title)" }
             }
-            diskDescription = startupMedia[0].disk.description
-            activeMediaKind = .software
-            externalDiskDescription = startupMedia.count > 1 ? startupMedia[1].disk.description : "未插入"
-            if software == .wordPerfect11 {
-                try mountWordPerfectWorkDisk()
-                externalDiskDescription = "WordPerfect 工作盘（/WORK）"
-            }
-            status = "\(software.bootROM.title) · \(software.title)"
-            reset()
-        } catch {
-            status = "无法装入内置软件：\(software.title)"
         }
     }
 
@@ -1085,9 +1126,8 @@ final class AppleIIMachine: ObservableObject {
         loadDownloadedGame(at: [game.url])
     }
 
-    /// Opens an image from the collection downloaded alongside this project.
-    /// Keeping this collection outside the app bundle makes it possible to
-    /// resume or extend the archive without rebuilding the application.
+    /// Opens additional local images. The packaged game menu is independent
+    /// of the workspace; this picker only provides an explicit user choice.
     func chooseDownloadedGame() {
         let panel = NSOpenPanel()
         panel.title = "从已下载游戏库装入游戏"
@@ -1118,17 +1158,17 @@ final class AppleIIMachine: ObservableObject {
         status = "正在读取 \(mountedURLs.count) 张游戏磁盘…"
         Task { [weak self] in
             let result = await Task.detached(priority: .userInitiated) {
-                Result { try mountedURLs.map { ($0, try Data(contentsOf: $0)) } }
+                Result { (try AppleIIROMImages.iiE(.appleIIeEnhanced), try mountedURLs.map { ($0, try Data(contentsOf: $0)) }) }
             }.value
             guard let self else { return }
 
             switch result {
-            case let .success(images):
+            case let .success((rom, images)):
                 do {
                     self.persistWordPerfectWorkDisk()
                     self.wordPerfectWorkDiskURL = nil
                     try self.withEmulationLock {
-                        try self.memory.loadBundledAppleIIeROM(.appleIIeEnhanced)
+                        try self.memory.installIIeROM(rom.motherboardROM, diskROM: rom.diskROM, choice: .appleIIeEnhanced)
                         self.memory.ejectDisk(drive: 0)
                         self.memory.ejectDisk(drive: 1)
                         for (drive, image) in images.enumerated() {
@@ -1349,26 +1389,28 @@ final class AppleIIMachine: ObservableObject {
         }
     }
 
+    func saveDiskAsWOZ(drive: Int = 0) {
+        guard let data = withEmulationLock({ memory.wozImage(drive: drive) }) else {
+            status = "驱动器 \(drive + 1) 的磁盘无法导出为 .woz"
+            return
+        }
+        let panel = NSSavePanel()
+        panel.title = "保存 Apple II WOZ 磁盘映像"
+        panel.nameFieldStringValue = "AppleII-Drive\(drive + 1).woz"
+        panel.allowedContentTypes = [.init(filenameExtension: "woz")!]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try data.write(to: url, options: .atomic)
+            setDiskDescription(url.lastPathComponent, drive: drive)
+            status = "已保存驱动器 \(drive + 1)：\(url.lastPathComponent)"
+        } catch {
+            status = "无法保存 \(url.lastPathComponent)"
+        }
+    }
+
     private func setDiskDescription(_ description: String, drive: Int) {
         if drive == 0 { diskDescription = description }
         else { externalDiskDescription = description }
-    }
-
-    private func mountWordPerfectWorkDisk() throws {
-        let persistentURL = try Self.wordPerfectWorkDiskStorageURL()
-        wordPerfectWorkDiskURL = persistentURL
-        if FileManager.default.fileExists(atPath: persistentURL.path) {
-            try withEmulationLock { try memory.mountDiskImage(at: persistentURL, drive: 1) }
-            return
-        }
-        guard let bundledURL = AppResources.bundle.url(
-            forResource: "WordPerfect 1.1 Work Disk",
-            withExtension: "dsk"
-        ) else {
-            throw CocoaError(.fileNoSuchFile)
-        }
-        try withEmulationLock { try memory.mountDiskImage(at: bundledURL, drive: 1) }
-        persistWordPerfectWorkDisk()
     }
 
     private func persistWordPerfectWorkDisk() {
@@ -1379,12 +1421,16 @@ final class AppleIIMachine: ObservableObject {
         }
     }
 
-    private static func wordPerfectWorkDiskStorageURL() throws -> URL {
-        let isRunningTests = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+    nonisolated private static var isAutomatedRun: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
             || Bundle.allBundles.contains { $0.bundleURL.pathExtension == "xctest" }
             || CommandLine.arguments.contains { argument in
                 argument.hasPrefix("--verify-") || argument.hasPrefix("--trace-")
             }
+    }
+
+    nonisolated private static func wordPerfectWorkDiskStorageURL() throws -> URL {
+        let isRunningTests = isAutomatedRun
         let base: URL
         if isRunningTests {
             base = FileManager.default.temporaryDirectory
@@ -1424,8 +1470,8 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
 
         var title: String { self == .thirteenSector ? "Disk II 13 扇区" : "Disk II 16 扇区" }
     }
-    private(set) var bytes = [UInt8](repeating: 0, count: 65_536)
-    private var auxiliaryBytes = [UInt8](repeating: 0, count: 65_536)
+    var bytes = [UInt8](repeating: 0, count: 65_536)
+    var auxiliaryBytes = [UInt8](repeating: 0, count: 65_536)
     // A 16 KB Language Card turns a 48 KB Apple II+ into the conventional
     // 64 KB configuration required by ProDOS and tools such as Copy II Plus.
     // $D000-$DFFF has two selectable 4 KB banks; $E000-$FFFF is the shared
@@ -1443,13 +1489,13 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
     private var languageCardBank2Selected = true
     private var languageCardWriteArmed = false
     private var languageCardWriteEnabled = false
-    private var iicROM = [UInt8]()
-    private var iicROMBank = 0
-    private var iieROM = [UInt8]()
-    private var plusSlot6ROM = [UInt8]()
-    private var plusDiskFirmware: DiskIIFirmware?
-    private(set) var model: Model = .appleIIPlus
-    private(set) var supportsMouseText = false
+    var iicROM = [UInt8]()
+    var iicROMBank = 0
+    var iieROM = [UInt8]()
+    var plusSlot6ROM = [UInt8]()
+    var plusDiskFirmware: DiskIIFirmware?
+    var model: Model = .appleIIPlus
+    var supportsMouseText = false
     var modelName: String {
         switch model {
         case .appleIIPlus: return "Apple II+"
@@ -1764,82 +1810,6 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
         }
     }
 
-    func loadBundledAppleIIcROM(named name: String) throws {
-        guard let url = AppResources.bundle.url(forResource: name, withExtension: "bin") else {
-            throw CocoaError(.fileNoSuchFile)
-        }
-        let data = try Data(contentsOf: url)
-        guard data.count == 0x4000 || data.count == 0x8000 else { throw CocoaError(.fileReadCorruptFile) }
-        model = .appleIIc
-        supportsMouseText = true
-        let bank = Array(data)
-        iicROM = data.count == 0x4000 ? bank + bank : bank
-        iicROMBank = 0
-        iieROM = []
-    }
-
-    func loadBundledAppleIIPlusROM(diskFirmware: DiskIIFirmware) throws {
-        guard let systemURL = AppResources.bundle.url(forResource: "AppleIIPlus-Applesoft-Autostart", withExtension: "rom"),
-              let diskURL = AppResources.bundle.url(forResource: diskFirmware.resourceName, withExtension: "rom") else {
-            throw CocoaError(.fileNoSuchFile)
-        }
-        let systemROM = try Data(contentsOf: systemURL)
-        let diskROM = try Data(contentsOf: diskURL)
-        guard systemROM.count == 0x3000, diskROM.count == 0x100 else { throw CocoaError(.fileReadCorruptFile) }
-        model = .appleIIPlus
-        supportsMouseText = false
-        iicROM = []
-        iicROMBank = 0
-        iieROM = []
-        plusSlot6ROM = Array(diskROM)
-        plusDiskFirmware = diskFirmware
-        bytes = [UInt8](repeating: 0, count: 65_536)
-        auxiliaryBytes = [UInt8](repeating: 0, count: 65_536)
-        clearLanguageCard()
-        bytes.replaceSubrange(0xD000..<0x10000, with: systemROM)
-    }
-
-    /// The IIe keeps a 16 KB motherboard ROM at $C000-$FFFF, with I/O
-    /// overlays in the $C0xx page and the Disk II controller ROM in slot 6.
-    /// Paired 2764 dumps are stored in address order: CD ($C000-$DFFF), then
-    /// EF ($E000-$FFFF). The CF 27128 dump contains that same 16 KB image.
-    func loadBundledAppleIIeROM(_ choice: AppleIIMachine.BootROM) throws {
-        let names: [String]
-        switch choice {
-        case .appleIIeEnhanced:
-            names = ["AppleIIe-CD-Enhanced-342-0304-A", "AppleIIe-EF-Enhanced-342-0303-A"]
-        case .appleIIeUnenhanced:
-            names = ["AppleIIe-CD-Unenhanced-342-0135-B", "AppleIIe-EF-Unenhanced-342-0134-A"]
-        case .appleIIeCF:
-            names = ["AppleIIe-CF-342-0349-B"]
-        default:
-            throw CocoaError(.fileReadCorruptFile)
-        }
-        var image = Data()
-        for name in names {
-            guard let url = AppResources.bundle.url(forResource: name, withExtension: "bin") else {
-                throw CocoaError(.fileNoSuchFile)
-            }
-            image.append(try Data(contentsOf: url))
-        }
-        guard image.count == 0x4000 else { throw CocoaError(.fileReadCorruptFile) }
-        guard let diskURL = AppResources.bundle.url(forResource: DiskIIFirmware.sixteenSector.resourceName, withExtension: "rom") else {
-            throw CocoaError(.fileNoSuchFile)
-        }
-        let diskROM = try Data(contentsOf: diskURL)
-        guard diskROM.count == 0x100 else { throw CocoaError(.fileReadCorruptFile) }
-        model = .appleIIe
-        supportsMouseText = choice == .appleIIeEnhanced
-        iicROM = []
-        iicROMBank = 0
-        iieROM = Array(image)
-        plusSlot6ROM = Array(diskROM)
-        plusDiskFirmware = .sixteenSector
-        bytes = [UInt8](repeating: 0, count: 65_536)
-        auxiliaryBytes = [UInt8](repeating: 0, count: 65_536)
-        clearLanguageCard()
-    }
-
     func resetROMBank() { iicROMBank = 0 }
 
     func resetHardwareState() {
@@ -1953,7 +1923,7 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
         }
     }
 
-    private func clearLanguageCard() {
+    func clearLanguageCard() {
         languageCardBank1 = [UInt8](repeating: 0, count: 0x1000)
         languageCardBank2 = [UInt8](repeating: 0, count: 0x1000)
         languageCardHigh = [UInt8](repeating: 0, count: 0x2000)
@@ -2070,6 +2040,7 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
         }
     }
     func nibImage(drive: Int = 0) -> Data? { diskController.nibImage(drive: drive) }
+    func wozImage(drive: Int = 0) -> Data? { diskController.wozImage(drive: drive) }
     func ejectDisk(drive: Int = 0) { diskController.eject(drive: drive) }
     var hasDisk: Bool { diskController.hasDisk }
     func hasDisk(in drive: Int) -> Bool { diskController.hasDisk(in: drive) }

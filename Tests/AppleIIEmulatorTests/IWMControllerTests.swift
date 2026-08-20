@@ -195,11 +195,30 @@ final class IWMControllerTests: XCTestCase {
         let disk = IWMController()
         try disk.mountImage(woz1Image(), fileExtension: "woz")
         XCTAssertTrue(disk.hasDisk)
-        XCTAssertTrue(disk.isWriteProtected())
+        XCTAssertFalse(disk.isWriteProtected(), "WOZ INFO write-protect bit must be honoured")
         _ = disk.access(0x09, write: nil)
         _ = disk.access(0x0C, write: nil)
         disk.advance(by: 64)
         XCTAssertGreaterThan(disk.nibbleReads, 0)
+    }
+
+    func testWOZ2SaveAsRoundTripsBitTracksAndWriteProtectSense() throws {
+        let original = woz2Image(writeProtected: false)
+        let disk = IWMController()
+        try disk.mountImage(original, fileExtension: "woz")
+        XCTAssertFalse(disk.isWriteProtected())
+
+        let saved = try XCTUnwrap(disk.wozImage())
+        XCTAssertEqual(Array(saved.prefix(4)), Array("WOZ2".utf8))
+        XCTAssertNotEqual(Array(saved[8..<12]), [0, 0, 0, 0], "export must include a CRC")
+
+        let restored = IWMController()
+        try restored.mountImage(saved, fileExtension: "woz")
+        XCTAssertFalse(restored.isWriteProtected())
+        _ = restored.access(0x09, write: nil)
+        _ = restored.access(0x0C, write: nil)
+        restored.advance(by: 64)
+        XCTAssertGreaterThan(restored.nibbleReads, 0)
     }
 
     func testCleanedWOZGeneratesWeakBits() throws {
@@ -211,7 +230,11 @@ final class IWMControllerTests: XCTestCase {
         XCTAssertGreaterThan(disk.weakBitsGenerated, 0)
     }
 
-    private func woz2Image(cleaned: Bool = false, blankTrack: Bool = false) -> Data {
+    private func woz2Image(
+        cleaned: Bool = false,
+        blankTrack: Bool = false,
+        writeProtected: Bool = true
+    ) -> Data {
         var image = [UInt8]("WOZ2".utf8) + [0xFF, 0x0A, 0x0D, 0x0A] + [0, 0, 0, 0]
         func appendChunk(_ identifier: String, _ payload: [UInt8]) {
             image += Array(identifier.utf8)
@@ -222,7 +245,7 @@ final class IWMControllerTests: XCTestCase {
         var info = [UInt8](repeating: 0, count: 60)
         info[0] = 2 // INFO version
         info[1] = 1 // 5.25-inch
-        info[2] = 1 // source media is write-protected
+        info[2] = writeProtected ? 1 : 0
         info[4] = cleaned ? 1 : 0
         appendChunk("INFO", info)
 
