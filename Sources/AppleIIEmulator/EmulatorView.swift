@@ -25,13 +25,21 @@ struct EmulatorView: View {
 
     private var chassis: some View {
         GeometryReader { proxy in
-            let chassisWidth = min(proxy.size.width, ChassisLayout.preferredWidth)
+            // Fit the *entire* monitor-and-panel assembly in the available
+            // height. Without this limit, stretching a window horizontally
+            // could enlarge the monitor until the lower edge of the supplied
+            // control-panel artwork was clipped offscreen.
+            let heightLimitedWidth = ChassisLayout.maximumWidth(forAvailableHeight: proxy.size.height)
+            let chassisWidth = min(proxy.size.width, ChassisLayout.preferredWidth, heightLimitedWidth)
+            let panelHeight = ChassisLayout.panelHeight(for: chassisWidth)
 
-            VStack(spacing: 0) {
+            // The two supplied enclosure photographs meet at their metal
+            // edges. A tiny negative overlap avoids a transparent sampling
+            // seam from appearing between the independently scaled images.
+            VStack(spacing: -2) {
                 monitor(width: chassisWidth)
                 EmulatorControlsPanel(machine: machine)
-                    .frame(width: chassisWidth)
-                    .padding(.top, 12)
+                    .frame(width: chassisWidth, height: panelHeight)
                     .padding(.bottom, 18)
             }
             .frame(width: chassisWidth)
@@ -110,14 +118,26 @@ struct EmulatorView: View {
 private enum ChassisLayout {
     static let preferredWidth: CGFloat = 960
     static let minimumWidth: CGFloat = 720
-    static let panelHeight: CGFloat = 118
+    // The supplied control-panel reference is 2672×494. Keep this in step
+    // with `EmulatorControlsPanel` so the window never clips its artwork.
+    static let panelHeight: CGFloat = panelHeight(for: preferredWidth)
     static let verticalSpacing: CGFloat = 30
 
     static func monitorHeight(for width: CGFloat) -> CGFloat {
         width / (1448.0 / 1084.0)
     }
 
-    static let minimumHeight = monitorHeight(for: minimumWidth) + panelHeight + verticalSpacing
+    static func panelHeight(for width: CGFloat) -> CGFloat {
+        width / EmulatorControlsPanel.artworkAspectRatio
+    }
+
+    static func maximumWidth(forAvailableHeight height: CGFloat) -> CGFloat {
+        let usableHeight = max(0, height - verticalSpacing)
+        let heightPerWidth = (1 / (1448.0 / 1084.0)) + (1 / EmulatorControlsPanel.artworkAspectRatio)
+        return usableHeight / heightPerWidth
+    }
+
+    static let minimumHeight = monitorHeight(for: minimumWidth) + panelHeight(for: minimumWidth) + verticalSpacing
     static let idealHeight = monitorHeight(for: preferredWidth) + panelHeight + verticalSpacing
 }
 
@@ -182,6 +202,23 @@ private struct WindowTransparencyConfigurator: NSViewRepresentable {
             window.backgroundColor = .clear
             window.titlebarAppearsTransparent = true
             window.hasShadow = false
+
+            // A previously saved window frame can predate a taller panel
+            // asset. Set a real AppKit minimum here as well as SwiftUI's view
+            // minimum, otherwise the monitor grows while the controls are
+            // silently clipped below the window.
+            let minimum = NSSize(
+                width: ChassisLayout.minimumWidth,
+                height: ChassisLayout.minimumHeight
+            )
+            window.contentMinSize = minimum
+            if let contentView = window.contentView,
+               (contentView.bounds.width < minimum.width || contentView.bounds.height < minimum.height) {
+                window.setContentSize(NSSize(
+                    width: ChassisLayout.preferredWidth,
+                    height: ChassisLayout.idealHeight
+                ))
+            }
         }
 
         private func observeFullscreenState() {

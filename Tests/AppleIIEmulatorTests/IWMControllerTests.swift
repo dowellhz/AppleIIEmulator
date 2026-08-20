@@ -77,6 +77,27 @@ final class IWMControllerTests: XCTestCase {
         XCTAssertTrue(disk.hasDisk(in: 0))
     }
 
+    func testIWMStepperPhasesDoNotLeakAcrossDriveSelect() throws {
+        let disk = IWMController()
+        try disk.mountDSK(DiskII.diagnosticDSK(), drive: 0)
+        try disk.mountDSK(DiskII.diagnosticDSK(), drive: 1)
+
+        // Seek Drive 1 by energizing phases 0, 1 and 2.
+        _ = disk.access(0x01, write: nil)
+        _ = disk.access(0x03, write: nil)
+        _ = disk.access(0x05, write: nil)
+        XCTAssertEqual(disk.currentTrack(in: 0), 1)
+
+        // The same phase accesses must be rising edges for Drive 2 as well.
+        // A controller-global phase latch leaves Drive 2 at track zero here.
+        _ = disk.access(0x0B, write: nil)
+        _ = disk.access(0x01, write: nil)
+        _ = disk.access(0x03, write: nil)
+        _ = disk.access(0x05, write: nil)
+        XCTAssertEqual(disk.currentTrack(in: 1), 1)
+        XCTAssertEqual(disk.currentTrack(in: 0), 1)
+    }
+
     func testIWMAllowsExtended37TrackSectorImage() throws {
         // WordPerfect 1.1 is distributed as a 37-track 5.25-inch DOS-order
         // image.  It must not be silently truncated to a normal 35-track disk.

@@ -46,6 +46,7 @@ func appleII80ColumnTextCell(byte: UInt8, alternateCharset: Bool, flashOn: Bool,
 final class AppleIIMachine: ObservableObject {
     enum BootROM: String, CaseIterable, Identifiable, Hashable {
         case appleIIPlus
+        case appleIIeGameCompatible
         case appleIIcROM00
         case appleIIcROM03
         case appleIIcROM04
@@ -59,7 +60,8 @@ final class AppleIIMachine: ObservableObject {
         var id: Self { self }
         var title: String {
             switch self {
-            case .appleIIPlus: return "Apple II+（游戏兼容）"
+            case .appleIIPlus: return "Apple II+"
+            case .appleIIeGameCompatible: return "Apple IIe（游戏兼容）"
             case .appleIIcROM00: return "Apple IIc ROM 00"
             case .appleIIcROM03: return "Apple IIc ROM 03"
             case .appleIIcROM04: return "Apple IIc ROM 04"
@@ -74,7 +76,7 @@ final class AppleIIMachine: ObservableObject {
 
         var resourceName: String? {
             switch self {
-            case .appleIIPlus: return nil
+            case .appleIIPlus, .appleIIeGameCompatible: return nil
             case .appleIIcROM00: return "AppleIIc-ROM00-342-0033-A"
             case .appleIIcROM03: return "AppleIIc-ROM03-341-0445-A"
             case .appleIIcROM04: return "AppleIIc-ROM04-341-0445-B"
@@ -83,43 +85,79 @@ final class AppleIIMachine: ObservableObject {
             }
         }
 
-        static let menuChoices: [BootROM] = [.appleIIPlus, .appleIIcROM00, .appleIIcROM03, .appleIIcROM04, .appleIIcROMFF, .appleIIeEnhanced, .appleIIeUnenhanced, .appleIIeCF, .diagnostic]
+        static let menuChoices: [BootROM] = [.appleIIeGameCompatible, .appleIIPlus, .appleIIcROM00, .appleIIcROM03, .appleIIcROM04, .appleIIcROMFF, .appleIIeEnhanced, .appleIIeUnenhanced, .appleIIeCF, .diagnostic]
     }
 
     /// A small, deterministic set of games shown in the default GAME menu.
     /// They are packaged with the app so launching one never opens a file picker.
     enum BundledGame: String, CaseIterable, Identifiable {
-        case falcons
-        case jBird
-        case oceanNight
+        case lodeRunner
+        case princeOfPersia
+        case wizardry
+        case karateka
 
         var id: Self { self }
 
+        struct StartupDisk {
+            let resourceName: String
+            let resourceExtension: String
+            let description: String
+        }
+
         var title: String {
             switch self {
-            case .falcons: return "Falcons (4am crack)"
-            case .jBird: return "J-Bird"
-            case .oceanNight: return "Ocean Night"
+            case .lodeRunner: return "Lode Runner (1983)"
+            case .princeOfPersia: return "Prince of Persia (1989)"
+            case .wizardry: return "Wizardry (1981)"
+            case .karateka: return "Karateka (1984)"
             }
         }
 
-        var resourceName: String {
+        /// The two Disk II drives are real physical drives. Multi-disk games
+        /// boot with their first two disks inserted; any later disk change is
+        /// performed through the normal Drive 1/Drive 2 media controls.
+        var startupDisks: [StartupDisk] {
             switch self {
-            case .falcons: return "Falcons (4am crack)"
-            case .jBird: return "j-bird"
-            case .oceanNight: return "Ocean Night (compatiboot)"
-            }
-        }
-
-        var resourceExtension: String {
-            switch self {
-            case .falcons, .jBird, .oceanNight: return "dsk"
+            case .lodeRunner:
+                return [.init(resourceName: "Lode Runner (1983)", resourceExtension: "dsk", description: title)]
+            case .princeOfPersia:
+                // The two-drive crack's boot page reads Disk 1 from Drive 1,
+                // then immediately switches to Drive 2 and expects Disk 3.
+                // Disk 2 is only used for its later, explicit disk-change
+                // prompt; mounting it here lets the title appear but corrupts
+                // the load that starts after the player presses a key.
+                return [
+                    .init(resourceName: "Prince of Persia (1989) Disk 1", resourceExtension: "dsk", description: "Prince of Persia 磁盘 1"),
+                    .init(resourceName: "Prince of Persia (1989) Disk 3", resourceExtension: "dsk", description: "Prince of Persia 磁盘 3")
+                ]
+            case .wizardry:
+                return [
+                    .init(resourceName: "Wizardry (1981) Disk 1", resourceExtension: "dsk", description: "Wizardry 磁盘 1"),
+                    .init(resourceName: "Wizardry (1981) Disk 2", resourceExtension: "dsk", description: "Wizardry 磁盘 2")
+                ]
+            case .karateka:
+                return [.init(resourceName: "Karateka (1984)", resourceExtension: "dsk", description: title)]
             }
         }
 
         var diskFirmware: AppleIIMemory.DiskIIFirmware {
             switch self {
-            case .falcons, .jBird, .oceanNight: return .sixteenSector
+            case .lodeRunner, .princeOfPersia, .wizardry, .karateka: return .sixteenSector
+            }
+        }
+
+        /// The game launcher uses a 128 KB enhanced IIe. This retains Apple
+        /// II+ game compatibility while also satisfying titles such as Prince
+        /// of Persia that explicitly require a IIc or IIe with 128 KB.
+        var bootROM: BootROM {
+            switch self {
+            case .wizardry:
+                // The original Wizardry 1.1 boot chain is an Apple II+
+                // Pascal loader.  Use the machine it was authored for: the
+                // second disk remains mounted in Drive 2 and is not a ROM.
+                return .appleIIPlus
+            case .lodeRunner, .princeOfPersia, .karateka:
+                return .appleIIeGameCompatible
             }
         }
 
@@ -199,6 +237,12 @@ final class AppleIIMachine: ObservableObject {
         }
     }
 
+    enum ActiveMediaKind {
+        case none
+        case game
+        case software
+    }
+
     @Published private(set) var isRunning = true
     /// Runs the same 6502/bus path at twice the normal 1.0218 MHz rate.  This
     /// is deliberately a clock multiplier rather than a UI shortcut: every
@@ -213,6 +257,9 @@ final class AppleIIMachine: ObservableObject {
     @Published private(set) var diskDescription = "未插入"
     @Published private(set) var externalDiskDescription = "未插入"
     @Published private(set) var hardDiskDescription = "未插入"
+    /// Drives the physical GAME/SOFTWARE LEDs in the panel without making a
+    /// UI choice alter the emulated hardware state.
+    @Published private(set) var activeMediaKind: ActiveMediaKind = .none
 
     private let gameLibrary = GameLibrary()
     /// Grouping keeps the in-app GAME menu navigable even with a large game
@@ -243,6 +290,10 @@ final class AppleIIMachine: ObservableObject {
     private var lastEmulationTick = ProcessInfo.processInfo.systemUptime
     private var fractionalCPUCycles = 0.0
     private var inputState = AppleIIInputState()
+    /// Wizardry boots from one disk and later needs a physical replacement
+    /// in Drive 1. Its bundled launch workflow performs that same live media
+    /// change only when the original game asks for the Scenario disk.
+    private var wizardryScenarioSwapPending = false
     /// A diskless Apple II+ reaches ROM Applesoft through the Autostart ROM's
     /// warm-reset path after it has shown the power-on banner.
     private var applesoftWarmStartDeadline: TimeInterval?
@@ -318,8 +369,15 @@ final class AppleIIMachine: ObservableObject {
 
     func tick() {
         let now = ProcessInfo.processInfo.systemUptime
-        defer { lastEmulationTick = now }
-        guard isRunning, !cpuSliceQueued else { return }
+        guard isRunning else {
+            lastEmulationTick = now
+            return
+        }
+        // Do not discard elapsed emulated time while a prior slice is still
+        // executing. Disk-heavy loaders can legitimately take longer than a
+        // UI frame; updating this timestamp here would make the machine fall
+        // permanently behind its 1.0218 MHz clock despite using a full CPU.
+        guard !cpuSliceQueued else { return }
         // Audio output is clocked independently of the UI. Derive the work
         // budget from elapsed wall time so a slow frame does not slow the
         // emulated speaker and lower the pitch. Cap catch-up to avoid a long
@@ -330,6 +388,7 @@ final class AppleIIMachine: ObservableObject {
         let cycles = Int(fractionalCPUCycles)
         fractionalCPUCycles -= Double(cycles)
         guard cycles > 0 else { return }
+        lastEmulationTick = now
         cpuSliceQueued = true
         let generation = executionGeneration
         let warmStart = applesoftWarmStartDeadline.map { now >= $0 } ?? false
@@ -354,8 +413,29 @@ final class AppleIIMachine: ObservableObject {
                 }
                 self.videoSnapshot = snapshot
                 self.refreshToken &+= 1
+                self.swapWizardryScenarioWhenPrompted(snapshot)
             }
         }
+    }
+
+    private func swapWizardryScenarioWhenPrompted(_ snapshot: AppleIIVideoSnapshot) {
+        guard wizardryScenarioSwapPending,
+              snapshot.textMode,
+              wizardryScenarioPromptIsVisible(in: snapshot) else { return }
+        wizardryScenarioSwapPending = false
+        // Hold the CPU only while the host reads and inserts the replacement.
+        // The media action itself remains a normal Disk II swap and does not
+        // reset the Apple II or alter any emulated RAM.
+        isRunning = false
+        swapWizardryScenarioIntoDriveOne()
+    }
+
+    private func wizardryScenarioPromptIsVisible(in snapshot: AppleIIVideoSnapshot) -> Bool {
+        let screen = String(snapshot.text.map { byte in
+            let code = byte & 0x7F
+            return code >= 0x20 && code < 0x7F ? Character(UnicodeScalar(code)) : " "
+        })
+        return screen.contains("SCENARIO MASTER IN DRV 1")
     }
 
     private func withEmulationLock<T>(_ body: () throws -> T) rethrows -> T {
@@ -389,6 +469,7 @@ final class AppleIIMachine: ObservableObject {
     /// that silently falls back into BASIC cannot look like a successful boot.
     var programCounter: UInt16 { withEmulationLock { cpu.pc } }
     var lastUnsupportedInstructionAddress: UInt16 { withEmulationLock { cpu.lastUnsupportedInstructionAddress } }
+    var firstUnsupportedInstructionTrace: [(UInt16, UInt8)] { withEmulationLock { cpu.firstUnsupportedTrace } }
     var recentInstructions: [(UInt16, UInt8)] { withEmulationLock { cpu.recentInstructions } }
     /// Observable boot-progress seam: disk-loaded Apple II programs execute
     /// from RAM below $C000, whereas the reset firmware lives in ROM above it.
@@ -485,6 +566,7 @@ final class AppleIIMachine: ObservableObject {
         guard choice != .external else { return }
         selectedBootROM = choice
         externalROMName = nil
+        activeMediaKind = .none
         switch choice {
         case .appleIIPlus:
             do {
@@ -504,9 +586,10 @@ final class AppleIIMachine: ObservableObject {
                 installDiagnosticROM()
                 status = "内置诊断 ROM（\(choice.title) 未找到）"
             }
-        case .appleIIeEnhanced, .appleIIeUnenhanced, .appleIIeCF:
+        case .appleIIeGameCompatible, .appleIIeEnhanced, .appleIIeUnenhanced, .appleIIeCF:
             do {
-                try withEmulationLock { try memory.loadBundledAppleIIeROM(choice) }
+                let iiEROM: BootROM = choice == .appleIIeGameCompatible ? .appleIIeEnhanced : choice
+                try withEmulationLock { try memory.loadBundledAppleIIeROM(iiEROM) }
                 hasExternalROM = true
                 status = "\(choice.title)（内置） · \(diskDescription)"
             } catch {
@@ -577,31 +660,92 @@ final class AppleIIMachine: ObservableObject {
     }
 
     func loadBundledGame(_ game: BundledGame) {
-        guard let url = AppResources.bundle.url(
-            forResource: game.resourceName,
-            withExtension: game.resourceExtension
-        ) else {
-            status = "未找到内置游戏：\(game.title)"
-            return
-        }
-
         do {
-            try withEmulationLock { try memory.loadBundledAppleIIPlusROM(diskFirmware: game.diskFirmware) }
+            wizardryScenarioSwapPending = game == .wizardry
+            let startupMedia = try game.startupDisks.enumerated().map { index, disk in
+                guard let url = AppResources.bundle.url(
+                    forResource: disk.resourceName,
+                    withExtension: disk.resourceExtension
+                ) else {
+                    throw CocoaError(.fileNoSuchFile)
+                }
+                return (drive: index, disk: disk, data: try Data(contentsOf: url))
+            }
             // Legacy 13-sector archival images are often padded to the
             // modern 140 KB .dsk length, so their byte count alone cannot
             // identify the format. The bundled title declares its controller
             // firmware and mounts through the matching sector codec.
-            if game.diskFirmware == .thirteenSector {
-                try withEmulationLock { try memory.mountThirteenSectorDisk(Data(contentsOf: url), drive: 0) }
-            } else {
-                try withEmulationLock { try memory.mountDiskImage(at: url, drive: 0) }
+            try withEmulationLock {
+                switch game.bootROM {
+                case .appleIIPlus:
+                    try memory.loadBundledAppleIIPlusROM(diskFirmware: game.diskFirmware)
+                case .appleIIeGameCompatible, .appleIIeEnhanced:
+                    try memory.loadBundledAppleIIeROM(.appleIIeEnhanced)
+                default:
+                    throw CocoaError(.fileReadCorruptFile)
+                }
+                memory.ejectDisk(drive: 0)
+                memory.ejectDisk(drive: 1)
+                for (drive, disk, data) in startupMedia.prefix(2) {
+                    if game.diskFirmware == .thirteenSector {
+                        try memory.mountThirteenSectorDisk(data, drive: drive)
+                    } else if ["dsk", "do"].contains(disk.resourceExtension.lowercased()) {
+                        try memory.mountDSK(data, drive: drive)
+                    } else {
+                        try memory.mountDiskImageData(data, fileExtension: disk.resourceExtension, drive: drive)
+                    }
+                }
             }
-            selectedBootROM = .appleIIPlus
+            selectedBootROM = game.bootROM
+            activeMediaKind = .game
             diskDescription = game.title
-            status = "Apple II+ · \(game.diskFirmware.title) · \(game.title)"
+            externalDiskDescription = startupMedia.count > 1 ? startupMedia[1].disk.description : "未插入"
+            let extraDiskNotice = startupMedia.count > 2 ? " · 已装入前两张盘" : ""
+            let wizardrySwapNotice = game == .wizardry
+                ? " · 出现换盘提示时将自动换入 Scenario 盘"
+                : ""
+            status = "\(game.bootROM.title) · \(game.diskFirmware.title) · \(game.title)\(extraDiskNotice)\(wizardrySwapNotice)"
             reset()
         } catch {
             status = "无法装入内置游戏：\(game.title)"
+        }
+    }
+
+    var canSwapWizardryScenarioIntoDriveOne: Bool {
+        guard case .game = activeMediaKind else { return false }
+        return diskDescription == BundledGame.wizardry.title
+    }
+
+    /// Wizardry boots from its program disk, then expects its Scenario disk
+    /// in the *same* physical drive. This performs the normal live-media
+    /// action—no reset and no CPU shortcut—using the bundled Scenario image.
+    func swapWizardryScenarioIntoDriveOne() {
+        guard canSwapWizardryScenarioIntoDriveOne,
+              let url = AppResources.bundle.url(forResource: "Wizardry (1981) Disk 2", withExtension: "dsk") else {
+            return
+        }
+        status = "Wizardry · 正在将 Scenario 盘换入驱动器 1…"
+        Task { [weak self] in
+            let result = await Task.detached { Result { try Data(contentsOf: url) } }.value
+            guard let self else { return }
+            switch result {
+            case let .success(data):
+                do {
+                    try self.replaceDiskImageData(
+                        data,
+                        fileExtension: "dsk",
+                        description: "Wizardry Scenario 磁盘",
+                        drive: 0
+                    )
+                    self.isRunning = true
+                    self.fractionalCPUCycles = 0
+                    self.lastEmulationTick = ProcessInfo.processInfo.systemUptime
+                } catch {
+                    self.status = "无法换入 Wizardry Scenario 磁盘"
+                }
+            case .failure:
+                self.status = "无法读取 Wizardry Scenario 磁盘"
+            }
         }
     }
 
@@ -634,6 +778,7 @@ final class AppleIIMachine: ObservableObject {
                 }
             }
             diskDescription = startupMedia[0].disk.description
+            activeMediaKind = .software
             externalDiskDescription = startupMedia.count > 1 ? startupMedia[1].disk.description : "未插入"
             if software == .wordPerfect11 {
                 try mountWordPerfectWorkDisk()
@@ -655,7 +800,7 @@ final class AppleIIMachine: ObservableObject {
     }
 
     func loadDownloadedGame(_ game: GameLibrary.Game) {
-        loadDownloadedGame(at: game.url, title: game.title)
+        loadDownloadedGame(at: [game.url])
     }
 
     /// Opens an image from the collection downloaded alongside this project.
@@ -664,30 +809,74 @@ final class AppleIIMachine: ObservableObject {
     func chooseDownloadedGame() {
         let panel = NSOpenPanel()
         panel.title = "从已下载游戏库装入游戏"
-        panel.message = "选择一个 Apple II 5¼ 英寸游戏映像；将自动装入驱动器 1 并以 Apple II+ 启动"
+        panel.message = "可选择多张 Apple II 5¼ 英寸游戏映像；将按路径名称顺序把前两张装入驱动器 1 和 2，并以 Apple II+ 启动"
         panel.allowedContentTypes = ["dsk", "do", "d13", "po", "nib", "2mg", "2img", "woz"].compactMap { UTType(filenameExtension: $0) }
-        panel.allowsMultipleSelection = false
+        panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         if let directory = Self.downloadedGamesDirectory() {
             panel.directoryURL = directory
         }
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard panel.runModal() == .OK else { return }
+        let urls = Self.sortedDiskURLs(panel.urls)
+        guard !urls.isEmpty else { return }
 
-        loadDownloadedGame(at: url, title: url.lastPathComponent)
+        loadDownloadedGame(at: urls)
     }
 
-    private func loadDownloadedGame(at url: URL, title: String) {
-        do {
-            try withEmulationLock {
-                try memory.loadBundledAppleIIPlusROM(diskFirmware: .sixteenSector)
-                try memory.mountDiskImage(at: url, drive: 0)
+    private func loadDownloadedGame(at urls: [URL]) {
+        let orderedURLs = Self.sortedDiskURLs(urls)
+        guard !orderedURLs.isEmpty else { return }
+        let mountedURLs = Array(orderedURLs.prefix(2))
+        let queuedDiskCount = orderedURLs.count - mountedURLs.count
+
+        status = "正在读取 \(mountedURLs.count) 张游戏磁盘…"
+        Task { [weak self] in
+            let result = await Task.detached(priority: .userInitiated) {
+                Result { try mountedURLs.map { ($0, try Data(contentsOf: $0)) } }
+            }.value
+            guard let self else { return }
+
+            switch result {
+            case let .success(images):
+                do {
+                    self.persistWordPerfectWorkDisk()
+                    self.wordPerfectWorkDiskURL = nil
+                    try self.withEmulationLock {
+                        try self.memory.loadBundledAppleIIeROM(.appleIIeEnhanced)
+                        self.memory.ejectDisk(drive: 0)
+                        self.memory.ejectDisk(drive: 1)
+                        for (drive, image) in images.enumerated() {
+                            try self.memory.mountDiskImageData(
+                                image.1,
+                                fileExtension: image.0.pathExtension,
+                                drive: drive
+                            )
+                        }
+                    }
+                    self.selectedBootROM = .appleIIeGameCompatible
+                    self.activeMediaKind = .game
+                    self.diskDescription = images[0].0.lastPathComponent
+                    self.externalDiskDescription = images.count == 2 ? images[1].0.lastPathComponent : "未插入"
+                    if queuedDiskCount > 0 {
+                        self.status = "Apple IIe（游戏兼容） · 已按路径顺序装入前两张盘；其余 \(queuedDiskCount) 张需在需要时换盘"
+                    } else {
+                        self.status = images.count == 1
+                            ? "Apple IIe（游戏兼容） · Disk II 16 扇区 · \(images[0].0.lastPathComponent)"
+                            : "Apple IIe（游戏兼容） · 已按路径顺序装入驱动器 1 和 2"
+                    }
+                    self.reset()
+                } catch {
+                    self.status = "无法装入所选磁盘：仅支持 .dsk/.do/.d13/.po/.nib/.2mg/.2img"
+                }
+            case .failure:
+                self.status = "无法读取所选游戏磁盘"
             }
-            selectedBootROM = .appleIIPlus
-            diskDescription = title
-            status = "Apple II+ · Disk II 16 扇区 · \(title)"
-            reset()
-        } catch {
-            status = "无法装入 \(title)：仅支持 .dsk/.do/.d13/.po/.nib/.2mg/.2img"
+        }
+    }
+
+    private static func sortedDiskURLs(_ urls: [URL]) -> [URL] {
+        urls.sorted {
+            $0.path.localizedStandardCompare($1.path) == .orderedAscending
         }
     }
 
@@ -709,22 +898,94 @@ final class AppleIIMachine: ObservableObject {
             .first { FileManager.default.fileExists(atPath: $0.path) }
     }
 
-    func chooseDiskImage(drive: Int = 0) {
+    /// Opens media for an initial boot or a live disk swap.  Swapping media
+    /// deliberately leaves the CPU running: a Disk II has no reset line, and
+    /// multi-disk software depends on retaining all RAM state while the user
+    /// changes disks.
+    func chooseDiskImage(drive: Int = 0, resetsMachine: Bool = true) {
         let panel = NSOpenPanel()
-        panel.title = "插入 Apple II 磁盘映像到驱动器 \(drive + 1)"
-        panel.message = "支持 .dsk/.do、13 扇区 .d13、ProDOS .po、.nib，以及 5¼ 英寸 .2mg/.2img 映像"
+        let availableDriveCount = 2 - drive
+        panel.title = resetsMachine
+            ? (availableDriveCount == 2 ? "装入 Apple II 磁盘映像" : "插入 Apple II 磁盘映像到驱动器 \(drive + 1)")
+            : (availableDriveCount == 2 ? "运行中更换 Apple II 磁盘" : "运行中更换驱动器 \(drive + 1) 磁盘")
+        panel.message = resetsMachine
+            ? (availableDriveCount == 2
+                ? "可同时选择一或两张映像，将依次装入驱动器 1 和 2"
+                : "支持 .dsk/.do、13 扇区 .d13、ProDOS .po、.nib，以及 5¼ 英寸 .2mg/.2img 映像")
+            : "更换不会重置 Apple II；多盘游戏会从当前运行状态继续读取新磁盘"
         panel.allowedContentTypes = ["dsk", "do", "d13", "po", "nib", "2mg", "2img", "woz"].compactMap { UTType(filenameExtension: $0) }
-        panel.allowsMultipleSelection = false
+        panel.allowsMultipleSelection = availableDriveCount > 1
         panel.canChooseDirectories = false
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        do {
-            try withEmulationLock { try memory.mountDiskImage(at: url, drive: drive) }
-            setDiskDescription(url.lastPathComponent, drive: drive)
-            status = "\(currentROMTitle) · 驱动器 \(drive + 1)：\(url.lastPathComponent)"
-            reset()
-        } catch {
-            status = "无法读取 \(url.lastPathComponent)：仅支持 .dsk/.do/.d13/.po/.nib/.2mg/.2img"
+        guard panel.runModal() == .OK else { return }
+        let urls = panel.urls
+        guard !urls.isEmpty else { return }
+        guard urls.count <= availableDriveCount else {
+            status = "Apple II 只有两台 Disk II 驱动器；请一次选择最多 \(availableDriveCount) 张磁盘"
+            return
         }
+        status = "正在读取 \(urls.count) 张磁盘映像…"
+        Task { [weak self] in
+            let result = await Task.detached { Result { try urls.map { ($0, try Data(contentsOf: $0)) } } }.value
+            guard let self else { return }
+            switch result {
+            case let .success(images):
+                do {
+                    if resetsMachine && (drive == 0 && images.count > 1 || drive == 1) {
+                        self.persistWordPerfectWorkDisk()
+                        self.wordPerfectWorkDiskURL = nil
+                    }
+                    if resetsMachine {
+                        try self.withEmulationLock {
+                            for (offset, image) in images.enumerated() {
+                                try self.memory.mountDiskImageData(image.1, fileExtension: image.0.pathExtension, drive: drive + offset)
+                            }
+                        }
+                        for (offset, image) in images.enumerated() {
+                            self.setDiskDescription(image.0.lastPathComponent, drive: drive + offset)
+                        }
+                        self.activeMediaKind = .none
+                        self.status = images.count == 1
+                            ? "\(self.currentROMTitle) · 驱动器 \(drive + 1)：\(images[0].0.lastPathComponent)"
+                            : "\(self.currentROMTitle) · 已装入驱动器 1 和 2"
+                        self.reset()
+                    } else {
+                        for (offset, image) in images.enumerated() {
+                            try self.replaceDiskImageData(
+                                image.1,
+                                fileExtension: image.0.pathExtension,
+                                description: image.0.lastPathComponent,
+                                drive: drive + offset
+                            )
+                        }
+                    }
+                } catch {
+                    self.status = "无法读取磁盘映像：仅支持 .dsk/.do/.d13/.po/.nib/.2mg/.2img"
+                }
+            case .failure:
+                self.status = "无法读取所选磁盘映像"
+            }
+        }
+    }
+
+    /// Inserts a replacement disk without disturbing the emulated CPU. This
+    /// is the programmatic half of the live media controls, and keeps disk
+    /// swaps testable without an AppKit file picker.
+    func replaceDiskImageData(
+        _ data: Data,
+        fileExtension: String,
+        description: String,
+        drive: Int
+    ) throws {
+        guard (0...1).contains(drive) else { throw CocoaError(.fileReadCorruptFile) }
+        if drive == 1 {
+            persistWordPerfectWorkDisk()
+            wordPerfectWorkDiskURL = nil
+        }
+        try withEmulationLock {
+            try memory.mountDiskImageData(data, fileExtension: fileExtension, drive: drive)
+        }
+        setDiskDescription(description, drive: drive)
+        status = "\(currentROMTitle) · 已更换驱动器 \(drive + 1)：\(description)"
     }
 
     /// Mounts a true SmartPort/ProDOS block image in slot 7.  Its media is
@@ -770,9 +1031,8 @@ final class AppleIIMachine: ObservableObject {
         withEmulationLock { memory.ejectDisk(drive: drive) }
         if drive == 1 { wordPerfectWorkDiskURL = nil }
         setDiskDescription("未插入", drive: drive)
+        if drive == 0 { activeMediaKind = .none }
         status = "\(currentROMTitle) · 驱动器 \(drive + 1) 未插入磁盘"
-        reset()
-        scheduleApplesoftWarmStartIfDiskless()
     }
 
     func saveDiskAsNIB(drive: Int = 0) {
@@ -1072,6 +1332,14 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
             }
             if model != .appleIIc, a >= 0xD000, languageCardRAMRead {
                 return languageCardByte(at: a)
+            }
+            // With the external Slot 3 ROM selected, a machine without a
+            // card in that slot must not mirror the IIe motherboard ROM.
+            // The firmware uses this open slot response while probing cards;
+            // returning the internal bytes here makes it believe a card is
+            // installed and leaves SLOTC3ROM enabled after reset.
+            if model == .appleIIe, (0xC300...0xC3FF).contains(a), slot3ROM, !internalCXROM {
+                return 0
             }
             if model == .appleIIe, a >= 0xC100, iieROM.count == 0x4000 {
                 return iieROM[a - 0xC000]
@@ -1478,6 +1746,7 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
     var diskNibbleReads: Int { diskController.nibbleReads }
     var diskNibbleWrites: Int { diskController.nibbleWrites }
     var diskTrack: Int { diskController.currentTrack() }
+    var diskDebugSnapshot: DiskIIDebugSnapshot { diskController.debugSnapshot }
 
     func mountHardDiskImage(at url: URL, drive: Int = 0) throws {
         try smartPortController.mountImage(Data(contentsOf: url), fileExtension: url.pathExtension, drive: drive)
