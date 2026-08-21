@@ -217,8 +217,15 @@ final class ROMLoadingTests: XCTestCase {
     func testWordPerfectMountsItsWorkDiskInDriveTwo() {
         let machine = AppleIIMachine()
         machine.loadBundledSoftware(.wordPerfect11)
-        XCTAssertTrue(machine.memory.hasDisk(in: 0))
-        XCTAssertTrue(machine.memory.hasDisk(in: 1))
+        // Production mounting reads the bundled media away from the main
+        // actor.  Give the execution queue a run-loop turn rather than
+        // racing the two drive assertions against that legitimate I/O.
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline, !(machine.hasDisk(in: 0) && machine.hasDisk(in: 1)) {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        XCTAssertTrue(machine.hasDisk(in: 0))
+        XCTAssertTrue(machine.hasDisk(in: 1))
     }
 
 }
