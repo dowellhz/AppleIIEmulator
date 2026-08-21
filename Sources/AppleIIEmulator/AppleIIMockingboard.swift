@@ -531,6 +531,13 @@ final class MockingboardController {
     }
 
     private func psgPortAInput(forVIA via: Int) -> UInt8 {
-        selectedPSGChips(forVIA: via).reduce(UInt8.max) { $0 & chips[$1].portAInput() }
+        let targets = selectedPSGChips(forVIA: via)
+        guard usesPairedAYSelection, targets.count > 1 else {
+            return targets.reduce(UInt8.max) { $0 & chips[$1].portAInput() }
+        }
+        // The GAL combines the data pins of two simultaneously selected AYs
+        // as an OR-sum. This matters for native-mode diagnostics that read
+        // both chips with neither active-low chip-select asserted.
+        return targets.reduce(0) { $0 | chips[$1].portAInput() }
     }
 }

@@ -65,6 +65,17 @@ final class MockingboardTests: XCTestCase {
         XCTAssertEqual(memory.mockingboardRegisterValue(chip: 1, register: 3), 0)
     }
 
+    func testPhasorNativeReadOfBothAYsUsesGALOrSum() {
+        let memory = AppleIIMemory()
+        _ = memory.read(0xC0C5)
+        writePhasorAY(memory, base: 0xC0C0, chipSelect: 0x02, register: 8, value: 0x01)
+        writePhasorAY(memory, base: 0xC0C0, chipSelect: 0x01, register: 8, value: 0x02)
+
+        memory.write(0xC0C0, 0x05) // both selected, BDIR=0, BC1=1: PSG read
+        XCTAssertEqual(memory.read(0xC0C1), 0x03)
+        memory.write(0xC0C0, 0x04)
+    }
+
     func testEchoPlusMapsItsMirroredCardPageToTheSecondVIAPair() {
         let memory = AppleIIMemory()
         _ = memory.read(0xC0C2) // Echo+ device-select encoding
