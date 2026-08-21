@@ -4,10 +4,10 @@ import Foundation
 /// chip's five attribute registers, power-down control and A/R request line
 /// are modelled here independently from the Phasor's address decoder.
 ///
-/// This deliberately represents the hardware's control plane only.  The
-/// phoneme waveform ROM and vocal-tract filter are a separate analog/digital
-/// synthesis task; this state machine must nevertheless provide the same bus
-/// handshaking and interrupt timing that speech drivers use.
+/// This models the bus-visible control plane and exposes a deterministic HLE
+/// synthesis description to the Phasor audio mixer.  It intentionally does
+/// not claim to dump or reproduce SSI's internal phoneme ROM; the renderer
+/// uses the documented excitation, pitch, amplitude and filter controls.
 struct SSI263 {
     private enum TimingMode {
         case phonemeTransitioned
@@ -23,6 +23,7 @@ struct SSI263 {
     private(set) var controlArticulationAmplitude: UInt8 = 0x80
     private(set) var filterFrequency: UInt8 = 0xFF
     private(set) var requestAsserted = false
+    private(set) var phonemeGeneration = 0
 
     private var timingMode: TimingMode = .phonemeTransitioned
     private var interruptsEnabled = false
@@ -33,6 +34,27 @@ struct SSI263 {
     }
 
     var dataBusValue: UInt8 { requestAsserted ? 0x80 : 0 }
+
+    /// The chip requests a fresh attribute word after a phoneme/frame.  The
+    /// current HLE voice is silent from that edge until software starts the
+    /// next phoneme, matching the useful behaviour of speech drivers that
+    /// wait for A/R before feeding the next target.
+    var isProducingAudio: Bool { !isPoweredDown && cyclesUntilRequest != nil && !requestAsserted }
+    var audioDurationCycles: Int { requestPeriodCycles }
+    var phonemeIndex: Int { Int(durationPhoneme & 0x3F) }
+    var amplitude: Double { Double(controlArticulationAmplitude & 0x0F) / 15.0 }
+    var articulation: Double { Double((controlArticulationAmplitude >> 4) & 0x07) / 7.0 }
+
+    /// The low nibble is the immediately-applied inflection.  The original
+    /// device quantizes pitch in musical steps; this normalized value lets the
+    /// audio renderer preserve that monotonic relation at the host rate.
+    var normalizedPitch: Double { Double(inflection & 0x0F) / 15.0 }
+
+    /// Datasheet formula, using the standard 2 MHz clock.  The renderer
+    /// clamps the resulting switched-capacitor clock below host Nyquist.
+    var filterClockHz: Double {
+        2_000_000.0 / (2.0 * Double(max(1, 256 - Int(filterFrequency))))
+    }
 
     mutating func reset() {
         self = Self()
@@ -122,5 +144,6 @@ struct SSI263 {
 
     private mutating func beginPhoneme() {
         cyclesUntilRequest = requestPeriodCycles
+        phonemeGeneration &+= 1
     }
 }

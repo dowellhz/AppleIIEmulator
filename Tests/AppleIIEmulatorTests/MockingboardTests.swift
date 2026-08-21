@@ -107,6 +107,16 @@ final class MockingboardTests: XCTestCase {
         XCTAssertFalse(memory.irqPending)
     }
 
+    func testSSI263ProducesCycleClockedHLEAudioBeforeRequest() {
+        let memory = AppleIIMemory()
+        _ = memory.read(0xC0C5)
+        configureSSI263(memory, base: 0xC440, durationPhoneme: 0xC2, rate: 0xF0)
+
+        let samples = memory.renderMockingboardAudio(toEmulatedCycle: 2_000)
+        XCTAssertFalse(samples.isEmpty)
+        XCTAssertTrue(samples.contains { abs($0) > 0.001 })
+    }
+
     func testMockingboardSpeechRequestsCA1Interrupt() {
         let memory = AppleIIMemory()
         memory.write(0xC0DE, 0x82) // enable VIA B CA1 (the primary SSI-263 socket)

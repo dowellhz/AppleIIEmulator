@@ -167,4 +167,42 @@ final class ACIA6551Tests: XCTestCase {
         master = -1
         wait(for: [disconnected, failure], timeout: 2)
     }
+
+    /// Opt-in validation against a user-approved physical loopback adapter.
+    /// It is deliberately skipped in CI and ordinary development runs: a
+    /// serial device can be an attached instrument rather than a harmless
+    /// terminal. Run it with APPLEII_REAL_SERIAL_PATH=/dev/cu.<device> only
+    /// after confirming the device echoes this four-byte probe unchanged.
+    func testApprovedRealSerialLoopback() throws {
+        guard let path = ProcessInfo.processInfo.environment["APPLEII_REAL_SERIAL_PATH"], !path.isEmpty else {
+            throw XCTSkip("Set APPLEII_REAL_SERIAL_PATH for user-approved loopback hardware")
+        }
+        let bridge = MacSerialBridge()
+        let connected = expectation(description: "physical serial connected")
+        let echoed = expectation(description: "physical serial echoed probe")
+        let disconnected = expectation(description: "physical serial disconnected")
+        let probe: [UInt8] = [0x55, 0xAA, 0x33, 0xCC]
+        var received = [UInt8]()
+
+        bridge.didChangeConnection = { port, connectedPath in
+            if port == 1, connectedPath == path { connected.fulfill() }
+            if port == 1, connectedPath == nil { disconnected.fulfill() }
+        }
+        bridge.didReceiveByte = { byte, port in
+            guard port == 1 else { return }
+            received.append(byte)
+            if received.suffix(probe.count).elementsEqual(probe) { echoed.fulfill() }
+        }
+        bridge.didFail = { port, error in
+            guard port == 1 else { return }
+            XCTFail("physical serial bridge failed: \(error)")
+        }
+
+        bridge.connect(path: path, port: 1, baudRate: 9_600)
+        wait(for: [connected], timeout: 4)
+        bridge.send(probe, port: 1)
+        wait(for: [echoed], timeout: 4)
+        bridge.disconnect(port: 1)
+        wait(for: [disconnected], timeout: 2)
+    }
 }
