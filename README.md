@@ -20,7 +20,7 @@ Apple II Emulator 是一个为 macOS 打造的原生 Apple II 系列模拟器。
 - IIc 内置鼠标接口：slot 4 的 6821 PIA（`$C0C0-$C0C3`）握手协议、位置/按键、夹紧范围与移动/VBL 中断；显示区域的鼠标移动会馈入该硬件；
 - 主板磁带输入/输出（`$C060` / `$C020`）与 Apple II+ 四路 annunciator（`$C058-$C05F`）软开关；
 - 内置游戏库按标题首字母分组，并提供 Apple Writer、WordPerfect、VisiCalc、Copy II Plus 与 Apple Pascal 等独立“软件”启动项；
-- 菜单栏提供“ROM”“磁盘”“游戏”“软件”和“串口”：可选择内置 ROM、按需打开已验证的用户 ROM 映像，或独立装入磁盘映像。
+- 菜单栏提供“ROM”“磁盘”“游戏”“软件”“串口”和“主题”：可选择内置 ROM、按需打开已验证的用户 ROM 映像，或独立装入磁盘映像；“主题”可在原始机箱照片的“经典 Apple II”、深石墨高级机壳的“全新 Apple II”和暖象牙白缎面机壳的“暖象牙白 Apple II”之间即时切换。三者的显示器、控制面板、按钮位置和交互保持一致，主题选择会在下次启动时保留。
 - “调试”菜单可显示实时 CPU 寄存器、周期和 Disk II 状态；暂停后“单步执行”仍走完整的 CPU 总线周期，不会跳过 I/O 软开关。该菜单也提供会话内的“快速保存状态”（Command-Shift-K）和“快速恢复状态”（Command-Shift-L）：快照包含 CPU、主/辅 RAM、软开关、Disk II、SmartPort、Mockingboard、串口、鼠标和磁带的模拟硬件状态；恢复时会丢弃旧执行批次并按快照中的 ACIA 线路格式重新配置已连接的 macOS 串口。快速状态仅驻留内存，关闭应用后不会保留。
 - ROM 菜单可额外打开用户有权使用的 ROM 映像：Apple II/II+ 12 KB，或 Apple IIc 16 KB / 32 KB；加载后会按映像类型切换机器并重置。
 - 不依赖第三方库，可直接用 Xcode 打开 `Package.swift`。
@@ -32,7 +32,7 @@ cd AppleIIEmulator
 swift run
 ```
 
-若要构建带图标的本地 App，请运行 `make package-app`，然后打开 `build/AppleIIEmulator.app`。首次启动默认使用内置 Apple II+ Autostart ROM，显示经典 `APPLE ][` 开机画面；默认不插入磁盘。通过“游戏”菜单选择游戏会自动装入驱动器 1 并重新启动。测试启动盘仅保留在“磁盘”菜单中，用于验证 ROM、IWM、GCR 解码和 `$0801` 引导链。点一下屏幕即可输入；若要验证键盘回显，可在“ROM”菜单选择“内置诊断 ROM”。
+若要构建带图标的本地 App，请运行 `make package-app`，然后打开 `build/AppleIIEmulator.app`。首次启动默认使用内置 Apple II+ Autostart ROM，显示经典 `APPLE ][` 开机画面；默认不插入磁盘。通过“游戏”菜单选择游戏会自动装入驱动器 1 并重新启动。测试启动盘仅保留在“磁盘”菜单中，用于验证 ROM、IWM、GCR 解码和 `$0801` 引导链。点一下屏幕即可输入；若要验证键盘回显，可在“ROM”菜单选择“内置诊断 ROM”。若想切换外观，在菜单栏选择“主题 → 经典 Apple II”“主题 → 全新 Apple II”或“主题 → 暖象牙白 Apple II”；主题只替换机壳图片素材，不会改变模拟屏幕、面板排版或操作方式。
 
 第三方 `.dsk` / `.do`（DOS 顺序）、`.d13`（13 扇区）、`.po`（ProDOS 顺序）、`.nib`、5¼ 英寸 `.2mg/.2img` 或 WOZ 1.x/2.x 位流映像可通过“磁盘”菜单独立装入驱动器 1 或 2；之后按 Command-R 重置即可由该 ROM 启动。SmartPort 硬盘是独立的 slot 7 设备，可从“磁盘”菜单装入 512 字节块的 `.po/.hdv/.img/.2mg/.2img` 映像；在 Apple II+/IIe 上，“从 SmartPort 硬盘启动”会进入 `$C700` 卡 ROM，由该 ROM 将 ProDOS block 0 读入 `$0800` 后执行。WOZ 会遵从其 `INFO` 写保护位；对可写 BITS 映像，IWM 写入保留在当前磁表面中。WOZ 2.1 的 FLUX 间隔以 125 ns tick 读取，并由驱动器上的数字锁相环恢复为控制器位单元；首次写入 FLUX 磁道会将该磁道恢复为 BITS 工作表面，导出时再将修改的位单元重新量化为 FLUX，未修改的 FLUX 磁道仍按原始间隔保留。“磁盘 → 将驱动器 N 另存为 .woz…”会导出带 CRC、保留有效 BITS/FLUX 轨道与 quarter-track 映射的 WOZ 2 文件，且始终要求选择新路径，不会改写原始镜像；未修改磁表面时会保留 `META`、`WRIT` 和兼容的非磁表面扩展块，修改后会丢弃描述旧 BITS 校验的 `WRIT`。`.nib` 导出仍适用于标准 35 磁道 NIB 流。请只使用你有权使用的磁盘映像。
 

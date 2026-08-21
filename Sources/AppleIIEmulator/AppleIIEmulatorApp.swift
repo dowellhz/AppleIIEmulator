@@ -1,9 +1,26 @@
 import SwiftUI
 import Darwin
 
+enum EmulatorTheme: String, CaseIterable, Identifiable {
+    case classic
+    case modern
+    case ivory
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .classic: "经典 Apple II"
+        case .modern: "全新 Apple II"
+        case .ivory: "暖象牙白 Apple II"
+        }
+    }
+}
+
 @main
 struct AppleIIEmulatorApp: App {
     @StateObject private var machine: AppleIIMachine
+    @AppStorage("emulatorTheme") private var emulatorTheme = EmulatorTheme.classic.rawValue
 
     init() {
         let machine = AppleIIMachine()
@@ -134,6 +151,19 @@ struct AppleIIEmulatorApp: App {
                 Divider()
                 serialPortMenu(title: "端口 1（打印机）", port: 1, connectedDevice: machine.serialPort1Device)
                 serialPortMenu(title: "端口 2（调制解调器）", port: 2, connectedDevice: machine.serialPort2Device)
+            }
+            CommandMenu("主题") {
+                ForEach(EmulatorTheme.allCases) { theme in
+                    Button {
+                        emulatorTheme = theme.rawValue
+                    } label: {
+                        if emulatorTheme == theme.rawValue {
+                            Label(theme.title, systemImage: "checkmark")
+                        } else {
+                            Text(theme.title)
+                        }
+                    }
+                }
             }
             CommandMenu("调试") {
                 Button(machine.isDebuggerVisible ? "隐藏调试监视器" : "显示调试监视器") {

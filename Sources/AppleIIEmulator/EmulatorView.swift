@@ -4,6 +4,11 @@ import SwiftUI
 struct EmulatorView: View {
     @ObservedObject var machine: AppleIIMachine
     @State private var isFullscreen = false
+    @AppStorage("emulatorTheme") private var emulatorTheme = EmulatorTheme.classic.rawValue
+
+    private var theme: EmulatorTheme {
+        EmulatorTheme(rawValue: emulatorTheme) ?? .classic
+    }
 
     var body: some View {
         Group {
@@ -38,14 +43,15 @@ struct EmulatorView: View {
             let chassisWidth = min(proxy.size.width, ChassisLayout.preferredWidth, heightLimitedWidth)
             let panelHeight = ChassisLayout.panelHeight(for: chassisWidth)
 
-            // The two supplied enclosure photographs meet at their metal
-            // edges. A tiny negative overlap avoids a transparent sampling
-            // seam from appearing between the independently scaled images.
-            VStack(spacing: -2) {
+            // The regenerated monitor/panel pairs include their own mating
+            // lips. Seat each complete control-panel backdrop over that lip
+            // so the chassis stays continuous; its live controls retain the
+            // same coordinate system inside the panel.
+            let chassisOverlap: CGFloat = theme == .modern ? -32 : (theme == .ivory ? -34 : -2)
+            VStack(spacing: chassisOverlap) {
                 monitor(width: chassisWidth)
-                EmulatorControlsPanel(machine: machine)
+                EmulatorControlsPanel(machine: machine, theme: theme)
                     .frame(width: chassisWidth, height: panelHeight)
-                    .padding(.bottom, 18)
             }
             .frame(width: chassisWidth)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -67,6 +73,218 @@ struct EmulatorView: View {
         .ignoresSafeArea()
     }
 
+    /// A deliberately new enclosure rather than a recolor of the reference
+    /// photograph. It keeps the raster and hardware controls intact while
+    /// presenting them as a compact, contemporary desktop instrument.
+    private var modernChassis: some View {
+        GeometryReader { proxy in
+            let width = max(680, proxy.size.width)
+            let contentWidth = min(width - 72, 1_140)
+            let screenWidth = min(contentWidth * 0.70, (proxy.size.height - 330) * 4 / 3)
+            let safeScreenWidth = max(440, screenWidth)
+
+            ZStack {
+                LinearGradient(
+                    colors: [
+                        Color(red: 0.025, green: 0.045, blue: 0.090),
+                        Color(red: 0.045, green: 0.105, blue: 0.145),
+                        Color(red: 0.018, green: 0.030, blue: 0.062)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                .ignoresSafeArea()
+
+                Canvas { context, size in
+                    let spacing: CGFloat = 32
+                    for x in stride(from: 0, through: size.width, by: spacing) {
+                        context.stroke(Path(CGPath(rect: CGRect(x: x, y: 0, width: 1, height: size.height), transform: nil)), with: .color(.white.opacity(0.025)))
+                    }
+                    for y in stride(from: 0, through: size.height, by: spacing) {
+                        context.stroke(Path(CGPath(rect: CGRect(x: 0, y: y, width: size.width, height: 1), transform: nil)), with: .color(.white.opacity(0.025)))
+                    }
+                }
+                .allowsHitTesting(false)
+
+                VStack(spacing: 20) {
+                    modernHeader
+
+                    HStack(alignment: .top, spacing: 20) {
+                        modernScreen(width: safeScreenWidth)
+                        modernStatusRail
+                            .frame(width: min(260, contentWidth * 0.27))
+                    }
+                    .frame(maxWidth: contentWidth, alignment: .center)
+
+                    modernControlDeck
+                        .frame(maxWidth: contentWidth)
+                }
+                .padding(.horizontal, 36)
+                .padding(.vertical, 30)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            }
+        }
+    }
+
+    private var modernHeader: some View {
+        HStack(spacing: 14) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 13, style: .continuous)
+                    .fill(LinearGradient(colors: [Color.cyan, Color.blue], startPoint: .topLeading, endPoint: .bottomTrailing))
+                Image(systemName: "circle.grid.cross")
+                    .font(.system(size: 21, weight: .bold))
+                    .foregroundStyle(.black.opacity(0.78))
+            }
+            .frame(width: 48, height: 48)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text("APPLE II")
+                    .font(.system(size: 22, weight: .black, design: .rounded))
+                    .tracking(2.5)
+                Text("MODERN EMULATION CONSOLE")
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .tracking(1.2)
+                    .foregroundStyle(.cyan.opacity(0.78))
+            }
+
+            Spacer()
+
+            HStack(spacing: 7) {
+                Circle()
+                    .fill(machine.isRunning ? Color.green : Color.orange)
+                    .frame(width: 8, height: 8)
+                    .shadow(color: machine.isRunning ? .green : .orange, radius: 6)
+                Text(machine.isRunning ? "RUNNING" : "PAUSED")
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.86))
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(.black.opacity(0.28), in: Capsule())
+            .overlay(Capsule().stroke(.white.opacity(0.12), lineWidth: 1))
+        }
+        .frame(maxWidth: 1_140)
+    }
+
+    private func modernScreen(width: CGFloat) -> some View {
+        let height = width * 3 / 4
+        return ZStack {
+            RoundedRectangle(cornerRadius: 26, style: .continuous)
+                .fill(Color.black.opacity(0.42))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 26, style: .continuous)
+                        .stroke(LinearGradient(colors: [.cyan.opacity(0.8), .blue.opacity(0.22), .white.opacity(0.15)], startPoint: .topLeading, endPoint: .bottomTrailing), lineWidth: 1.2)
+                }
+                .shadow(color: .cyan.opacity(0.18), radius: 28, y: 12)
+
+            emulatedScreen(width: width - 26, height: height - 26)
+                .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
+
+            Text("6502  •  (machine.currentROMTitle.uppercased())")
+                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                .tracking(1)
+                .foregroundStyle(.white.opacity(0.50))
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                .padding(13)
+                .allowsHitTesting(false)
+        }
+        .frame(width: width, height: height)
+    }
+
+    private var modernStatusRail: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("SYSTEM")
+                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                .tracking(1.4)
+                .foregroundStyle(.cyan)
+
+            modernStatusRow(title: "ROM", value: machine.currentROMTitle, icon: "memorychip")
+            modernStatusRow(title: "DRIVE 1", value: machine.diskDescription, icon: "opticaldiscdrive")
+            modernStatusRow(title: "DRIVE 2", value: machine.externalDiskDescription, icon: "opticaldiscdrive")
+            modernStatusRow(title: "SMARTPORT", value: machine.hardDiskDescription, icon: "internaldrive")
+
+            Spacer(minLength: 8)
+
+            Text(machine.status)
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.60))
+                .lineLimit(4)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 6)
+        }
+        .padding(16)
+        .frame(maxHeight: .infinity, alignment: .top)
+        .background(.black.opacity(0.25), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(.white.opacity(0.10), lineWidth: 1))
+    }
+
+    private func modernStatusRow(title: String, value: String, icon: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: icon)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(value == "未插入" ? .white.opacity(0.32) : .cyan)
+                .frame(width: 16)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 8, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.40))
+                Text(value)
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.82))
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+            }
+        }
+    }
+
+    private var modernControlDeck: some View {
+        HStack(spacing: 10) {
+            modernAction(title: machine.isRunning ? "暂停" : "继续", subtitle: machine.isRunning ? "PAUSE CPU" : "RESUME CPU", icon: machine.isRunning ? "pause.fill" : "play.fill", color: .orange) {
+                machine.toggleRunning()
+            }
+            modernAction(title: "重置", subtitle: "COLD BOOT", icon: "arrow.counterclockwise", color: .pink) {
+                machine.reset()
+            }
+            modernAction(title: "装入磁盘", subtitle: "DRIVE 1", icon: "externaldrive.fill", color: .cyan) {
+                machine.chooseDiskImage(drive: 0)
+            }
+            modernAction(title: "驱动器 2", subtitle: "HOT SWAP", icon: "opticaldiscdrive.fill", color: .purple) {
+                machine.chooseDiskImage(drive: 1, resetsMachine: false)
+            }
+        }
+        .padding(12)
+        .background(.black.opacity(0.28), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(.white.opacity(0.10), lineWidth: 1))
+    }
+
+    private func modernAction(title: String, subtitle: String, icon: String, color: Color, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: icon)
+                    .font(.system(size: 15, weight: .bold))
+                    .frame(width: 30, height: 30)
+                    .background(color.opacity(0.22), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    .foregroundStyle(color)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 13, weight: .bold))
+                    Text(subtitle)
+                        .font(.system(size: 8, weight: .bold, design: .monospaced))
+                        .tracking(0.6)
+                        .foregroundStyle(.white.opacity(0.48))
+                }
+                Spacer(minLength: 0)
+            }
+            .foregroundStyle(.white.opacity(0.92))
+            .padding(10)
+            .frame(maxWidth: .infinity)
+            .background(color.opacity(0.08), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(color.opacity(0.28), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .help(title)
+    }
+
     private func monitor(width chassisWidth: CGFloat) -> some View {
         let monitorHeight = ChassisLayout.monitorHeight(for: chassisWidth)
         let screenWidth = chassisWidth * 0.62
@@ -77,7 +295,7 @@ struct EmulatorView: View {
         )
 
         return ZStack {
-            MonitorArtwork()
+            MonitorArtwork(theme: theme)
                 .frame(width: chassisWidth, height: monitorHeight)
 
             // The supplied photograph is 1448×1084.  These normalized bounds
@@ -159,8 +377,18 @@ struct MetalButtonStyle: ButtonStyle {
 }
 
 private struct MonitorArtwork: View {
+    let theme: EmulatorTheme
+
+    private var resourceName: String {
+        switch theme {
+        case .classic: "AppleIIMonitorReference"
+        case .modern: "AppleIIMonitorNewReference"
+        case .ivory: "AppleIIMonitorIvoryReference"
+        }
+    }
+
     var body: some View {
-        if let url = AppResources.bundle.url(forResource: "AppleIIMonitorReference", withExtension: "png"),
+        if let url = AppResources.bundle.url(forResource: resourceName, withExtension: "png"),
            let image = NSImage(contentsOf: url) {
             Image(nsImage: image)
                 .resizable()

@@ -6,6 +6,7 @@ import SwiftUI
 /// and the interactive hit areas.
 struct EmulatorControlsPanel: View {
     @ObservedObject var machine: AppleIIMachine
+    let theme: EmulatorTheme
     @State private var menuPress: PanelControl?
     @State private var presentedMenu: PanelControl?
     @State private var resetIndicator = false
@@ -56,8 +57,27 @@ struct EmulatorControlsPanel: View {
             // The reference PNG has transparent, broadly rounded corners.
             // Fill those pixels first so the smaller SwiftUI mask below is
             // the sole visible corner radius of the assembled panel.
-            Color(red: 0.43, green: 0.37, blue: 0.27)
-            ControlPanelArtwork()
+            switch theme {
+            case .classic:
+                Color(red: 0.43, green: 0.37, blue: 0.27)
+            case .modern:
+                Color(red: 0.115, green: 0.11, blue: 0.105)
+            case .ivory:
+                Color(red: 0.87, green: 0.85, blue: 0.80)
+            }
+            ControlPanelArtwork(theme: theme)
+            // The regenerated graphite panel carries a bright export edge in
+            // its first few raster rows. It is outside the physical panel
+            // face, so cover it without translating the artwork or anchors.
+            if theme == .modern {
+                Rectangle()
+                    .fill(Color(red: 0.115, green: 0.11, blue: 0.105))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .mask(alignment: .top) {
+                        Rectangle().frame(height: 7)
+                    }
+                    .allowsHitTesting(false)
+            }
 
             GeometryReader { proxy in
                 let width = proxy.size.width
@@ -264,16 +284,15 @@ struct EmulatorControlsPanel: View {
             // well. The source ON thumb continues 54 source pixels past that
             // crop, so hide only this residual portion underneath.
             RoundedRectangle(cornerRadius: 3, style: .continuous)
-                .fill(Color(red: 0.105, green: 0.093, blue: 0.064))
+                .fill(cpuSwitchWellColor)
                 .frame(width: width * 54 / 2672, height: height * 58 / 494)
                 .position(position(x: 2_517, y: 414, width: width, height: height))
-            CPUSwitchOffArtwork()
-                // This asset is the supplied 101×53 visual at the current
-                // reference scale. Its 177×93 source-pixel footprint covers
-                // the complete original ON switch before rendering the OFF
-                // version, without touching OFF/ON lettering.
+            CPUSwitchOffArtwork(theme: theme)
+                // The source compositing footprint is 177×93 pixels. Keep
+                // this exact frame for every material variant so the switch
+                // remains aligned with the panel's engraved labels.
                 .frame(width: width * 177 / 2672, height: height * 93 / 494)
-                .position(position(x: 2_460, y: 414, width: width, height: height))
+                .position(position(x: 2_460, y: cpuSwitchArtworkCenterY, width: width, height: height))
         }
 
         Button {
@@ -289,6 +308,22 @@ struct EmulatorControlsPanel: View {
         .position(position(x: 2_460, y: 414, width: width, height: height))
         .accessibilityLabel("CPU 两倍速度")
         .accessibilityValue(machine.isCPUAccelerated ? "开" : "关")
+    }
+
+    private var cpuSwitchWellColor: Color {
+        switch theme {
+        case .classic: Color(red: 0.105, green: 0.093, blue: 0.064)
+        case .modern: Color(red: 0.030, green: 0.031, blue: 0.031)
+        case .ivory: Color(red: 0.21, green: 0.19, blue: 0.15)
+        }
+    }
+
+    private var cpuSwitchArtworkCenterY: CGFloat {
+        // The ivory generated knob has less transparent headroom within the
+        // original footprint, so seat it lower on the unchanged track.
+        // At the 960-point chassis width, three source pixels map to roughly
+        // one on-screen point, matching the engraved switch recess.
+        theme == .ivory ? 429 : 414
     }
 
     private var gameMenu: some View {
@@ -366,12 +401,40 @@ struct EmulatorControlsPanel: View {
 }
 
 private struct ControlPanelArtwork: View {
+    let theme: EmulatorTheme
+
+    private var resourceName: String {
+        switch theme {
+        case .classic: "ControlPanelReference"
+        case .modern: "ControlPanelNewReference"
+        case .ivory: "ControlPanelIvoryReference"
+        }
+    }
+
     var body: some View {
-        if let url = AppResources.bundle.url(forResource: "ControlPanelReference", withExtension: "png"),
+        if let url = AppResources.bundle.url(forResource: resourceName, withExtension: "png"),
            let image = NSImage(contentsOf: url) {
             Image(nsImage: image)
                 .resizable()
                 .interpolation(.high)
+                // The ivory artwork has a one-point export offset relative
+                // to the original panel anchors. Correct the backdrop only;
+                // live LEDs and controls continue using their hardware
+                // coordinate map.
+                .offset(x: theme == .ivory ? -2 : 0, y: theme == .ivory ? -1 : 0)
+                .overlay(alignment: .bottom) {
+                    if theme == .ivory {
+                        LinearGradient(
+                            colors: [
+                                Color(red: 0.34, green: 0.31, blue: 0.25),
+                                Color(red: 0.72, green: 0.68, blue: 0.58)
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                        .frame(height: 3)
+                    }
+                }
         } else {
             Color(red: 0.40, green: 0.34, blue: 0.24)
         }
@@ -424,12 +487,34 @@ private struct PanelLED: View {
 }
 
 private struct CPUSwitchOffArtwork: View {
+    let theme: EmulatorTheme
+
+    private var resourceName: String {
+        switch theme {
+        case .classic: "CPUSwitchOff"
+        case .modern: "CPUSwitchOffGraphite"
+        case .ivory: "CPUSwitchOffIvory"
+        }
+    }
+
     var body: some View {
-        if let url = AppResources.bundle.url(forResource: "CPUSwitchOff", withExtension: "png"),
+        if let url = AppResources.bundle.url(forResource: resourceName, withExtension: "png"),
            let image = NSImage(contentsOf: url) {
             Image(nsImage: image)
                 .resizable()
                 .interpolation(.high)
+                // Image generation returns an opaque canvas, while the
+                // original asset has a shaped alpha boundary that leaves the
+                // panel's CPU/OFF/ON lettering visible. Reuse that boundary
+                // for every material variant without changing its placement.
+                .mask {
+                    if let maskURL = AppResources.bundle.url(forResource: "CPUSwitchOff", withExtension: "png"),
+                       let maskImage = NSImage(contentsOf: maskURL) {
+                        Image(nsImage: maskImage)
+                            .resizable()
+                            .interpolation(.high)
+                    }
+                }
         }
     }
 }
