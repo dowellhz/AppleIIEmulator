@@ -1191,16 +1191,20 @@ final class AppleIIMachine: ObservableObject {
                 return (drive: drive, disk: disk, data: try Data(contentsOf: url))
                 }
                 let rom = try AppleIIROMImages.iiE(software.bootROM)
-                let wordPerfectWorkDisk: (url: URL, data: Data)?
+                // The persistent work disk is a NIB export, but a first
+                // launch seeds it from the bundled DSK. Keep the source
+                // format with the bytes; parsing new DSK bytes as the future
+                // `.nib` destination made Drive 2 fail only on clean hosts.
+                let wordPerfectWorkDisk: (url: URL, data: Data, sourceExtension: String)?
                 if software == .wordPerfect11 {
                     let persistentURL = try Self.wordPerfectWorkDiskStorageURL()
                     if FileManager.default.fileExists(atPath: persistentURL.path) {
-                        wordPerfectWorkDisk = (persistentURL, try Data(contentsOf: persistentURL))
+                        wordPerfectWorkDisk = (persistentURL, try Data(contentsOf: persistentURL), persistentURL.pathExtension)
                     } else {
                         guard let bundledURL = AppResources.bundle.url(forResource: "WordPerfect 1.1 Work Disk", withExtension: "dsk") else {
                             throw CocoaError(.fileNoSuchFile)
                         }
-                        wordPerfectWorkDisk = (persistentURL, try Data(contentsOf: bundledURL))
+                        wordPerfectWorkDisk = (persistentURL, try Data(contentsOf: bundledURL), bundledURL.pathExtension)
                     }
                 } else {
                     wordPerfectWorkDisk = nil
@@ -1218,7 +1222,7 @@ final class AppleIIMachine: ObservableObject {
                     )
                 }
                 if let workDisk = wordPerfectWorkDisk {
-                    try memory.mountDiskImageData(workDisk.data, fileExtension: workDisk.url.pathExtension, drive: 1)
+                    try memory.mountDiskImageData(workDisk.data, fileExtension: workDisk.sourceExtension, drive: 1)
                 }
                 let bootsDriveOne = memory.hasDisk(in: 0)
                 memory.coldBootSystemState()
