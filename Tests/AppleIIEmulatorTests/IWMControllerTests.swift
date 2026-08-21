@@ -288,6 +288,17 @@ final class IWMControllerTests: XCTestCase {
         XCTAssertGreaterThan(disk.weakBitsGenerated, 0)
     }
 
+    func testCleanedWOZRaisesOnlyItsDriveLocalReadAmplifierGain() throws {
+        let disk = IWMController()
+        try disk.mountImage(woz2Image(cleaned: true, blankTrack: true), fileExtension: "woz", drive: 0)
+        _ = disk.access(0x09, write: nil) // motor on
+        _ = disk.access(0x0C, write: nil) // Q6L: read mode
+        disk.advance(by: 128)
+
+        XCTAssertGreaterThan(disk.readAmplifierGainByDrive[0], 4)
+        XCTAssertEqual(disk.readAmplifierGainByDrive[1], 0)
+    }
+
     private func woz2Image(
         cleaned: Bool = false,
         blankTrack: Bool = false,

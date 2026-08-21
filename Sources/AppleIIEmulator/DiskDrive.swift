@@ -62,6 +62,11 @@ struct DiskDrive {
     /// head state with the physical drive rather than making it a UI effect.
     var emulatesWeakBits = false
     var readHeadWindow: UInt8 = 0
+    /// The MC3470 raises its analog gain while no flux transition is found.
+    /// This is a small, deterministic representation of that state: it is
+    /// drive-local, survives snapshots, and is only consulted for WOZ weak
+    /// regions where the captured medium deliberately omits transitions.
+    var readAmplifierGain: UInt8 = 0
     var weakBitLFSR: UInt32 = 0xA2_5A_5A_01
     /// Flux decoder state lives in the drive because changing controller
     /// registers must never restart a physical revolution.
@@ -92,6 +97,7 @@ struct DiskDrive {
         isWriteProtected = false
         emulatesWeakBits = false
         readHeadWindow = 0
+        readAmplifierGain = 0
         weakBitLFSR = 0xA2_5A_5A_01
         fluxBytePosition = 0
         fluxTicksUntilTransition = 0
@@ -125,6 +131,7 @@ struct DiskDrive {
         self.isWriteProtected = writeProtected
         self.emulatesWeakBits = emulatesWeakBits
         readHeadWindow = 0
+        readAmplifierGain = 0
         weakBitLFSR = 0xA2_5A_5A_01
         fluxBytePosition = 0
         fluxTicksUntilTransition = 0
@@ -135,12 +142,13 @@ struct DiskDrive {
         bitPosition = 0
     }
 
-    mutating func nextWeakBit() -> UInt8 {
+    mutating func nextWeakBit(probability: UInt8 = 77) -> UInt8 {
         // A small deterministic noise source keeps runs reproducible in
-        // regression tests while providing the approximately 30% pulse rate
-        // recommended for MC3470 fake-bit recovery.
+        // regression tests. At the nominal threshold it emits the roughly
+        // 30% pulse rate used for MC3470 fake-bit recovery; a starving read
+        // amplifier may pass a larger threshold while its gain rises.
         weakBitLFSR = weakBitLFSR &* 1_664_525 &+ 1_013_904_223
-        return UInt8((weakBitLFSR >> 24) < 77 ? 1 : 0)
+        return UInt8((weakBitLFSR >> 24) < probability ? 1 : 0)
     }
 
     mutating func nextFluxBit(track: Int) -> UInt8? {
