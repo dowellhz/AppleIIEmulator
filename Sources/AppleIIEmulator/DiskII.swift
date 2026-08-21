@@ -109,6 +109,8 @@ final class IWMController {
 
     var hasDisk: Bool { drives.contains { $0.hasDisk } }
     func hasDisk(in drive: Int) -> Bool { drives.indices.contains(drive) && drives[drive].hasDisk }
+    /// Test-only observation of the drive-local MC3470 recovery state.
+    var readAmplifierGainByDrive: [UInt8] { drives.map(\.readAmplifierGain) }
 
     func snapshot() -> State {
         State(
@@ -356,13 +358,27 @@ final class IWMController {
         }
         nibbleReads &+= 1
         guard drives[selectedDrive].emulatesWeakBits else { return rawBit }
-        // WOZ 2.1's MC3470 guidance: delay the raw pulse through a four-bit
-        // head window and produce a noise pulse only after four zero cells.
+        // MC3470 read path: the analog gain rises when flux transitions have
+        // been absent for a while. WOZ's four-cell weak-bit delay keeps the
+        // digital comparator from treating an ordinary GCR zero as noise;
+        // once it is empty, the rising gain makes fake pulses progressively
+        // more likely until a real transition resets the front end.
         let headWindow = ((drives[selectedDrive].readHeadWindow << 1) | rawBit) & 0x0F
         drives[selectedDrive].readHeadWindow = headWindow
+        if rawBit == 0 {
+            drives[selectedDrive].readAmplifierGain = min(15, drives[selectedDrive].readAmplifierGain &+ 1)
+        } else {
+            drives[selectedDrive].readAmplifierGain = 0
+        }
         if headWindow == 0 {
             weakBitsGenerated &+= 1
-            return drives[selectedDrive].nextWeakBit()
+            // Gain 4 is the first eligible weak-bit cell and preserves the
+            // historical 30% probability. Continued silence raises the
+            // comparator sensitivity but caps it below a permanently-high
+            // stream, matching the MC3470's noisy recovery rather than a
+            // synthetic clock pulse.
+            let probability = min(191, 77 + max(0, Int(drives[selectedDrive].readAmplifierGain) - 4) * 12)
+            return drives[selectedDrive].nextWeakBit(probability: UInt8(probability))
         }
         return (headWindow >> 1) & 1
     }

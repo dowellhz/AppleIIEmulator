@@ -330,21 +330,28 @@ final class MockingboardController {
                 filterState[index] += stageAlpha * (sample - filterState[index])
                 sample = filterState[index]
             }
-            return Float(sample * configuration.amplitude * 0.42)
+            return Float(sample * configuration.amplitude * profile.gain * 0.42)
         }
 
-        private static func profile(for phoneme: Int) -> (noise: Double, filterScale: Double) {
-            // SSI publishes the source/filter architecture but not its ROM
-            // contents. Grouping the 64 codes into deterministic voiced and
-            // fricative families keeps every code audible without inventing a
-            // copied waveform table.
-            switch phoneme & 0x07 {
-            case 0, 1: return (0.08, 0.33)
-            case 2, 3: return (0.18, 0.48)
-            case 4: return (0.42, 0.65)
-            case 5: return (0.68, 0.82)
-            case 6: return (0.86, 1.00)
-            default: return (0.30, 0.56)
+        private static func profile(for phoneme: Int) -> (noise: Double, filterScale: Double, gain: Double) {
+            // The SSI-263 programming guide identifies $00 as PA (pause),
+            // $01...$1B as vowel/diphthong sounds, $1C...$22 as sonorants,
+            // then plosives and fricatives. This maps the public phoneme
+            // alphabet to its documented voiced/noise excitation families;
+            // it deliberately does not pretend to contain the chip's ROM.
+            switch phoneme {
+            case 0x00:
+                return (0, 0.40, 0)
+            case 0x01...0x1B:
+                return (0.06, 0.38, 1.00)
+            case 0x1C...0x22:
+                return (0.16, 0.48, 0.82)
+            case 0x23...0x28:
+                return (0.64, 0.72, 0.72)
+            case 0x29...0x3F:
+                return (0.88, 0.92, 0.68)
+            default:
+                return (0.30, 0.56, 0.72)
             }
         }
     }
