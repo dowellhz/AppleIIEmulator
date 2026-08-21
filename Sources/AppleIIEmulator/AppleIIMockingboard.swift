@@ -12,13 +12,14 @@ final class MockingboardController {
         fileprivate let renderCycle: Double
         fileprivate let audioChips: [AudioChip]
         fileprivate let phasorMode: UInt8
+        fileprivate let speechChips: [SSI263]
         fileprivate init(
             vias: [VIA6522], chips: [AYChip], events: [AudioEvent], nextEvent: Int,
-            renderCycle: Double, audioChips: [AudioChip], phasorMode: UInt8
+            renderCycle: Double, audioChips: [AudioChip], phasorMode: UInt8, speechChips: [SSI263]
         ) {
             self.vias = vias; self.chips = chips; self.events = events
             self.nextEvent = nextEvent; self.renderCycle = renderCycle; self.audioChips = audioChips
-            self.phasorMode = phasorMode
+            self.phasorMode = phasorMode; self.speechChips = speechChips
         }
     }
     private static let sampleRate = 44_100.0
@@ -63,7 +64,9 @@ final class MockingboardController {
         mutating func read(_ register: Int, portAInput: UInt8) -> UInt8 {
             switch register & 0x0F {
             case 0: return orb
-            case 1, 15: return (ora & ddra) | (portAInput & ~ddra)
+            case 1, 15:
+                ifr &= ~0x02 // CA1, used by the SSI-263 A/R line in Mockingboard mode.
+                return (ora & ddra) | (portAInput & ~ddra)
             case 2: return ddrb
             case 3: return ddra
             case 4:
@@ -90,7 +93,9 @@ final class MockingboardController {
         mutating func write(_ value: UInt8, register: Int) -> Bool {
             switch register & 0x0F {
             case 0: orb = value; return true
-            case 1, 15: ora = value
+            case 1, 15:
+                ora = value
+                ifr &= ~0x02
             case 2: ddrb = value
             case 3: ddra = value
             case 4: timer1Latch = (timer1Latch & 0xFF00) | UInt16(value)
@@ -277,24 +282,29 @@ final class MockingboardController {
     private var nextEvent = 0
     private var renderCycle = 0.0
     private var audioChips = [AudioChip(), AudioChip(), AudioChip(), AudioChip()]
+    // SSI-263 socket 0 is associated with VIA A, socket 1 with VIA B.
+    // The Phasor card decodes these chips directly rather than through a VIA.
+    private var speechChips = [SSI263(), SSI263()]
     /// The Phasor's device-select latch is controlled by the low address
     /// bits in its $C0n0 device-select window. Mode 000 remains fully
     /// Mockingboard compatible; 101 exposes both AY chips behind each VIA.
     private var phasorMode: UInt8 = 0
 
-    var irqPending: Bool { vias.contains { $0.irqPending } }
+    var irqPending: Bool {
+        vias.contains { $0.irqPending } || (phasorMode == 0x05 && speechChips.contains { $0.irqPending })
+    }
 
     func snapshot() -> State {
         State(
             vias: vias, chips: chips, events: events, nextEvent: nextEvent,
-            renderCycle: renderCycle, audioChips: audioChips, phasorMode: phasorMode
+            renderCycle: renderCycle, audioChips: audioChips, phasorMode: phasorMode, speechChips: speechChips
         )
     }
 
     func restore(_ state: State) {
         vias = state.vias; chips = state.chips; events = state.events
         nextEvent = state.nextEvent; renderCycle = state.renderCycle; audioChips = state.audioChips
-        phasorMode = state.phasorMode
+        phasorMode = state.phasorMode; speechChips = state.speechChips
     }
 
     func reset() {
@@ -305,11 +315,19 @@ final class MockingboardController {
         renderCycle = 0
         audioChips = [AudioChip(), AudioChip(), AudioChip(), AudioChip()]
         phasorMode = 0
+        speechChips.indices.forEach { speechChips[$0].reset() }
     }
 
     func advance(by cycles: Int) {
         guard cycles > 0 else { return }
         vias.indices.forEach { vias[$0].advance(by: cycles) }
+        speechChips.indices.forEach { index in
+            let wasRequesting = speechChips[index].requestAsserted
+            speechChips[index].advance(by: cycles)
+            if !wasRequesting, speechChips[index].requestAsserted, phasorMode == 0, vias[index].pcr & 0x01 == 0 {
+                vias[index].ifr |= 0x02
+            }
+        }
     }
 
     /// Accesses a slot-four/five Mockingboard register at the current CPU
@@ -317,23 +335,48 @@ final class MockingboardController {
     func access(_ address: Int, write value: UInt8?, atCycle cycle: Int) -> UInt8 {
         // Apple II slot I/O uses the high nibble of the low address byte:
         // $C0C0-$C0CF is slot 4 and $C0D0-$C0DF is slot 5.
-        updatePhasorDeviceSelect(address)
+        // Device Select belongs to the Phasor's own slot-four soft-switch
+        // window.  Slot five remains the second Mockingboard-compatible VIA;
+        // accesses there must not accidentally rewrite the Phasor mode latch.
+        if address & 0xFFF0 == 0xC0C0 { updatePhasorDeviceSelect(address) }
         let index = address & 0x10 == 0 ? 0 : 1
-        let register = address & 0x0F
+        return accessVIA(index, register: address & 0x0F, write: value, atCycle: cycle)
+    }
+
+    /// Accesses the Phasor's slot-card I/O page ($Cn00-$CnFF).  Native mode
+    /// interleaves its two VIAs and direct SSI-263 decoders in this page.
+    func accessPhasorCard(_ address: Int, write value: UInt8?, atCycle cycle: Int) -> UInt8 {
+        let offset = address & 0xFF
+        let viaMask: Int
+        switch phasorMode {
+        case 0:
+            viaMask = offset & 0x80 == 0 ? 1 : 2
+        case 5:
+            viaMask = ((offset & 0x80) >> 6) | ((offset & 0x10) >> 4)
+        case 7:
+            viaMask = 2 // Echo+ maps its one VIA across the card page.
+        default:
+            viaMask = 0
+        }
+
         if let value {
-            let affectsPSG = vias[index].write(value, register: register)
-            if affectsPSG {
-                let via = vias[index]
-                if via.orb & 0x04 == 0 {
-                    resetPSGChips(forVIA: index)
-                    appendAudioEvent(at: cycle)
-                } else if updatePSGChips(forVIA: index, portA: via.ora, portB: via.orb) {
-                    appendAudioEvent(at: cycle)
-                }
-            }
+            if viaMask & 1 != 0 { _ = accessVIA(0, register: offset & 0x0F, write: value, atCycle: cycle) }
+            if viaMask & 2 != 0 { _ = accessVIA(1, register: offset & 0x0F, write: value, atCycle: cycle) }
+            guard phasorMode == 0 || phasorMode == 5 else { return 0 }
+            if offset & 0x40 != 0 { speechChips[1].write(offset & 0x07, value: value) }
+            if offset & 0x20 != 0 { speechChips[0].write(offset & 0x07, value: value) }
             return 0
         }
-        return vias[index].read(register, portAInput: psgPortAInput(forVIA: index))
+
+        var result: UInt8 = 0
+        if viaMask & 1 != 0 { result |= accessVIA(0, register: offset & 0x0F, write: nil, atCycle: cycle) }
+        if viaMask & 2 != 0 { result |= accessVIA(1, register: offset & 0x0F, write: nil, atCycle: cycle) }
+        let readsSpeech = phasorMode == 5 && offset & 0x10 == 0 && offset & 0x60 != 0 && offset & 0x80 == 0
+        if readsSpeech {
+            if offset & 0x40 != 0 { result |= speechChips[1].dataBusValue }
+            if offset & 0x20 != 0 { result |= speechChips[0].dataBusValue }
+        }
+        return result
     }
 
     /// Generates chip PCM on the emulation thread. The audio endpoint only
@@ -367,6 +410,34 @@ final class MockingboardController {
     func registerValue(chip: Int, register: Int) -> UInt8? {
         guard chips.indices.contains(chip), (0..<16).contains(register) else { return nil }
         return chips[chip].registers[register]
+    }
+
+    func speechRegisterValue(chip: Int, register: Int) -> UInt8? {
+        guard speechChips.indices.contains(chip) else { return nil }
+        switch register & 0x07 {
+        case 0: return speechChips[chip].durationPhoneme
+        case 1: return speechChips[chip].inflection
+        case 2: return speechChips[chip].rateInflection
+        case 3: return speechChips[chip].controlArticulationAmplitude
+        default: return speechChips[chip].filterFrequency
+        }
+    }
+
+    private func accessVIA(_ index: Int, register: Int, write value: UInt8?, atCycle cycle: Int) -> UInt8 {
+        if let value {
+            let affectsPSG = vias[index].write(value, register: register)
+            if affectsPSG {
+                let via = vias[index]
+                if via.orb & 0x04 == 0 {
+                    resetPSGChips(forVIA: index)
+                    appendAudioEvent(at: cycle)
+                } else if updatePSGChips(forVIA: index, portA: via.ora, portB: via.orb) {
+                    appendAudioEvent(at: cycle)
+                }
+            }
+            return 0
+        }
+        return vias[index].read(register, portAInput: psgPortAInput(forVIA: index))
     }
 
     private func appendAudioEvent(at cycle: Int) {

@@ -1911,6 +1911,8 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
             return mouseController.read(register: a - 0xC0C0)
         case 0xC0C0...0xC0DF where model != .appleIIc:
             return mockingboardController.access(a, write: nil, atCycle: speakerCycle)
+        case 0xC400...0xC4FF where model != .appleIIc && !internalCXROM:
+            return mockingboardController.accessPhasorCard(a, write: nil, atCycle: speakerCycle)
         case 0xC0E0...0xC0EF:
             return accessIWM(a, write: nil)
         case 0xC0F0...0xC0FF:
@@ -2001,6 +2003,8 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
         case 0xC0C0...0xC0C3 where model == .appleIIc: mouseController.write(value, register: a - 0xC0C0)
         case 0xC0C0...0xC0DF where model != .appleIIc:
             _ = mockingboardController.access(a, write: value, atCycle: speakerCycle)
+        case 0xC400...0xC4FF where model != .appleIIc && !internalCXROM:
+            _ = mockingboardController.accessPhasorCard(a, write: value, atCycle: speakerCycle)
         case 0xC0E0...0xC0EF: _ = accessIWM(a, write: value)
         case 0xC0F0...0xC0FF: _ = smartPortController.access(a, write: value, bus: self)
         case 0xC030: toggleSpeaker()
@@ -2391,6 +2395,10 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
 
     func mockingboardRegisterValue(chip: Int, register: Int) -> UInt8? {
         mockingboardController.registerValue(chip: chip, register: register)
+    }
+
+    func mockingboardSpeechRegisterValue(chip: Int, register: Int) -> UInt8? {
+        mockingboardController.speechRegisterValue(chip: chip, register: register)
     }
 
     /// The IIc's integrated IWM occupies slot-zero I/O ($C080-$C08F). This

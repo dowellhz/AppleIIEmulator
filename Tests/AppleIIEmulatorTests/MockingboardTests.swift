@@ -46,6 +46,35 @@ final class MockingboardTests: XCTestCase {
         XCTAssertTrue(samples.contains { abs($0) > 0.01 })
     }
 
+    func testPhasorNativeSSI263DrivesRequestLineAndIRQFromCycles() {
+        let memory = AppleIIMemory()
+        _ = memory.read(0xC0C5) // Phasor-native mode
+        configureSSI263(memory, base: 0xC440, durationPhoneme: 0xC2, rate: 0xF0)
+
+        XCTAssertEqual(memory.mockingboardSpeechRegisterValue(chip: 1, register: 0), 0xC2)
+        memory.advanceVideoClock(by: 4_095)
+        XCTAssertEqual(memory.read(0xC440) & 0x80, 0)
+        XCTAssertFalse(memory.irqPending)
+        memory.advanceVideoClock(by: 1)
+        XCTAssertEqual(memory.read(0xC440) & 0x80, 0x80)
+        XCTAssertTrue(memory.irqPending)
+
+        memory.write(0xC440, 0xC3) // attribute write acknowledges A/R
+        XCTAssertEqual(memory.read(0xC440) & 0x80, 0)
+        XCTAssertFalse(memory.irqPending)
+    }
+
+    func testMockingboardSpeechRequestsCA1Interrupt() {
+        let memory = AppleIIMemory()
+        memory.write(0xC0DE, 0x82) // enable VIA B CA1 (the primary SSI-263 socket)
+        configureSSI263(memory, base: 0xC440, durationPhoneme: 0xC2, rate: 0xF0)
+        memory.advanceVideoClock(by: 4_096)
+
+        XCTAssertEqual(memory.read(0xC0DD) & 0x82, 0x82)
+        _ = memory.read(0xC0D1) // VIA ORA acknowledgement clears CA1
+        XCTAssertEqual(memory.read(0xC0DD) & 0x02, 0)
+    }
+
     func testVIAOneShotTimerRaisesAndClearsIRQFlag() {
         let memory = AppleIIMemory()
         memory.write(0xC0CE, 0xC0) // IER: enable Timer 1 interrupt
@@ -105,5 +134,14 @@ final class MockingboardTests: XCTestCase {
         memory.write(base + 1, value)
         memory.write(base, select | 0x06) // BDIR=1, BC1=0: write
         memory.write(base, select | 0x04) // inactive
+    }
+
+    private func configureSSI263(
+        _ memory: AppleIIMemory, base: UInt16, durationPhoneme: UInt8, rate: UInt8
+    ) {
+        memory.write(base, durationPhoneme)
+        memory.write(base + 2, rate)
+        memory.write(base + 3, 0x80) // enter power-down / standby
+        memory.write(base + 3, 0x00) // CTL high-to-low starts the selected phoneme mode
     }
 }
