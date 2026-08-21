@@ -11,12 +11,14 @@ final class MockingboardController {
         fileprivate let nextEvent: Int
         fileprivate let renderCycle: Double
         fileprivate let audioChips: [AudioChip]
+        fileprivate let phasorMode: UInt8
         fileprivate init(
             vias: [VIA6522], chips: [AYChip], events: [AudioEvent], nextEvent: Int,
-            renderCycle: Double, audioChips: [AudioChip]
+            renderCycle: Double, audioChips: [AudioChip], phasorMode: UInt8
         ) {
             self.vias = vias; self.chips = chips; self.events = events
             self.nextEvent = nextEvent; self.renderCycle = renderCycle; self.audioChips = audioChips
+            self.phasorMode = phasorMode
         }
     }
     private static let sampleRate = 44_100.0
@@ -268,21 +270,31 @@ final class MockingboardController {
     }
 
     private var vias = [VIA6522(), VIA6522()]
-    private var chips = [AYChip(), AYChip()]
-    private var events = [AudioEvent(cycle: 0, registers: [[UInt8](repeating: 0, count: 16), [UInt8](repeating: 0, count: 16)])]
+    // In Mockingboard mode each VIA drives one AY. Phasor-native mode uses
+    // the same two VIA buses, with each one selecting a pair of AY-3-8913s.
+    private var chips = [AYChip(), AYChip(), AYChip(), AYChip()]
+    private var events = [AudioEvent(cycle: 0, registers: Array(repeating: [UInt8](repeating: 0, count: 16), count: 4))]
     private var nextEvent = 0
     private var renderCycle = 0.0
-    private var audioChips = [AudioChip(), AudioChip()]
+    private var audioChips = [AudioChip(), AudioChip(), AudioChip(), AudioChip()]
+    /// The Phasor's device-select latch is controlled by the low address
+    /// bits in its $C0n0 device-select window. Mode 000 remains fully
+    /// Mockingboard compatible; 101 exposes both AY chips behind each VIA.
+    private var phasorMode: UInt8 = 0
 
     var irqPending: Bool { vias.contains { $0.irqPending } }
 
     func snapshot() -> State {
-        State(vias: vias, chips: chips, events: events, nextEvent: nextEvent, renderCycle: renderCycle, audioChips: audioChips)
+        State(
+            vias: vias, chips: chips, events: events, nextEvent: nextEvent,
+            renderCycle: renderCycle, audioChips: audioChips, phasorMode: phasorMode
+        )
     }
 
     func restore(_ state: State) {
         vias = state.vias; chips = state.chips; events = state.events
         nextEvent = state.nextEvent; renderCycle = state.renderCycle; audioChips = state.audioChips
+        phasorMode = state.phasorMode
     }
 
     func reset() {
@@ -291,7 +303,8 @@ final class MockingboardController {
         events = [AudioEvent(cycle: 0, registers: chips.map(\.registers))]
         nextEvent = 0
         renderCycle = 0
-        audioChips = [AudioChip(), AudioChip()]
+        audioChips = [AudioChip(), AudioChip(), AudioChip(), AudioChip()]
+        phasorMode = 0
     }
 
     func advance(by cycles: Int) {
@@ -304,6 +317,7 @@ final class MockingboardController {
     func access(_ address: Int, write value: UInt8?, atCycle cycle: Int) -> UInt8 {
         // Apple II slot I/O uses the high nibble of the low address byte:
         // $C0C0-$C0CF is slot 4 and $C0D0-$C0DF is slot 5.
+        updatePhasorDeviceSelect(address)
         let index = address & 0x10 == 0 ? 0 : 1
         let register = address & 0x0F
         if let value {
@@ -311,15 +325,15 @@ final class MockingboardController {
             if affectsPSG {
                 let via = vias[index]
                 if via.orb & 0x04 == 0 {
-                    chips[index].reset()
+                    resetPSGChips(forVIA: index)
                     appendAudioEvent(at: cycle)
-                } else if chips[index].update(portA: via.ora, portB: via.orb) {
+                } else if updatePSGChips(forVIA: index, portA: via.ora, portB: via.orb) {
                     appendAudioEvent(at: cycle)
                 }
             }
             return 0
         }
-        return vias[index].read(register, portAInput: chips[index].portAInput())
+        return vias[index].read(register, portAInput: psgPortAInput(forVIA: index))
     }
 
     /// Generates chip PCM on the emulation thread. The audio endpoint only
@@ -335,8 +349,11 @@ final class MockingboardController {
                 for index in audioChips.indices { audioChips[index].apply(event.registers[index]) }
                 nextEvent += 1
             }
-            let left = audioChips[0].nextSample()
-            let right = audioChips[1].nextSample()
+            // Phasor routes two AYs to each stereo channel. In ordinary
+            // Mockingboard mode chips 2/3 stay silent, retaining the old
+            // two-chip output exactly.
+            let left = (audioChips[0].nextSample() + audioChips[2].nextSample()) * 0.5
+            let right = (audioChips[1].nextSample() + audioChips[3].nextSample()) * 0.5
             samples.append((left + right) * 0.075)
             renderCycle += cyclesPerSample
         }
@@ -359,5 +376,45 @@ final class MockingboardController {
         } else {
             events.append(event)
         }
+    }
+
+    private func updatePhasorDeviceSelect(_ address: Int) {
+        let selector = UInt8(address & 0x0F)
+        if selector & 0x08 != 0 { phasorMode = 0 }
+        phasorMode |= selector & 0x07
+    }
+
+    private var usesPhasorNativeAYSelection: Bool { phasorMode == 0x05 }
+
+    private func selectedPSGChips(forVIA via: Int, portB: UInt8? = nil) -> [Int] {
+        guard usesPhasorNativeAYSelection else { return [via] }
+        let base = via * 2
+        let chipSelect = ((portB ?? vias[via].orb) >> 3) & 0x03
+        // PB3/PB4 are active-low selects for AY1/AY2. Selecting both is
+        // meaningful for mirrored register setup and is sampled by both
+        // chips at the same emulated bus cycle.
+        switch chipSelect {
+        case 0: return [base, base + 1]
+        case 1: return [base + 1]
+        case 2: return [base]
+        default: return []
+        }
+    }
+
+    private func resetPSGChips(forVIA via: Int) {
+        let targets = usesPhasorNativeAYSelection ? [via * 2, via * 2 + 1] : [via]
+        for target in targets { chips[target].reset() }
+    }
+
+    private func updatePSGChips(forVIA via: Int, portA: UInt8, portB: UInt8) -> Bool {
+        var changed = false
+        for target in selectedPSGChips(forVIA: via, portB: portB) {
+            changed = chips[target].update(portA: portA, portB: portB) || changed
+        }
+        return changed
+    }
+
+    private func psgPortAInput(forVIA via: Int) -> UInt8 {
+        selectedPSGChips(forVIA: via).reduce(UInt8.max) { $0 & chips[$1].portAInput() }
     }
 }

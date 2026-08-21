@@ -19,6 +19,33 @@ final class MockingboardTests: XCTestCase {
         XCTAssertEqual(memory.mockingboardRegisterValue(chip: 0, register: 0), 0)
     }
 
+    func testPhasorNativeDeviceSelectAddressesAllFourAYChips() {
+        let memory = AppleIIMemory()
+        _ = memory.read(0xC0C5) // device select: Phasor-native mode (101)
+
+        writePhasorAY(memory, base: 0xC0C0, chipSelect: 0x01, register: 8, value: 0x0C)
+        writePhasorAY(memory, base: 0xC0D0, chipSelect: 0x02, register: 8, value: 0x0A)
+
+        XCTAssertEqual(memory.mockingboardRegisterValue(chip: 0, register: 8), 0)
+        XCTAssertEqual(memory.mockingboardRegisterValue(chip: 1, register: 8), 0x0C)
+        XCTAssertEqual(memory.mockingboardRegisterValue(chip: 2, register: 8), 0x0A)
+        XCTAssertEqual(memory.mockingboardRegisterValue(chip: 3, register: 8), 0)
+    }
+
+    func testPhasorNativeSecondVIAProducesCycleClockedAudio() {
+        let memory = AppleIIMemory()
+        _ = memory.read(0xC0C5)
+        let base: UInt16 = 0xC0D0
+        writePhasorAY(memory, base: base, chipSelect: 0x02, register: 0, value: 0x08)
+        writePhasorAY(memory, base: base, chipSelect: 0x02, register: 1, value: 0x00)
+        writePhasorAY(memory, base: base, chipSelect: 0x02, register: 7, value: 0x3E)
+        writePhasorAY(memory, base: base, chipSelect: 0x02, register: 8, value: 0x0F)
+
+        let samples = memory.renderMockingboardAudio(toEmulatedCycle: 2_000)
+        XCTAssertFalse(samples.isEmpty)
+        XCTAssertTrue(samples.contains { abs($0) > 0.01 })
+    }
+
     func testVIAOneShotTimerRaisesAndClearsIRQFlag() {
         let memory = AppleIIMemory()
         memory.write(0xC0CE, 0xC0) // IER: enable Timer 1 interrupt
@@ -66,5 +93,17 @@ final class MockingboardTests: XCTestCase {
         memory.write(base + 1, value)
         memory.write(base, 0x06) // BDIR=1, BC1=0: write register
         memory.write(base, 0x04) // inactive
+    }
+
+    private func writePhasorAY(
+        _ memory: AppleIIMemory, base: UInt16, chipSelect: UInt8, register: UInt8, value: UInt8
+    ) {
+        let select = (chipSelect & 0x03) << 3
+        memory.write(base + 1, register)
+        memory.write(base, select | 0x07) // BDIR=1, BC1=1: latch
+        memory.write(base, select | 0x04) // inactive
+        memory.write(base + 1, value)
+        memory.write(base, select | 0x06) // BDIR=1, BC1=0: write
+        memory.write(base, select | 0x04) // inactive
     }
 }
