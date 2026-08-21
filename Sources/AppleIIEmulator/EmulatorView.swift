@@ -21,6 +21,11 @@ struct EmulatorView: View {
             idealHeight: ChassisLayout.idealHeight
         )
         .preferredColorScheme(.dark)
+        .overlay(alignment: .topLeading) {
+            if machine.isDebuggerVisible {
+                EmulatorDebuggerHUD(machine: machine)
+            }
+        }
     }
 
     private var chassis: some View {

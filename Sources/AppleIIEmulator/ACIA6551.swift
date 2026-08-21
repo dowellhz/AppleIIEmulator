@@ -1,10 +1,23 @@
 import Foundation
 
+struct SerialLineConfiguration: Equatable {
+    enum Parity: Equatable { case none, odd, even }
+
+    let baudRate: Int
+    let dataBits: Int
+    let stopBits: Int
+    let parity: Parity
+}
+
 /// Synertek/MOS 6551 ACIA as used by the Apple IIc's built-in printer and
 /// modem ports.  It models register-visible state and shifts one framed byte
 /// from the transmitter using the emulator's 6502 cycle clock; it deliberately
 /// has no AppKit or host-serial dependency.
 struct ACIA6551 {
+    struct State {
+        fileprivate let acia: ACIA6551
+        fileprivate init(acia: ACIA6551) { self.acia = acia }
+    }
     private static let receiverDataFull: UInt8 = 0x08
     private static let transmitterDataEmpty: UInt8 = 0x10
     private static let interruptRequest: UInt8 = 0x80
@@ -31,6 +44,17 @@ struct ACIA6551 {
     private var transmitterBreakActive: Bool { command & 0x0C == 0x0C }
     var irqPending: Bool { receiveData != nil && receiverInterruptEnabled }
     var baudRate: Int { selectedBaudRate }
+    var lineConfiguration: SerialLineConfiguration {
+        SerialLineConfiguration(
+            baudRate: selectedBaudRate,
+            dataBits: selectedDataBits,
+            stopBits: control & 0x80 == 0 ? 1 : 2,
+            parity: selectedParity
+        )
+    }
+
+    func snapshot() -> State { State(acia: self) }
+    mutating func restore(_ snapshot: State) { self = snapshot.acia }
 
     mutating func reset() {
         command = 0
@@ -141,17 +165,27 @@ struct ACIA6551 {
         // duration reflects its visible word-length, parity and stop-bit
         // controls so software polling TDRE remains tied to 6502 cycles.
         let baud = selectedBaudRate
-        let dataBits: Int
-        switch (control >> 5) & 0x03 {
-        case 0x01: dataBits = 7
-        case 0x02: dataBits = 6
-        case 0x03: dataBits = 5
-        default: dataBits = 8
-        }
-        let parityBits = command & 0x03 == 0 ? 0 : 1
-        let stopBits = control & 0x80 == 0 ? 1 : 2
-        let frameBits = 1 + dataBits + parityBits + stopBits
+        let frameBits = 1 + selectedDataBits + (command & 0x03 == 0 ? 0 : 1) + (control & 0x80 == 0 ? 1 : 2)
         return max(1, (1_021_800 * frameBits + baud - 1) / baud)
+    }
+
+    private var selectedDataBits: Int {
+        switch (control >> 5) & 0x03 {
+        case 0x01: return 7
+        case 0x02: return 6
+        case 0x03: return 5
+        default: return 8
+        }
+    }
+
+    private var selectedParity: SerialLineConfiguration.Parity {
+        // Mark/space parity has no portable macOS termios representation.
+        // Keep their emulated framing distinct from a silently wrong host mode.
+        switch command & 0x03 {
+        case 0x01: return .odd
+        case 0x02: return .even
+        default: return .none
+        }
     }
 
     private var selectedBaudRate: Int {

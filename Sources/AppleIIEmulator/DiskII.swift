@@ -18,6 +18,24 @@ struct DiskIIDebugSnapshot {
 /// IWM/P6 soft-switch state machine. Media container decoding is delegated to
 /// `DiskImageCodec`; callers may keep using the historical `DiskII` alias.
 final class IWMController {
+    struct State {
+        fileprivate let drives: [DiskDrive]
+        fileprivate let q6: Bool
+        fileprivate let q7: Bool
+        fileprivate let motorOn: Bool
+        fileprivate let motorOffDelay: Int
+        fileprivate let selectedDrive: Int
+        fileprivate let dataLatch: UInt8
+        fileprivate let busData: UInt8
+        fileprivate let sequencerState: UInt8
+        fileprivate let sequencerPhase: UInt8
+        fileprivate let writeLevel: UInt8
+        fileprivate let nibbleReads: Int
+        fileprivate let nibbleWrites: Int
+        fileprivate let weakBitsGenerated: Int
+        fileprivate let fluxBitReads: Int
+        fileprivate let readBitsByDrive: [Int]
+    }
     static let imageSize = 35 * 16 * 256
     static let thirteenSectorImageSize = 35 * 13 * 256
     static let nibImageSize = 35 * 6_656
@@ -91,6 +109,26 @@ final class IWMController {
 
     var hasDisk: Bool { drives.contains { $0.hasDisk } }
     func hasDisk(in drive: Int) -> Bool { drives.indices.contains(drive) && drives[drive].hasDisk }
+
+    func snapshot() -> State {
+        State(
+            drives: drives, q6: q6, q7: q7, motorOn: motorOn, motorOffDelay: motorOffDelay,
+            selectedDrive: selectedDrive, dataLatch: dataLatch, busData: busData,
+            sequencerState: sequencerState, sequencerPhase: sequencerPhase, writeLevel: writeLevel,
+            nibbleReads: nibbleReads, nibbleWrites: nibbleWrites,
+            weakBitsGenerated: weakBitsGenerated, fluxBitReads: fluxBitReads, readBitsByDrive: readBitsByDrive
+        )
+    }
+
+    func restore(_ state: State) {
+        drives = state.drives; q6 = state.q6; q7 = state.q7; motorOn = state.motorOn
+        motorOffDelay = state.motorOffDelay; selectedDrive = state.selectedDrive
+        dataLatch = state.dataLatch; busData = state.busData; sequencerState = state.sequencerState
+        sequencerPhase = state.sequencerPhase; writeLevel = state.writeLevel
+        nibbleReads = state.nibbleReads; nibbleWrites = state.nibbleWrites
+        weakBitsGenerated = state.weakBitsGenerated; fluxBitReads = state.fluxBitReads
+        readBitsByDrive = state.readBitsByDrive
+    }
 
     func reset() {
         for index in drives.indices {
@@ -629,14 +667,15 @@ final class IWMController {
     /// Save As action; mounting a disk never changes its original file.
     func wozImage(drive: Int = 0) -> Data? {
         guard drives.indices.contains(drive), drives[drive].quarterTrackMap.count == 160 else { return nil }
+        let fluxSurface = drives[drive].fluxSurfaceForExport()
         return try? DiskImageCodec.encodeWOZ2(
             tracks: drives[drive].bitTracks,
             quarterTrackMap: drives[drive].quarterTrackMap,
             thirteenSector: drives[drive].isThirteenSector,
             writeProtected: drives[drive].isWriteProtected,
             container: drives[drive].wozContainer,
-            fluxTracks: drives[drive].fluxTracks,
-            fluxQuarterTrackMap: drives[drive].fluxQuarterTrackMap,
+            fluxTracks: fluxSurface.tracks,
+            fluxQuarterTrackMap: fluxSurface.map,
             preserveWriteHints: !drives[drive].surfaceModified
         )
     }

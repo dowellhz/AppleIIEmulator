@@ -49,6 +49,11 @@ struct DiskDrive {
     /// deliberately blank or overlapping tracks used by protected disks.
     var quarterTrackMap = [Int]()
     var fluxQuarterTrackMap = [Int]()
+    /// Runtime writes use a recovered BITS working surface, while WOZ Save As
+    /// must retain the original FLUX addressing and re-quantize that changed
+    /// surface. This map is immutable media geometry, not a live head map.
+    var originalFluxQuarterTrackMap = [Int]()
+    var modifiedFluxTracks = [Bool]()
     var wozContainer: WOZContainerMetadata?
     var isThirteenSector = false
     var isWriteProtected = false
@@ -80,6 +85,8 @@ struct DiskDrive {
         fluxTracks.removeAll()
         quarterTrackMap.removeAll()
         fluxQuarterTrackMap.removeAll()
+        originalFluxQuarterTrackMap.removeAll()
+        modifiedFluxTracks.removeAll()
         wozContainer = nil
         isThirteenSector = false
         isWriteProtected = false
@@ -111,6 +118,8 @@ struct DiskDrive {
         self.fluxTracks = fluxTracks
         self.quarterTrackMap = quarterTrackMap
         self.fluxQuarterTrackMap = fluxQuarterTrackMap
+        self.originalFluxQuarterTrackMap = fluxQuarterTrackMap
+        self.modifiedFluxTracks = Array(repeating: false, count: fluxTracks.count)
         self.wozContainer = wozContainer
         self.isThirteenSector = thirteenSector
         self.isWriteProtected = writeProtected
@@ -160,8 +169,8 @@ struct DiskDrive {
     /// A flux capture has no intrinsic writable bit cells.  Before the IWM
     /// changes one, recover a complete revolution into a BITS track and move
     /// each FLUX-mapped quarter track onto that new surface.  This is a
-    /// deliberate one-way conversion: a later WOZ export retains untouched
-    /// FLUX tracks but writes the altered track as conventional BITS data.
+    /// The working copy is BITS so the IWM can address individual cells. A
+    /// later WOZ export re-quantizes only this changed track back to FLUX.
     mutating func materializeFluxTrack(_ track: Int) -> Bool {
         guard fluxTracks.indices.contains(track), let stream = fluxTracks[track], !stream.bytes.isEmpty else {
             return false
@@ -192,7 +201,7 @@ struct DiskDrive {
             bitCount: cells.count,
             nibbleBitOffsets: Array(repeating: -1, count: cells.count)
         )
-        fluxTracks[track] = nil
+        if modifiedFluxTracks.indices.contains(track) { modifiedFluxTracks[track] = true }
         for quarterTrack in fluxQuarterTrackMap.indices where fluxQuarterTrackMap[quarterTrack] == track {
             fluxQuarterTrackMap[quarterTrack] = -1
             if quarterTrackMap.indices.contains(quarterTrack), quarterTrackMap[quarterTrack] < 0 {
@@ -205,6 +214,42 @@ struct DiskDrive {
         bitPosition = 0
         surfaceModified = true
         return true
+    }
+
+    /// FLUX records transition intervals in 125 ns ticks. A recovered BITS
+    /// track has an explicit transition at every `1` cell, so its modified
+    /// surface can be deterministically re-quantized for WOZ 2.1 Save As.
+    func fluxSurfaceForExport() -> (tracks: [DiskFluxTrack?], map: [Int]) {
+        guard modifiedFluxTracks.contains(true) else {
+            return (fluxTracks, fluxQuarterTrackMap)
+        }
+        var tracks = fluxTracks
+        for index in modifiedFluxTracks.indices where modifiedFluxTracks[index] {
+            guard bitTracks.indices.contains(index) else { continue }
+            let timing = fluxTracks.indices.contains(index) ? fluxTracks[index]?.optimalBitTiming ?? 32 : 32
+            tracks[index] = Self.quantize(bitTrack: bitTracks[index], timing: timing)
+        }
+        return (tracks, originalFluxQuarterTrackMap)
+    }
+
+    private static func quantize(bitTrack: DiskBitTrack, timing: Int) -> DiskFluxTrack {
+        guard bitTrack.bitCount > 0 else { return DiskFluxTrack(bytes: [1], optimalBitTiming: timing) }
+        var intervals = [UInt8]()
+        var cellsSinceTransition = 0
+        for position in 0..<bitTrack.bitCount {
+            cellsSinceTransition += 1
+            let bit = (bitTrack.bytes[position / 8] >> UInt8(7 - (position & 7))) & 1
+            guard bit != 0 else { continue }
+            var ticks = max(1, cellsSinceTransition * max(16, timing))
+            while ticks >= 255 {
+                intervals.append(0xFF)
+                ticks -= 255
+            }
+            intervals.append(UInt8(ticks))
+            cellsSinceTransition = 0
+        }
+        if intervals.isEmpty { intervals = [UInt8(min(254, max(1, bitTrack.bitCount * max(16, timing))))] }
+        return DiskFluxTrack(bytes: intervals, optimalBitTiming: timing)
     }
 
     private mutating func nextFluxInterval(from stream: DiskFluxTrack) -> Int {

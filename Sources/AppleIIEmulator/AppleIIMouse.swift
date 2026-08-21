@@ -4,6 +4,10 @@ import Foundation
 /// its built-in mouse port; its ROM communicates through an MC6821 PIA rather
 /// than reading host coordinates directly.
 struct AppleIIMouseInterface {
+    struct State {
+        fileprivate let mouse: AppleIIMouseInterface
+        fileprivate init(mouse: AppleIIMouseInterface) { self.mouse = mouse }
+    }
     private struct PIA6821 {
         var portAOutput: UInt8 = 0
         var portBOutput: UInt8 = 0
@@ -65,6 +69,9 @@ struct AppleIIMouseInterface {
     private static let interruptMask: UInt8 = 0x0E
 
     var irqPending: Bool { state & Self.interruptMask != 0 }
+
+    func snapshot() -> State { State(mouse: self) }
+    mutating func restore(_ snapshot: State) { self = snapshot.mouse }
 
     mutating func reset() {
         pia = PIA6821()

@@ -72,6 +72,19 @@ final class ACIA6551Tests: XCTestCase {
         XCTAssertEqual(memory.serialBaudRate(port: 2), 19_200)
     }
 
+    func testIIcSerialLineFormatIsExposedToTheHostBridge() {
+        let memory = AppleIIMemory()
+        memory.loadROM(Data(repeating: 0, count: 0x8000))
+        memory.write(0xC09B, 0xAF) // 7 data bits, 2 stops, 19,200 baud
+        memory.write(0xC09A, 0x05) // transmitter enabled, odd parity
+        XCTAssertEqual(
+            memory.serialLineConfiguration(port: 1),
+            SerialLineConfiguration(baudRate: 19_200, dataBits: 7, stopBits: 2, parity: .odd)
+        )
+        memory.write(0xC09A, 0x06)
+        XCTAssertEqual(memory.serialLineConfiguration(port: 1).parity, .even)
+    }
+
     func testAppleIIPlusDoesNotExposeIIcACIARegisters() {
         let memory = AppleIIMemory()
         memory.loadROM(Data(repeating: 0, count: 0x3000))

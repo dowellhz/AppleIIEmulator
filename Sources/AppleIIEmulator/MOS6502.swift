@@ -1,9 +1,33 @@
 import Foundation
 
+struct MOS6502DebugSnapshot: Equatable {
+    let a: UInt8
+    let x: UInt8
+    let y: UInt8
+    let sp: UInt8
+    let pc: UInt16
+    let p: UInt8
+    let cycles: Int
+}
+
 /// 65C02 instruction-level core. It deliberately models the processor
 /// separately from Apple II hardware, allowing the same core to be exercised
 /// with conformance ROMs and a simple test bus.
 final class MOS6502: @unchecked Sendable {
+    struct State {
+        fileprivate let a: UInt8, x: UInt8, y: UInt8, sp: UInt8, pc: UInt16, p: UInt8
+        fileprivate let totalCycles: Int, lastOpcode: UInt8, lastInstructionAddress: UInt16
+        fileprivate let unsupportedOpcodes: Set<UInt8>, lastUnsupportedInstructionAddress: UInt16
+        fileprivate let recentInstructions: [(UInt16, UInt8)], firstUnsupportedTrace: [(UInt16, UInt8)]
+        fileprivate let hasExecutedRAMInstruction: Bool, waitingForInterrupt: Bool, stopped: Bool
+        fileprivate init(cpu: MOS6502) {
+            a = cpu.a; x = cpu.x; y = cpu.y; sp = cpu.sp; pc = cpu.pc; p = cpu.p
+            totalCycles = cpu.totalCycles; lastOpcode = cpu.lastOpcode; lastInstructionAddress = cpu.lastInstructionAddress
+            unsupportedOpcodes = cpu.unsupportedOpcodes; lastUnsupportedInstructionAddress = cpu.lastUnsupportedInstructionAddress
+            recentInstructions = cpu.recentInstructions; firstUnsupportedTrace = cpu.firstUnsupportedTrace
+            hasExecutedRAMInstruction = cpu.hasExecutedRAMInstruction; waitingForInterrupt = cpu.waitingForInterrupt; stopped = cpu.stopped
+        }
+    }
     private let bus: AppleIIBus
     private(set) var a: UInt8 = 0
     private(set) var x: UInt8 = 0
@@ -51,6 +75,34 @@ final class MOS6502: @unchecked Sendable {
     func start(at address: UInt16, x registerX: UInt8? = nil) {
         pc = address
         if let registerX { x = registerX }
+    }
+
+    var debugSnapshot: MOS6502DebugSnapshot {
+        MOS6502DebugSnapshot(a: a, x: x, y: y, sp: sp, pc: pc, p: p, cycles: totalCycles)
+    }
+
+    func snapshot() -> State { State(cpu: self) }
+
+    func restore(_ state: State) {
+        a = state.a; x = state.x; y = state.y; sp = state.sp; pc = state.pc; p = state.p
+        totalCycles = state.totalCycles; lastOpcode = state.lastOpcode; lastInstructionAddress = state.lastInstructionAddress
+        unsupportedOpcodes = state.unsupportedOpcodes; lastUnsupportedInstructionAddress = state.lastUnsupportedInstructionAddress
+        recentInstructions = state.recentInstructions; firstUnsupportedTrace = state.firstUnsupportedTrace
+        hasExecutedRAMInstruction = state.hasExecutedRAMInstruction; waitingForInterrupt = state.waitingForInterrupt; stopped = state.stopped
+        cyclePenalty = 0; instructionBusCycle = 0; advancedBusCycles = 0
+    }
+
+    /// Executes exactly one instruction using the same bus-cycle protocol as
+    /// normal execution. Debug stepping therefore cannot skip a disk, sound
+    /// or soft-switch side effect merely because the UI is paused.
+    @discardableResult
+    func runOneInstruction() -> Int {
+        let cyclesBefore = totalCycles
+        let cost = step()
+        totalCycles += cost
+        finishInstructionBusCycles(total: cost)
+        if bus.irqPending { irq() }
+        return totalCycles - cyclesBefore
     }
 
 
