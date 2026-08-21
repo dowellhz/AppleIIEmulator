@@ -22,6 +22,7 @@ final class MockingboardTests: XCTestCase {
     func testPhasorNativeDeviceSelectAddressesAllFourAYChips() {
         let memory = AppleIIMemory()
         _ = memory.read(0xC0C5) // device select: Phasor-native mode (101)
+        XCTAssertEqual(memory.mockingboardAYClockScale, 2)
 
         writePhasorAY(memory, base: 0xC0C0, chipSelect: 0x01, register: 8, value: 0x0C)
         writePhasorAY(memory, base: 0xC0D0, chipSelect: 0x02, register: 8, value: 0x0A)
@@ -30,6 +31,9 @@ final class MockingboardTests: XCTestCase {
         XCTAssertEqual(memory.mockingboardRegisterValue(chip: 1, register: 8), 0x0C)
         XCTAssertEqual(memory.mockingboardRegisterValue(chip: 2, register: 8), 0x0A)
         XCTAssertEqual(memory.mockingboardRegisterValue(chip: 3, register: 8), 0)
+
+        _ = memory.read(0xC0C8) // reset Device Select back to Mockingboard mode
+        XCTAssertEqual(memory.mockingboardAYClockScale, 1)
     }
 
     func testPhasorNativeSecondVIAProducesCycleClockedAudio() {
@@ -44,6 +48,34 @@ final class MockingboardTests: XCTestCase {
         let samples = memory.renderMockingboardAudio(toEmulatedCycle: 2_000)
         XCTAssertFalse(samples.isEmpty)
         XCTAssertTrue(samples.contains { abs($0) > 0.01 })
+    }
+
+    func testPhasorNativeAY2LatchAlsoSetsAY1RegisterAddress() {
+        let memory = AppleIIMemory()
+        _ = memory.read(0xC0C5)
+
+        memory.write(0xC0C1, 3)
+        memory.write(0xC0C0, 0x0F) // AY2 LATCH; native GAL also latches AY1
+        memory.write(0xC0C0, 0x0C)
+        memory.write(0xC0C1, 0x0E)
+        memory.write(0xC0C0, 0x16) // AY1 WRITE
+        memory.write(0xC0C0, 0x14)
+
+        XCTAssertEqual(memory.mockingboardRegisterValue(chip: 0, register: 3), 0x0E)
+        XCTAssertEqual(memory.mockingboardRegisterValue(chip: 1, register: 3), 0)
+    }
+
+    func testEchoPlusMapsItsMirroredCardPageToTheSecondVIAPair() {
+        let memory = AppleIIMemory()
+        _ = memory.read(0xC0C2) // Echo+ device-select encoding
+
+        writePhasorAY(memory, base: 0xC400, chipSelect: 0x01, register: 8, value: 0x0D)
+        writePhasorAY(memory, base: 0xC4F0, chipSelect: 0x02, register: 8, value: 0x0B)
+
+        XCTAssertEqual(memory.mockingboardRegisterValue(chip: 0, register: 8), 0)
+        XCTAssertEqual(memory.mockingboardRegisterValue(chip: 1, register: 8), 0)
+        XCTAssertEqual(memory.mockingboardRegisterValue(chip: 2, register: 8), 0x0B)
+        XCTAssertEqual(memory.mockingboardRegisterValue(chip: 3, register: 8), 0x0D)
     }
 
     func testPhasorNativeSSI263DrivesRequestLineAndIRQFromCycles() {

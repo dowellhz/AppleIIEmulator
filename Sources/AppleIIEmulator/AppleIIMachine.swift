@@ -2401,6 +2401,8 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
         mockingboardController.speechRegisterValue(chip: chip, register: register)
     }
 
+    var mockingboardAYClockScale: Double { mockingboardController.ayClockScale }
+
     /// The IIc's integrated IWM occupies slot-zero I/O ($C080-$C08F). This
     /// models its control latch and data path; the sector stream is attached
     /// to this same state machine by the disk-image layer.

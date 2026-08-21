@@ -63,4 +63,26 @@ final class DebuggerTests: XCTestCase {
         _ = cpu.runOneInstruction()
         XCTAssertEqual(memory.speakerFlips, 1)
     }
+
+    func testCoreStateSnapshotRestoresSSI263RequestDeadline() {
+        let memory = AppleIIMemory()
+        _ = memory.read(0xC0C5) // Phasor-native mode
+        memory.write(0xC440, 0xC2) // DR=3, phoneme 2
+        memory.write(0xC442, 0xF0) // shortest 4,096-cycle frame
+        memory.write(0xC443, 0x80)
+        memory.write(0xC443, 0x00) // power down -> active
+        memory.advanceVideoClock(by: 2_000)
+        let state = memory.snapshot()
+
+        memory.advanceVideoClock(by: 2_096)
+        XCTAssertEqual(memory.read(0xC440) & 0x80, 0x80)
+        memory.write(0xC440, 0xC3)
+        XCTAssertEqual(memory.read(0xC440) & 0x80, 0)
+
+        memory.restore(state)
+        memory.advanceVideoClock(by: 2_095)
+        XCTAssertEqual(memory.read(0xC440) & 0x80, 0)
+        memory.advanceVideoClock(by: 1)
+        XCTAssertEqual(memory.read(0xC440) & 0x80, 0x80)
+    }
 }

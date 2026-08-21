@@ -24,7 +24,7 @@ final class MockingboardController {
     }
     private static let sampleRate = 44_100.0
     private static let cyclesPerSecond = 1_021_800.0
-    private static let ayClock = 1_021_800.0
+    private static let baseAYClock = 1_021_800.0
 
     fileprivate struct VIA6522 {
         var ora: UInt8 = 0
@@ -207,18 +207,20 @@ final class MockingboardController {
 
     fileprivate struct AudioChip {
         var registers = [UInt8](repeating: 0, count: 16)
+        var clockScale = 1.0
         var tonePhase = [Double](repeating: 0, count: 3)
         var noisePhase = 0.0
         var noiseLFSR: UInt32 = 0x1FFFF
         var envelopePhase = 0.0
         var envelopeStep = 0
 
-        mutating func apply(_ registers: [UInt8]) {
+        mutating func apply(_ registers: [UInt8], clockScale: Double) {
             if registers[13] != self.registers[13] {
                 envelopePhase = 0
                 envelopeStep = 0
             }
             self.registers = registers
+            self.clockScale = clockScale
         }
 
         mutating func nextSample() -> Float {
@@ -226,7 +228,8 @@ final class MockingboardController {
             var total = 0.0
             for channel in 0..<3 {
                 let period = max(1, Int(registers[channel * 2]) | (Int(registers[channel * 2 + 1] & 0x0F) << 8))
-                let increment = MockingboardController.ayClock / (16.0 * Double(period) * MockingboardController.sampleRate)
+                let increment = MockingboardController.baseAYClock * clockScale
+                    / (16.0 * Double(period) * MockingboardController.sampleRate)
                 tonePhase[channel] += increment
                 if tonePhase[channel] >= 1 { tonePhase[channel] -= floor(tonePhase[channel]) }
                 let toneHigh = tonePhase[channel] < 0.5
@@ -246,14 +249,16 @@ final class MockingboardController {
             }
 
             let noisePeriod = max(1, Int(registers[6] & 0x1F))
-            noisePhase += MockingboardController.ayClock / (16.0 * Double(noisePeriod) * MockingboardController.sampleRate)
+            noisePhase += MockingboardController.baseAYClock * clockScale
+                / (16.0 * Double(noisePeriod) * MockingboardController.sampleRate)
             while noisePhase >= 1 {
                 noisePhase -= 1
                 let feedback = (noiseLFSR ^ (noiseLFSR >> 3)) & 1
                 noiseLFSR = (noiseLFSR >> 1) | (feedback << 16)
             }
             let envelopePeriod = max(1, Int(registers[11]) | Int(registers[12]) << 8)
-            envelopePhase += MockingboardController.ayClock / (256.0 * Double(envelopePeriod) * MockingboardController.sampleRate)
+            envelopePhase += MockingboardController.baseAYClock * clockScale
+                / (256.0 * Double(envelopePeriod) * MockingboardController.sampleRate)
             while envelopePhase >= 1 {
                 envelopePhase -= 1
                 envelopeStep = (envelopeStep + 1) & 31
@@ -272,13 +277,14 @@ final class MockingboardController {
     fileprivate struct AudioEvent {
         let cycle: Int
         let registers: [[UInt8]]
+        let ayClockScale: Double
     }
 
     private var vias = [VIA6522(), VIA6522()]
     // In Mockingboard mode each VIA drives one AY. Phasor-native mode uses
     // the same two VIA buses, with each one selecting a pair of AY-3-8913s.
     private var chips = [AYChip(), AYChip(), AYChip(), AYChip()]
-    private var events = [AudioEvent(cycle: 0, registers: Array(repeating: [UInt8](repeating: 0, count: 16), count: 4))]
+    private var events = [AudioEvent(cycle: 0, registers: Array(repeating: [UInt8](repeating: 0, count: 16), count: 4), ayClockScale: 1)]
     private var nextEvent = 0
     private var renderCycle = 0.0
     private var audioChips = [AudioChip(), AudioChip(), AudioChip(), AudioChip()]
@@ -310,7 +316,7 @@ final class MockingboardController {
     func reset() {
         vias.indices.forEach { vias[$0].reset() }
         chips.indices.forEach { chips[$0].reset() }
-        events = [AudioEvent(cycle: 0, registers: chips.map(\.registers))]
+        events = [AudioEvent(cycle: 0, registers: chips.map(\.registers), ayClockScale: 1)]
         nextEvent = 0
         renderCycle = 0
         audioChips = [AudioChip(), AudioChip(), AudioChip(), AudioChip()]
@@ -338,7 +344,9 @@ final class MockingboardController {
         // Device Select belongs to the Phasor's own slot-four soft-switch
         // window.  Slot five remains the second Mockingboard-compatible VIA;
         // accesses there must not accidentally rewrite the Phasor mode latch.
-        if address & 0xFFF0 == 0xC0C0 { updatePhasorDeviceSelect(address) }
+        if address & 0xFFF0 == 0xC0C0, updatePhasorDeviceSelect(address) {
+            appendAudioEvent(at: cycle)
+        }
         let index = address & 0x10 == 0 ? 0 : 1
         return accessVIA(index, register: address & 0x0F, write: value, atCycle: cycle)
     }
@@ -353,7 +361,7 @@ final class MockingboardController {
             viaMask = offset & 0x80 == 0 ? 1 : 2
         case 5:
             viaMask = ((offset & 0x80) >> 6) | ((offset & 0x10) >> 4)
-        case 7:
+        case 2, 7:
             viaMask = 2 // Echo+ maps its one VIA across the card page.
         default:
             viaMask = 0
@@ -389,7 +397,9 @@ final class MockingboardController {
         while renderCycle + cyclesPerSample <= Double(cycle) {
             while nextEvent < events.count, Double(events[nextEvent].cycle) <= renderCycle {
                 let event = events[nextEvent]
-                for index in audioChips.indices { audioChips[index].apply(event.registers[index]) }
+                for index in audioChips.indices {
+                    audioChips[index].apply(event.registers[index], clockScale: event.ayClockScale)
+                }
                 nextEvent += 1
             }
             // Phasor routes two AYs to each stereo channel. In ordinary
@@ -423,6 +433,8 @@ final class MockingboardController {
         }
     }
 
+    var ayClockScale: Double { currentAYClockScale }
+
     private func accessVIA(_ index: Int, register: Int, write value: UInt8?, atCycle cycle: Int) -> UInt8 {
         if let value {
             let affectsPSG = vias[index].write(value, register: register)
@@ -441,7 +453,9 @@ final class MockingboardController {
     }
 
     private func appendAudioEvent(at cycle: Int) {
-        let event = AudioEvent(cycle: max(0, cycle), registers: chips.map(\.registers))
+        let event = AudioEvent(
+            cycle: max(0, cycle), registers: chips.map(\.registers), ayClockScale: currentAYClockScale
+        )
         if let last = events.last, last.cycle == event.cycle {
             events[events.count - 1] = event
         } else {
@@ -449,21 +463,42 @@ final class MockingboardController {
         }
     }
 
-    private func updatePhasorDeviceSelect(_ address: Int) {
+    @discardableResult
+    private func updatePhasorDeviceSelect(_ address: Int) -> Bool {
+        let oldMode = phasorMode
         let selector = UInt8(address & 0x0F)
         if selector & 0x08 != 0 { phasorMode = 0 }
         phasorMode |= selector & 0x07
+        return phasorMode != oldMode
     }
+
+    private var currentAYClockScale: Double { usesPhasorNativeAYSelection ? 2 : 1 }
 
     private var usesPhasorNativeAYSelection: Bool { phasorMode == 0x05 }
 
+    /// Both observed Echo+ latch encodings map the card page to VIA B and
+    /// its paired AY chips.  A subsequent device-select access can change
+    /// the raw latch from 010 to 111 without leaving Echo+ mode.
+    private var usesEchoPlusAYSelection: Bool { phasorMode == 0x02 || phasorMode == 0x07 }
+
+    private var usesPairedAYSelection: Bool {
+        usesPhasorNativeAYSelection || usesEchoPlusAYSelection
+    }
+
     private func selectedPSGChips(forVIA via: Int, portB: UInt8? = nil) -> [Int] {
-        guard usesPhasorNativeAYSelection else { return [via] }
+        guard usesPairedAYSelection else { return [via] }
         let base = via * 2
-        let chipSelect = ((portB ?? vias[via].orb) >> 3) & 0x03
+        let bus = portB ?? vias[via].orb
+        let chipSelect = (bus >> 3) & 0x03
         // PB3/PB4 are active-low selects for AY1/AY2. Selecting both is
         // meaningful for mirrored register setup and is sampled by both
         // chips at the same emulated bus cycle.
+        if usesPhasorNativeAYSelection, bus & 0x03 == 0x03, chipSelect == 0x01 {
+            // The native-mode GAL mirrors an AY2 LATCH operation to AY1.
+            // It mirrors only the register-address latch; subsequent READ
+            // and WRITE operations still obey the requested chip-select.
+            return [base, base + 1]
+        }
         switch chipSelect {
         case 0: return [base, base + 1]
         case 1: return [base + 1]
@@ -473,13 +508,23 @@ final class MockingboardController {
     }
 
     private func resetPSGChips(forVIA via: Int) {
-        let targets = usesPhasorNativeAYSelection ? [via * 2, via * 2 + 1] : [via]
+        let targets = usesPairedAYSelection ? [via * 2, via * 2 + 1] : [via]
         for target in targets { chips[target].reset() }
     }
 
     private func updatePSGChips(forVIA via: Int, portA: UInt8, portB: UInt8) -> Bool {
         var changed = false
-        for target in selectedPSGChips(forVIA: via, portB: portB) {
+        var targets = selectedPSGChips(forVIA: via, portB: portB)
+        if usesPairedAYSelection, portB & 0x03 == 0 {
+            // A mirrored AY2 LATCH leaves both PSGs waiting for the inactive
+            // edge. Deliver that edge to every active chip in the pair even
+            // if the current select lines name only one of them.
+            let base = via * 2
+            for target in base..<(base + 2) where chips[target].busState != 0 && !targets.contains(target) {
+                targets.append(target)
+            }
+        }
+        for target in targets {
             changed = chips[target].update(portA: portA, portB: portB) || changed
         }
         return changed
