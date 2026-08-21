@@ -497,7 +497,10 @@ final class AppleIIMachine: ObservableObject {
         }
         if startsRuntimeTimer ?? !Self.isAutomatedRun {
             timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-                Task { @MainActor in self?.tick() }
+                // Capture the weak reference in the task itself. Swift 6
+                // rejects forwarding the outer closure's mutable weak
+                // capture into a concurrently-executing task.
+                Task { @MainActor [weak self] in self?.tick() }
             }
         }
     }
