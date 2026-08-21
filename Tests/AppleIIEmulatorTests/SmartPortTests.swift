@@ -37,4 +37,19 @@ final class SmartPortTests: XCTestCase {
         _ = memory.read(0xC0F0)
         XCTAssertEqual(memory.read(0x0900), 1)
     }
+
+    func testSlotSevenROMLoadsBlockZeroBeforeEnteringIt() throws {
+        let memory = AppleIIMemory()
+        memory.loadROM(Data(repeating: 0, count: 0x3000)) // Apple II+
+        var image = [UInt8](repeating: 0xEA, count: SmartPortController.blockSize)
+        image[0] = 0xA9 // LDA #$42, proves execution transferred into RAM
+        image[1] = 0x42
+        try memory.mountHardDiskImageData(Data(image), fileExtension: "hdv")
+        let cpu = MOS6502(bus: memory)
+        cpu.start(at: 0xC700)
+        cpu.run(cycles: 80)
+        XCTAssertEqual(memory.read(0x0800), 0xA9)
+        XCTAssertEqual(cpu.a, 0x42)
+        XCTAssertGreaterThanOrEqual(cpu.pc, 0x0802)
+    }
 }

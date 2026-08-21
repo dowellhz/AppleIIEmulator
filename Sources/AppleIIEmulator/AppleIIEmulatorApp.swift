@@ -92,6 +92,8 @@ struct AppleIIEmulatorApp: App {
                 Button("弹出磁带") { machine.ejectCassette() }
                 Divider()
                 Button("装入 SmartPort 硬盘映像…") { machine.chooseHardDiskImage() }
+                Button("从 SmartPort 硬盘启动") { machine.bootFromHardDisk() }
+                    .disabled(!machine.canBootHardDisk)
                 Button("推出 SmartPort 硬盘") { machine.ejectHardDisk() }
                     .disabled(machine.hardDiskDescription == "未插入")
             }
@@ -132,6 +134,19 @@ struct AppleIIEmulatorApp: App {
                 Divider()
                 serialPortMenu(title: "端口 1（打印机）", port: 1, connectedDevice: machine.serialPort1Device)
                 serialPortMenu(title: "端口 2（调制解调器）", port: 2, connectedDevice: machine.serialPort2Device)
+            }
+            CommandMenu("调试") {
+                Button(machine.isDebuggerVisible ? "隐藏调试监视器" : "显示调试监视器") {
+                    machine.isDebuggerVisible.toggle()
+                }
+                Button("单步执行") { machine.stepInstruction() }
+                    .disabled(machine.isRunning)
+                Divider()
+                Button("快速保存状态") { machine.saveQuickState() }
+                    .keyboardShortcut("k", modifiers: [.command, .shift])
+                Button("快速恢复状态") { machine.restoreQuickState() }
+                    .keyboardShortcut("l", modifiers: [.command, .shift])
+                    .disabled(!machine.hasQuickState)
             }
             CommandGroup(after: .newItem) {
                 Button("重置") { machine.reset() }

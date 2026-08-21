@@ -17,12 +17,12 @@ final class MacSerialBridge: @unchecked Sendable {
     private final class Connection {
         let descriptor: Int32
         let source: DispatchSourceRead
-        var baudRate: Int
+        var configuration: SerialLineConfiguration
 
-        init(descriptor: Int32, source: DispatchSourceRead, baudRate: Int) {
+        init(descriptor: Int32, source: DispatchSourceRead, configuration: SerialLineConfiguration) {
             self.descriptor = descriptor
             self.source = source
-            self.baudRate = baudRate
+            self.configuration = configuration
         }
     }
 
@@ -53,17 +53,17 @@ final class MacSerialBridge: @unchecked Sendable {
         }
     }
 
-    func connect(path: String, port: Int, baudRate: Int) {
+    func connect(path: String, port: Int, configuration: SerialLineConfiguration) {
         queue.async { [weak self] in
             guard let self else { return }
             self.disconnectLocked(port: port, notify: false)
             do {
-                let descriptor = try self.open(path: path, baudRate: baudRate)
+                let descriptor = try self.open(path: path, configuration: configuration)
                 let source = DispatchSource.makeReadSource(fileDescriptor: descriptor, queue: self.queue)
                 source.setEventHandler { [weak self] in
                     self?.readAvailable(from: descriptor, port: port)
                 }
-                self.connections[port] = Connection(descriptor: descriptor, source: source, baudRate: baudRate)
+                self.connections[port] = Connection(descriptor: descriptor, source: source, configuration: configuration)
                 source.resume()
                 self.didChangeConnection?(port, path)
             } catch {
@@ -72,20 +72,28 @@ final class MacSerialBridge: @unchecked Sendable {
         }
     }
 
+    func connect(path: String, port: Int, baudRate: Int) {
+        connect(path: path, port: port, configuration: SerialLineConfiguration(baudRate: baudRate, dataBits: 8, stopBits: 1, parity: .none))
+    }
+
     func disconnect(port: Int) {
         queue.async { [weak self] in self?.disconnectLocked(port: port, notify: true) }
     }
 
-    func setBaudRate(_ baudRate: Int, port: Int) {
+    func setConfiguration(_ configuration: SerialLineConfiguration, port: Int) {
         queue.async { [weak self] in
-            guard let self, let connection = self.connections[port], connection.baudRate != baudRate else { return }
+            guard let self, let connection = self.connections[port], connection.configuration != configuration else { return }
             do {
-                try self.configure(descriptor: connection.descriptor, baudRate: baudRate)
-                connection.baudRate = baudRate
+                try self.configure(descriptor: connection.descriptor, configuration: configuration)
+                connection.configuration = configuration
             } catch {
                 self.didFail?(port, error)
             }
         }
+    }
+
+    func setBaudRate(_ baudRate: Int, port: Int) {
+        setConfiguration(SerialLineConfiguration(baudRate: baudRate, dataBits: 8, stopBits: 1, parity: .none), port: port)
     }
 
     func send(_ bytes: [UInt8], port: Int) {
@@ -155,11 +163,11 @@ final class MacSerialBridge: @unchecked Sendable {
         }
     }
 
-    private func open(path: String, baudRate: Int) throws -> Int32 {
+    private func open(path: String, configuration: SerialLineConfiguration) throws -> Int32 {
         let descriptor = Darwin.open(path, O_RDWR | O_NOCTTY | O_NONBLOCK)
         guard descriptor >= 0 else { throw posixError() }
         do {
-            try configure(descriptor: descriptor, baudRate: baudRate)
+            try configure(descriptor: descriptor, configuration: configuration)
             return descriptor
         } catch {
             Darwin.close(descriptor)
@@ -167,19 +175,30 @@ final class MacSerialBridge: @unchecked Sendable {
         }
     }
 
-    private func configure(descriptor: Int32, baudRate: Int) throws {
+    private func configure(descriptor: Int32, configuration: SerialLineConfiguration) throws {
         var attributes = termios()
         guard tcgetattr(descriptor, &attributes) == 0 else { throw posixError() }
         cfmakeraw(&attributes)
         attributes.c_cflag |= tcflag_t(CLOCAL | CREAD)
-        attributes.c_cflag &= ~tcflag_t(CSIZE | PARENB | CSTOPB)
-        attributes.c_cflag |= tcflag_t(CS8)
+        attributes.c_cflag &= ~tcflag_t(CSIZE | PARENB | PARODD | CSTOPB)
+        switch configuration.dataBits {
+        case 5: attributes.c_cflag |= tcflag_t(CS5)
+        case 6: attributes.c_cflag |= tcflag_t(CS6)
+        case 7: attributes.c_cflag |= tcflag_t(CS7)
+        default: attributes.c_cflag |= tcflag_t(CS8)
+        }
+        if configuration.stopBits == 2 { attributes.c_cflag |= tcflag_t(CSTOPB) }
+        switch configuration.parity {
+        case .none: break
+        case .odd: attributes.c_cflag |= tcflag_t(PARENB | PARODD)
+        case .even: attributes.c_cflag |= tcflag_t(PARENB)
+        }
         withUnsafeMutableBytes(of: &attributes.c_cc) { values in
             values[Int(VMIN)] = 1
             values[Int(VTIME)] = 0
         }
-        guard let speed = serialSpeed(for: baudRate) else {
-            throw BridgeError.unsupportedBaudRate(baudRate)
+        guard let speed = serialSpeed(for: configuration.baudRate) else {
+            throw BridgeError.unsupportedBaudRate(configuration.baudRate)
         }
         guard cfsetspeed(&attributes, speed) == 0, tcsetattr(descriptor, TCSANOW, &attributes) == 0 else {
             throw posixError()

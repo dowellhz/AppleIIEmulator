@@ -23,6 +23,14 @@ struct AppleIISpeakerWaveform {
         edgeCycles.append(cycle)
     }
 
+    mutating func reset(toEmulatedCycle cycle: Int, flipCount: Int) {
+        edgeCycles.removeAll(keepingCapacity: true)
+        nextEdge = 0
+        renderedLevel = flipCount & 1 == 0 ? -1 : 1
+        renderCycle = Double(cycle)
+        dcEstimate = 0
+    }
+
     /// Convert every whole output sample ending at or before `cycle`.
     mutating func render(toEmulatedCycle cycle: Int) -> [Float] {
         guard cycle > 0 else { return [] }
@@ -138,6 +146,14 @@ final class AppleIISpeaker: @unchecked Sendable {
 
     func toggle(atEmulatedCycle cycle: Int) {
         waveform.toggle(atEmulatedCycle: cycle)
+    }
+
+    /// A machine-state restore changes the emulated timeline discontinuously.
+    /// Discard the producer-side edge history so PCM is never synthesized
+    /// across two unrelated moments in Apple II time. The bounded FIFO may
+    /// still drain at most its existing short host-audio lead.
+    func resetWaveform(toEmulatedCycle cycle: Int, flipCount: Int) {
+        waveform.reset(toEmulatedCycle: cycle, flipCount: flipCount)
     }
 
     /// Convert all fully elapsed Apple II cycles to PCM after each CPU slice.

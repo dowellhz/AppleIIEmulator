@@ -8,11 +8,23 @@ final class SmartPortController {
     static let blockSize = 512
     static let maximumBlocks = 65_535
 
-    private struct Drive {
+    fileprivate struct Drive {
         var blocks: [UInt8]
         var writeProtected: Bool
 
         var blockCount: Int { blocks.count / SmartPortController.blockSize }
+    }
+
+    struct State {
+        fileprivate let drives: [Drive?]
+        fileprivate let command: UInt8
+        fileprivate let unit: UInt8
+        fileprivate let bufferAddress: UInt16
+        fileprivate let blockNumber: UInt32
+        fileprivate let statusCode: UInt8
+        fileprivate let error: UInt8
+        fileprivate let emulatedCycle: Int
+        fileprivate let busyUntilCycle: Int
     }
 
     private var drives: [Drive?] = [nil, nil]
@@ -25,9 +37,53 @@ final class SmartPortController {
     private var emulatedCycle = 0
     private var busyUntilCycle = 0
 
+    /// A minimal slot-seven boot ROM. It uses this card's real C0F0 register
+    /// window to load ProDOS block zero into $0800, then transfers control to
+    /// that block. Apple II+/IIe software can therefore enter via `PR#7` /
+    /// `$C700` instead of a UI-side program-counter shortcut.
+    private static let bootROM: [UInt8] = {
+        var rom = [UInt8](repeating: 0x60, count: 256) // RTS for unused probes
+        let code: [UInt8] = [
+            0xA9, 0x01,             // LDA #$01: SmartPort block read
+            0x8D, 0xF2, 0xC0,       // STA $C0F2
+            0xA9, 0x70,             // LDA #$70: slot 7, drive 1
+            0x8D, 0xF3, 0xC0,       // STA $C0F3
+            0xA9, 0x00,             // LDA #$00: buffer low
+            0x8D, 0xF4, 0xC0,       // STA $C0F4
+            0xA9, 0x08,             // LDA #$08: buffer high ($0800)
+            0x8D, 0xF5, 0xC0,       // STA $C0F5
+            0xA9, 0x00,             // LDA #$00: ProDOS block zero
+            0x8D, 0xF6, 0xC0,       // STA $C0F6: block 0 low
+            0x8D, 0xF7, 0xC0,       // STA $C0F7: block 0 high
+            0x8D, 0xF8, 0xC0,       // STA $C0F8: block 0 bank
+            0xAD, 0xF0, 0xC0,       // LDA $C0F0: execute command
+            0x29, 0x01,             // AND #$01: SmartPort error bit
+            0xD0, 0x03,             // BNE failure
+            0x4C, 0x00, 0x08,       // JMP $0800
+            0x60                    // failure: RTS
+        ]
+        rom.replaceSubrange(0..<code.count, with: code)
+        return rom
+    }()
+
     var hasDisk: Bool { drives.contains { $0 != nil } }
     func hasDisk(in drive: Int) -> Bool { drives.indices.contains(drive) && drives[drive] != nil }
     func blockCount(in drive: Int) -> Int { drives.indices.contains(drive) ? drives[drive]?.blockCount ?? 0 : 0 }
+
+    func snapshot() -> State {
+        State(
+            drives: drives, command: command, unit: unit, bufferAddress: bufferAddress,
+            blockNumber: blockNumber, statusCode: statusCode, error: error,
+            emulatedCycle: emulatedCycle, busyUntilCycle: busyUntilCycle
+        )
+    }
+
+    func restore(_ state: State) {
+        drives = state.drives; command = state.command; unit = state.unit
+        bufferAddress = state.bufferAddress; blockNumber = state.blockNumber
+        statusCode = state.statusCode; error = state.error
+        emulatedCycle = state.emulatedCycle; busyUntilCycle = state.busyUntilCycle
+    }
 
     func reset() {
         command = 0
@@ -63,6 +119,10 @@ final class SmartPortController {
     func imageData(drive: Int = 0) -> Data? {
         guard drives.indices.contains(drive), let drive = drives[drive] else { return nil }
         return Data(drive.blocks)
+    }
+
+    func romByte(at offset: Int) -> UInt8 {
+        Self.bootROM[offset & 0xFF]
     }
 
     /// C0F0-C0FF for slot 7.  The CPU has already performed the bus access at

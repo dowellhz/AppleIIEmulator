@@ -4,12 +4,19 @@ import Foundation
 /// durations before mounting it here; the memory bus then sees only the
 /// cassette comparator's level at `$C060`.
 struct AppleIICassetteInput {
+    struct State {
+        fileprivate let cassette: AppleIICassetteInput
+        fileprivate init(cassette: AppleIICassetteInput) { self.cassette = cassette }
+    }
     private var pulseDurations = [Int]()
     private var pulseIndex = 0
     private var cyclesUntilEdge = 0
     private(set) var level = false
 
     var isMounted: Bool { !pulseDurations.isEmpty }
+
+    func snapshot() -> State { State(cassette: self) }
+    mutating func restore(_ snapshot: State) { self = snapshot.cassette }
 
     mutating func mount(pulseDurations: [Int], initialLevel: Bool = false) {
         self.pulseDurations = pulseDurations.filter { $0 > 0 }

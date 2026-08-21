@@ -30,6 +30,17 @@ final class MockingboardTests: XCTestCase {
         XCTAssertEqual(memory.read(0xC0CD) & 0x40, 0)
     }
 
+    func testVIAShiftRegisterRaisesIRQAfterPhi2Transfer() {
+        let memory = AppleIIMemory()
+        memory.write(0xC0CB, 0x18) // ACR: shift out under phi2
+        memory.write(0xC0CE, 0x84) // IER: enable shift-register interrupt
+        memory.write(0xC0CA, 0xA5)
+        memory.advanceVideoClock(by: 8)
+        XCTAssertEqual(memory.read(0xC0CD) & 0x84, 0x84)
+        _ = memory.read(0xC0CA)
+        XCTAssertEqual(memory.read(0xC0CD) & 0x04, 0)
+    }
+
     func testAYAudioIsSynthesizedFromTheCycleClock() {
         let memory = AppleIIMemory()
         writeAY(memory, base: 0xC0C0, register: 0, value: 0x08)

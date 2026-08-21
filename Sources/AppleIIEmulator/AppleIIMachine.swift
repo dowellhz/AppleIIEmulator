@@ -252,6 +252,25 @@ final class AppleIIMachine: ObservableObject {
         case software
     }
 
+    /// An in-memory, session-only machine image. This deliberately captures
+    /// emulated hardware state rather than host objects such as serial file
+    /// descriptors, Core Audio callbacks, or security-scoped URLs.
+    private struct QuickState {
+        let cpu: MOS6502.State
+        let memory: AppleIIMemory.State
+        let wasRunning: Bool
+        let wasAccelerated: Bool
+        let selectedBootROM: BootROM
+        let hasExternalROM: Bool
+        let externalROMName: String?
+        let diskDescription: String
+        let externalDiskDescription: String
+        let hardDiskDescription: String
+        let activeMediaKind: ActiveMediaKind
+        let wizardryScenarioDiskData: Data?
+        let wizardryScenarioPromptHandled: Bool
+    }
+
     /// A playable item in the recent-games menu. Disk games retain every
     /// image selected for their initial boot, so a two-disk game reopens with
     /// the same drive layout instead of silently losing its second disk.
@@ -314,6 +333,11 @@ final class AppleIIMachine: ObservableObject {
     /// without synchronously querying the emulation queue from the UI.
     @Published private(set) var presentedCPUCycles = 0
     @Published private(set) var presentedProgramCounter: UInt16 = 0
+    @Published private(set) var debuggerSnapshot = MOS6502DebugSnapshot(
+        a: 0, x: 0, y: 0, sp: 0xFD, pc: 0, p: 0x24, cycles: 0
+    )
+    @Published var isDebuggerVisible = false
+    @Published private(set) var hasQuickState = false
     @Published private(set) var presentedDiskState = DiskIIDebugSnapshot(
         motorOn: false,
         selectedDrive: 0,
@@ -379,6 +403,7 @@ final class AppleIIMachine: ObservableObject {
     /// A diskless Apple II+ reaches ROM Applesoft through the Autostart ROM's
     /// warm-reset path after it has shown the power-on banner.
     private var applesoftWarmStartDeadline: TimeInterval?
+    private var quickState: QuickState?
 
     var currentROMTitle: String { externalROMName ?? selectedBootROM.title }
     var supportsIIcSerial: Bool {
@@ -525,15 +550,16 @@ final class AppleIIMachine: ObservableObject {
             )
             let serialPort1Bytes = memory.drainTransmittedSerialBytes(port: 1)
             let serialPort2Bytes = memory.drainTransmittedSerialBytes(port: 2)
-            let serialPort1Baud = memory.serialBaudRate(port: 1)
-            let serialPort2Baud = memory.serialBaudRate(port: 2)
+            let serialPort1Configuration = memory.serialLineConfiguration(port: 1)
+            let serialPort2Configuration = memory.serialLineConfiguration(port: 2)
             let totalCycles = cpu.totalCycles
             let programCounter = cpu.pc
+            let debuggerSnapshot = cpu.debugSnapshot
             let diskState = memory.diskDebugSnapshot
             let snapshot = memory.makeVideoSnapshot()
             lock.unlock()
-            serialBridge.setBaudRate(serialPort1Baud, port: 1)
-            serialBridge.setBaudRate(serialPort2Baud, port: 2)
+            serialBridge.setConfiguration(serialPort1Configuration, port: 1)
+            serialBridge.setConfiguration(serialPort2Configuration, port: 2)
             serialBridge.send(serialPort1Bytes, port: 1)
             serialBridge.send(serialPort2Bytes, port: 2)
             DispatchQueue.main.async { [weak self] in
@@ -547,6 +573,7 @@ final class AppleIIMachine: ObservableObject {
                 self.videoSnapshot = snapshot
                 self.presentedCPUCycles = totalCycles
                 self.presentedProgramCounter = programCounter
+                self.debuggerSnapshot = debuggerSnapshot
                 self.presentedDiskState = diskState
                 self.advanceWizardryScenarioPromptIfNeeded(snapshot)
                 self.refreshToken &+= 1
@@ -583,16 +610,17 @@ final class AppleIIMachine: ObservableObject {
     /// Narrow diagnostic seam for regression tests: it runs the same CPU and
     /// bus path as the display timer without needing an AppKit run loop.
     func runForVerification(cycles: Int) {
-        let snapshot = withEmulationLock {
+        let result = withEmulationLock {
             cpu.run(cycles: cycles)
             speaker.advance(
                 toEmulatedCycle: cpu.totalCycles,
                 auxiliarySamples: memory.renderMockingboardAudio(toEmulatedCycle: cpu.totalCycles)
             )
-            return memory.makeVideoSnapshot()
+            return (memory.makeVideoSnapshot(), cpu.debugSnapshot)
         }
-        videoSnapshot = snapshot
-        advanceWizardryScenarioPromptIfNeeded(snapshot)
+        videoSnapshot = result.0
+        debuggerSnapshot = result.1
+        advanceWizardryScenarioPromptIfNeeded(result.0)
         refreshToken &+= 1
     }
 
@@ -673,6 +701,101 @@ final class AppleIIMachine: ObservableObject {
         lastEmulationTick = ProcessInfo.processInfo.systemUptime
     }
 
+    func stepInstruction() {
+        guard !isRunning, !cpuSliceQueued else {
+            if isRunning { status = "请先暂停后再单步执行" }
+            return
+        }
+        let result = withEmulationLock { () -> (AppleIIVideoSnapshot, MOS6502DebugSnapshot, DiskIIDebugSnapshot, [UInt8], [UInt8], SerialLineConfiguration, SerialLineConfiguration) in
+            _ = cpu.runOneInstruction()
+            speaker.advance(
+                toEmulatedCycle: cpu.totalCycles,
+                auxiliarySamples: memory.renderMockingboardAudio(toEmulatedCycle: cpu.totalCycles)
+            )
+            return (
+                memory.makeVideoSnapshot(), cpu.debugSnapshot, memory.diskDebugSnapshot,
+                memory.drainTransmittedSerialBytes(port: 1), memory.drainTransmittedSerialBytes(port: 2),
+                memory.serialLineConfiguration(port: 1), memory.serialLineConfiguration(port: 2)
+            )
+        }
+        serialBridge.setConfiguration(result.5, port: 1)
+        serialBridge.setConfiguration(result.6, port: 2)
+        serialBridge.send(result.3, port: 1)
+        serialBridge.send(result.4, port: 2)
+        videoSnapshot = result.0
+        debuggerSnapshot = result.1
+        presentedCPUCycles = result.1.cycles
+        presentedProgramCounter = result.1.pc
+        presentedDiskState = result.2
+        status = "单步执行 · PC=$\(String(result.1.pc, radix: 16).uppercased())"
+        refreshToken &+= 1
+    }
+
+    func saveQuickState() {
+        let state = withEmulationLock { () -> QuickState in
+            QuickState(
+                cpu: cpu.snapshot(), memory: memory.snapshot(),
+                wasRunning: isRunning, wasAccelerated: isCPUAccelerated,
+                selectedBootROM: selectedBootROM, hasExternalROM: hasExternalROM,
+                externalROMName: externalROMName, diskDescription: diskDescription,
+                externalDiskDescription: externalDiskDescription,
+                hardDiskDescription: hardDiskDescription, activeMediaKind: activeMediaKind,
+                wizardryScenarioDiskData: wizardryScenarioDiskData,
+                wizardryScenarioPromptHandled: wizardryScenarioPromptHandled
+            )
+        }
+        quickState = state
+        hasQuickState = true
+        status = "已快速保存状态 · PC=$\(String(debuggerSnapshot.pc, radix: 16).uppercased())"
+    }
+
+    func restoreQuickState() {
+        guard let quickState else {
+            status = "尚未保存快速状态"
+            return
+        }
+
+        // A completed older slice is allowed to publish only if it belongs to
+        // this generation. Restoring before it gets back to the main actor
+        // prevents stale video, CPU and disk snapshots overwriting this one.
+        executionGeneration &+= 1
+        isRunning = false
+        applesoftWarmStartDeadline = nil
+        let result = withEmulationLock { () -> (AppleIIVideoSnapshot, MOS6502DebugSnapshot, DiskIIDebugSnapshot, SerialLineConfiguration, SerialLineConfiguration, Int) in
+            memory.restore(quickState.memory)
+            cpu.restore(quickState.cpu)
+            speaker.resetWaveform(toEmulatedCycle: cpu.totalCycles, flipCount: memory.speakerFlipCount)
+            return (
+                memory.makeVideoSnapshot(), cpu.debugSnapshot, memory.diskDebugSnapshot,
+                memory.serialLineConfiguration(port: 1), memory.serialLineConfiguration(port: 2),
+                cpu.totalCycles
+            )
+        }
+        serialBridge.setConfiguration(result.3, port: 1)
+        serialBridge.setConfiguration(result.4, port: 2)
+        selectedBootROM = quickState.selectedBootROM
+        hasExternalROM = quickState.hasExternalROM
+        externalROMName = quickState.externalROMName
+        diskDescription = quickState.diskDescription
+        externalDiskDescription = quickState.externalDiskDescription
+        hardDiskDescription = quickState.hardDiskDescription
+        activeMediaKind = quickState.activeMediaKind
+        wizardryScenarioDiskData = quickState.wizardryScenarioDiskData
+        wizardryScenarioPromptHandled = quickState.wizardryScenarioPromptHandled
+        isCPUAccelerated = quickState.wasAccelerated
+        cpuSliceQueued = false
+        fractionalCPUCycles = 0
+        lastEmulationTick = ProcessInfo.processInfo.systemUptime
+        videoSnapshot = result.0
+        debuggerSnapshot = result.1
+        presentedCPUCycles = result.5
+        presentedProgramCounter = result.1.pc
+        presentedDiskState = result.2
+        isRunning = quickState.wasRunning
+        status = "已恢复快速状态 · PC=$\(String(result.1.pc, radix: 16).uppercased())"
+        refreshToken &+= 1
+    }
+
     func refreshSerialDevices() { serialBridge.refreshDevices() }
 
     func connectSerialDevice(_ path: String, port: Int) {
@@ -680,9 +803,9 @@ final class AppleIIMachine: ObservableObject {
             status = "串口仅适用于 Apple IIc ROM"
             return
         }
-        // The next CPU slice applies the ACIA's current control-register
-        // rate. Start at the reset-default 9600 to avoid waiting on the UI.
-        serialBridge.connect(path: path, port: port, baudRate: 9_600)
+        serialBridge.connect(path: path, port: port, configuration: withEmulationLock {
+            memory.serialLineConfiguration(port: port)
+        })
     }
 
     func disconnectSerialDevice(port: Int) { serialBridge.disconnect(port: port) }
@@ -1416,6 +1539,32 @@ final class AppleIIMachine: ObservableObject {
         status = "\(currentROMTitle) · SmartPort 硬盘未插入"
     }
 
+    /// Enters the slot-seven card ROM just as `PR#7` does on an Apple II+ or
+    /// IIe. The ROM itself performs the block transfer; the UI never copies
+    /// disk data into RAM or jumps directly to the payload.
+    func bootFromHardDisk() {
+        guard hardDiskDescription != "未插入", canBootHardDisk else {
+            status = "SmartPort 启动需要已插入硬盘及 Apple II+/IIe ROM"
+            return
+        }
+        let result = withEmulationLock { () -> AppleIIVideoSnapshot in
+            memory.coldBootSystemState()
+            cpu.reset()
+            cpu.start(at: 0xC700)
+            return memory.makeVideoSnapshot()
+        }
+        isRunning = true
+        fractionalCPUCycles = 0
+        lastEmulationTick = ProcessInfo.processInfo.systemUptime
+        videoSnapshot = result
+        status = "\(currentROMTitle) · 正在经 slot 7 启动 SmartPort 硬盘"
+        refreshToken &+= 1
+    }
+
+    var canBootHardDisk: Bool {
+        hardDiskDescription != "未插入" && withEmulationLock { memory.supportsSmartPortSlotROM }
+    }
+
     func ejectDisk(drive: Int = 0) {
         if drive == 1 { persistWordPerfectWorkDisk() }
         withEmulationLock { memory.ejectDisk(drive: drive) }
@@ -1512,6 +1661,42 @@ final class AppleIIMachine: ObservableObject {
 }
 
 final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
+    struct State {
+        fileprivate let bytes: [UInt8], auxiliaryBytes: [UInt8]
+        fileprivate let languageCardBank1: [UInt8], languageCardBank2: [UInt8], languageCardHigh: [UInt8]
+        fileprivate let auxiliaryLanguageCardBank1: [UInt8], auxiliaryLanguageCardBank2: [UInt8], auxiliaryLanguageCardHigh: [UInt8]
+        fileprivate let languageCardRAMRead: Bool, languageCardBank2Selected: Bool, languageCardWriteArmed: Bool, languageCardWriteEnabled: Bool
+        fileprivate let iicROM: [UInt8], iicROMBank: Int, iieROM: [UInt8], plusSlot6ROM: [UInt8], plusDiskFirmware: DiskIIFirmware?
+        fileprivate let model: Model, supportsMouseText: Bool, keyLatch: UInt8
+        fileprivate let textMode: Bool, mixedMode: Bool, page2: Bool, hires: Bool, column80: Bool, store80: Bool
+        fileprivate let ramReadAuxiliary: Bool, ramWriteAuxiliary: Bool, internalCXROM: Bool, slot3ROM: Bool
+        fileprivate let doubleHires: Bool, alternateZeroPage: Bool, alternateCharset: Bool
+        fileprivate let disk: IWMController.State, smartPort: SmartPortController.State, mockingboard: MockingboardController.State
+        fileprivate let serialPort1: ACIA6551.State, serialPort2: ACIA6551.State, mouse: AppleIIMouseInterface.State
+        fileprivate let speakerFlips: Int, speakerCycle: Int, cassetteInput: Bool, cassetteTransport: AppleIICassetteInput.State
+        fileprivate let cassetteOutput: Bool, cassetteOutputEdges: [Int], annunciators: [Bool]
+        fileprivate let videoClock: Int, iiCVBLFlag: Bool, iicIOUDisabled: Bool, iicVBLEnabled: Bool
+        fileprivate let paddleElapsedCycles: Int, paddles: [UInt8], openAppleDown: Bool, closedAppleDown: Bool
+
+        fileprivate init(memory: AppleIIMemory) {
+            bytes = memory.bytes; auxiliaryBytes = memory.auxiliaryBytes
+            languageCardBank1 = memory.languageCardBank1; languageCardBank2 = memory.languageCardBank2; languageCardHigh = memory.languageCardHigh
+            auxiliaryLanguageCardBank1 = memory.auxiliaryLanguageCardBank1; auxiliaryLanguageCardBank2 = memory.auxiliaryLanguageCardBank2; auxiliaryLanguageCardHigh = memory.auxiliaryLanguageCardHigh
+            languageCardRAMRead = memory.languageCardRAMRead; languageCardBank2Selected = memory.languageCardBank2Selected
+            languageCardWriteArmed = memory.languageCardWriteArmed; languageCardWriteEnabled = memory.languageCardWriteEnabled
+            iicROM = memory.iicROM; iicROMBank = memory.iicROMBank; iieROM = memory.iieROM; plusSlot6ROM = memory.plusSlot6ROM; plusDiskFirmware = memory.plusDiskFirmware
+            model = memory.model; supportsMouseText = memory.supportsMouseText; keyLatch = memory.keyLatch
+            textMode = memory.textMode; mixedMode = memory.mixedMode; page2 = memory.page2; hires = memory.hires; column80 = memory.column80; store80 = memory.store80
+            ramReadAuxiliary = memory.ramReadAuxiliary; ramWriteAuxiliary = memory.ramWriteAuxiliary; internalCXROM = memory.internalCXROM; slot3ROM = memory.slot3ROM
+            doubleHires = memory.doubleHires; alternateZeroPage = memory.alternateZeroPage; alternateCharset = memory.alternateCharset
+            disk = memory.diskController.snapshot(); smartPort = memory.smartPortController.snapshot(); mockingboard = memory.mockingboardController.snapshot()
+            serialPort1 = memory.serialPort1.snapshot(); serialPort2 = memory.serialPort2.snapshot(); mouse = memory.mouseController.snapshot()
+            speakerFlips = memory.speakerFlips; speakerCycle = memory.speakerCycle; cassetteInput = memory.cassetteInput; cassetteTransport = memory.cassetteTransport.snapshot()
+            cassetteOutput = memory.cassetteOutput; cassetteOutputEdges = memory.cassetteOutputEdges; annunciators = memory.annunciators
+            videoClock = memory.videoClock; iiCVBLFlag = memory.iiCVBLFlag; iicIOUDisabled = memory.iicIOUDisabled; iicVBLEnabled = memory.iicVBLEnabled
+            paddleElapsedCycles = memory.paddleElapsedCycles; paddles = memory.paddles; openAppleDown = memory.openAppleDown; closedAppleDown = memory.closedAppleDown
+        }
+    }
     enum Model: Equatable { case appleIIPlus, appleIIc, appleIIe }
     enum DiskIIFirmware: Equatable {
         case thirteenSector, sixteenSector
@@ -1558,6 +1743,27 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
         case .appleIIe: return "Apple IIe"
         }
     }
+
+    func snapshot() -> State { State(memory: self) }
+
+    func restore(_ state: State) {
+        bytes = state.bytes; auxiliaryBytes = state.auxiliaryBytes
+        languageCardBank1 = state.languageCardBank1; languageCardBank2 = state.languageCardBank2; languageCardHigh = state.languageCardHigh
+        auxiliaryLanguageCardBank1 = state.auxiliaryLanguageCardBank1; auxiliaryLanguageCardBank2 = state.auxiliaryLanguageCardBank2; auxiliaryLanguageCardHigh = state.auxiliaryLanguageCardHigh
+        languageCardRAMRead = state.languageCardRAMRead; languageCardBank2Selected = state.languageCardBank2Selected
+        languageCardWriteArmed = state.languageCardWriteArmed; languageCardWriteEnabled = state.languageCardWriteEnabled
+        iicROM = state.iicROM; iicROMBank = state.iicROMBank; iieROM = state.iieROM; plusSlot6ROM = state.plusSlot6ROM; plusDiskFirmware = state.plusDiskFirmware
+        model = state.model; supportsMouseText = state.supportsMouseText; keyLatch = state.keyLatch
+        textMode = state.textMode; mixedMode = state.mixedMode; page2 = state.page2; hires = state.hires; column80 = state.column80; store80 = state.store80
+        ramReadAuxiliary = state.ramReadAuxiliary; ramWriteAuxiliary = state.ramWriteAuxiliary; internalCXROM = state.internalCXROM; slot3ROM = state.slot3ROM
+        doubleHires = state.doubleHires; alternateZeroPage = state.alternateZeroPage; alternateCharset = state.alternateCharset
+        diskController.restore(state.disk); smartPortController.restore(state.smartPort); mockingboardController.restore(state.mockingboard)
+        serialPort1.restore(state.serialPort1); serialPort2.restore(state.serialPort2); mouseController.restore(state.mouse)
+        speakerFlips = state.speakerFlips; speakerCycle = state.speakerCycle; cassetteInput = state.cassetteInput; cassetteTransport.restore(state.cassetteTransport)
+        cassetteOutput = state.cassetteOutput; cassetteOutputEdges = state.cassetteOutputEdges; annunciators = state.annunciators
+        videoClock = state.videoClock; iiCVBLFlag = state.iiCVBLFlag; iicIOUDisabled = state.iicIOUDisabled; iicVBLEnabled = state.iicVBLEnabled
+        paddleElapsedCycles = state.paddleElapsedCycles; paddles = state.paddles; openAppleDown = state.openAppleDown; closedAppleDown = state.closedAppleDown
+    }
     private var keyLatch: UInt8 = 0
     private(set) var textMode = true
     private(set) var mixedMode = false
@@ -1581,6 +1787,7 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
     private var serialPort2 = ACIA6551()
     private var mouseController = AppleIIMouseInterface()
     private(set) var speakerFlips = 0
+    var speakerFlipCount: Int { speakerFlips }
     var speakerDidToggle: (() -> Void)?
     var speakerDidToggleAtCycle: ((Int) -> Void)?
     private var speakerCycle = 0
@@ -1738,6 +1945,9 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
             if (model == .appleIIPlus || model == .appleIIe), (0xC600...0xC6FF).contains(a), !internalCXROM, plusSlot6ROM.count == 0x100 {
                 return plusSlot6ROM[a - 0xC600]
             }
+            if (model == .appleIIPlus || model == .appleIIe), (0xC700...0xC7FF).contains(a), !internalCXROM {
+                return smartPortController.romByte(at: a - 0xC700)
+            }
             if model != .appleIIc, a >= 0xD000, languageCardRAMRead {
                 return languageCardByte(at: a)
             }
@@ -1814,6 +2024,7 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
         default:
             if model == .appleIIc, a >= 0xC100 { return }
             if (model == .appleIIPlus || model == .appleIIe), (0xC600...0xC6FF).contains(a), !internalCXROM { return }
+            if (model == .appleIIPlus || model == .appleIIe), (0xC700...0xC7FF).contains(a), !internalCXROM { return }
             if model != .appleIIc, a >= 0xD000 {
                 if languageCardWriteEnabled { setLanguageCardByte(value, at: a) }
                 return
@@ -2138,6 +2349,7 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
     }
     func ejectHardDisk(drive: Int = 0) { smartPortController.eject(drive: drive) }
     func hasHardDisk(in drive: Int) -> Bool { smartPortController.hasDisk(in: drive) }
+    var supportsSmartPortSlotROM: Bool { model != .appleIIc }
     func hardDiskBlockCount(in drive: Int) -> Int { smartPortController.blockCount(in: drive) }
     func hardDiskImage(drive: Int = 0) -> Data? { smartPortController.imageData(drive: drive) }
 
@@ -2158,6 +2370,12 @@ final class AppleIIMemory: AppleIIBus, @unchecked Sendable {
         if port == 1 { return serialPort1.baudRate }
         if port == 2 { return serialPort2.baudRate }
         return 9_600
+    }
+
+    func serialLineConfiguration(port: Int) -> SerialLineConfiguration {
+        if port == 1 { return serialPort1.lineConfiguration }
+        if port == 2 { return serialPort2.lineConfiguration }
+        return SerialLineConfiguration(baudRate: 9_600, dataBits: 8, stopBits: 1, parity: .none)
     }
 
     func renderMockingboardAudio(toEmulatedCycle cycle: Int) -> [Float] {

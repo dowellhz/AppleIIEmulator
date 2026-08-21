@@ -241,7 +241,7 @@ final class IWMControllerTests: XCTestCase {
         XCTAssertGreaterThan(restored.fluxBitReads, 0)
     }
 
-    func testWOZ21FluxWriteMaterializesChangedTrackAsBITS() throws {
+    func testWOZ21FluxWriteRequantizesChangedTrackAsFLUX() throws {
         let disk = IWMController()
         try disk.mountImage(woz21FluxImage(), fileExtension: "woz")
         _ = disk.access(0x09, write: nil) // motor on
@@ -251,14 +251,14 @@ final class IWMControllerTests: XCTestCase {
         XCTAssertGreaterThan(disk.nibbleWrites, 0)
 
         let saved = try XCTUnwrap(disk.wozImage())
-        XCTAssertNil(saved.range(of: Data("FLUX".utf8)), "the modified flux track must export as BITS")
+        XCTAssertNotNil(saved.range(of: Data("FLUX".utf8)), "the modified flux track must remain a FLUX surface")
         let restored = IWMController()
         try restored.mountImage(saved, fileExtension: "woz")
         _ = restored.access(0x09, write: nil)
         _ = restored.access(0x0C, write: nil)
         restored.advance(by: 64)
         XCTAssertGreaterThan(restored.nibbleReads, 0)
-        XCTAssertEqual(restored.fluxBitReads, 0)
+        XCTAssertGreaterThan(restored.fluxBitReads, 0)
     }
 
     func testWOZSaveAsRetainsExtensionsUntilSurfaceChanges() throws {

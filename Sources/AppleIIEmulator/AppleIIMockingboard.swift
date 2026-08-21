@@ -4,11 +4,26 @@ import Foundation
 /// each driving an AY-3-8913.  This deliberately keeps the card at its real
 /// I/O addresses instead of treating music as a UI-side audio effect.
 final class MockingboardController {
+    struct State {
+        fileprivate let vias: [VIA6522]
+        fileprivate let chips: [AYChip]
+        fileprivate let events: [AudioEvent]
+        fileprivate let nextEvent: Int
+        fileprivate let renderCycle: Double
+        fileprivate let audioChips: [AudioChip]
+        fileprivate init(
+            vias: [VIA6522], chips: [AYChip], events: [AudioEvent], nextEvent: Int,
+            renderCycle: Double, audioChips: [AudioChip]
+        ) {
+            self.vias = vias; self.chips = chips; self.events = events
+            self.nextEvent = nextEvent; self.renderCycle = renderCycle; self.audioChips = audioChips
+        }
+    }
     private static let sampleRate = 44_100.0
     private static let cyclesPerSecond = 1_021_800.0
     private static let ayClock = 1_021_800.0
 
-    private struct VIA6522 {
+    fileprivate struct VIA6522 {
         var ora: UInt8 = 0
         var orb: UInt8 = 0
         var ddra: UInt8 = 0
@@ -21,6 +36,9 @@ final class MockingboardController {
         var timer1Counter: Int?
         var timer2Latch: UInt16 = 0
         var timer2Counter: Int?
+        var shiftRegister: UInt8 = 0
+        var shiftBitsRemaining = 0
+        var shiftCycles = 0
 
         var irqPending: Bool { ifr & ier & 0x7F != 0 }
 
@@ -37,6 +55,7 @@ final class MockingboardController {
             var timer2Counter = timer2Counter
             advanceTimer(&timer2Counter, latch: timer2Latch, flag: 0x20, continuous: false, cycles: cycles)
             self.timer2Counter = timer2Counter
+            advanceShiftRegister(by: cycles)
         }
 
         mutating func read(_ register: Int, portAInput: UInt8) -> UInt8 {
@@ -55,6 +74,9 @@ final class MockingboardController {
                 ifr &= ~0x20
                 return UInt8(truncatingIfNeeded: timer2Counter ?? 0)
             case 9: return UInt8(truncatingIfNeeded: (timer2Counter ?? 0) >> 8)
+            case 10:
+                ifr &= ~0x04
+                return shiftRegister
             case 11: return acr
             case 12: return pcr
             case 13: return ifr | (irqPending ? 0x80 : 0)
@@ -81,6 +103,11 @@ final class MockingboardController {
                 timer2Latch = (timer2Latch & 0x00FF) | UInt16(value) << 8
                 timer2Counter = Int(timer2Latch) + 1
                 ifr &= ~0x20
+            case 10:
+                shiftRegister = value
+                shiftBitsRemaining = 8
+                shiftCycles = 0
+                ifr &= ~0x04
             case 11: acr = value
             case 12: pcr = value
             case 13: ifr &= ~(value & 0x7F)
@@ -107,9 +134,30 @@ final class MockingboardController {
             }
             counter = remaining
         }
+
+        private mutating func advanceShiftRegister(by cycles: Int) {
+            // ACR bits 4...2 select the 6522 shift mode. External-clock
+            // modes have no synthetic edge source; phi2 modes clock once per
+            // CPU cycle and T2 modes clock from their programmed latch.
+            let mode = (acr >> 2) & 0x07
+            guard mode != 0, shiftBitsRemaining > 0 else { return }
+            guard mode != 3, mode != 7 else { return }
+            let period = (mode == 2 || mode == 6) ? 1 : max(1, Int(timer2Latch) + 1)
+            shiftCycles += cycles
+            while shiftCycles >= period, shiftBitsRemaining > 0 {
+                shiftCycles -= period
+                if mode >= 4 {
+                    shiftRegister <<= 1 // shift-out serial data on CB2
+                } else {
+                    shiftRegister = (shiftRegister << 1) | 1 // idle-high CB2 input
+                }
+                shiftBitsRemaining -= 1
+            }
+            if shiftBitsRemaining == 0 { ifr |= 0x04 }
+        }
     }
 
-    private struct AYChip {
+    fileprivate struct AYChip {
         var registers = [UInt8](repeating: 0, count: 16)
         var selectedRegister: Int?
         var busState: UInt8 = 0
@@ -150,7 +198,7 @@ final class MockingboardController {
         }
     }
 
-    private struct AudioChip {
+    fileprivate struct AudioChip {
         var registers = [UInt8](repeating: 0, count: 16)
         var tonePhase = [Double](repeating: 0, count: 3)
         var noisePhase = 0.0
@@ -214,7 +262,7 @@ final class MockingboardController {
         }
     }
 
-    private struct AudioEvent {
+    fileprivate struct AudioEvent {
         let cycle: Int
         let registers: [[UInt8]]
     }
@@ -227,6 +275,15 @@ final class MockingboardController {
     private var audioChips = [AudioChip(), AudioChip()]
 
     var irqPending: Bool { vias.contains { $0.irqPending } }
+
+    func snapshot() -> State {
+        State(vias: vias, chips: chips, events: events, nextEvent: nextEvent, renderCycle: renderCycle, audioChips: audioChips)
+    }
+
+    func restore(_ state: State) {
+        vias = state.vias; chips = state.chips; events = state.events
+        nextEvent = state.nextEvent; renderCycle = state.renderCycle; audioChips = state.audioChips
+    }
 
     func reset() {
         vias.indices.forEach { vias[$0].reset() }
